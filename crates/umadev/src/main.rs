@@ -459,6 +459,43 @@ enum Command {
         #[arg(long)]
         review: bool,
     },
+    /// Open a GitHub PR whose body is the run's review report + proof-pack.
+    #[command(
+        long_about = "Turn the finished run into the most trustworthy PR on the team.\n\
+                      The PR body is UmaDev's own evidence: the PR-ready review\n\
+                      report (contract / acceptance / coverage / governance /\n\
+                      security / runtime + rollback) followed by a proof-pack\n\
+                      summary — a reviewer reads a self-asserting, source-cited\n\
+                      case for merge, not a bare diff.\n\
+                      \n\
+                      Fail-open + safe by design. It first checks readiness (git\n\
+                      repo? uncommitted changes? GitHub remote? `gh` installed +\n\
+                      logged in?). If anything is missing it prints the exact\n\
+                      manual steps and stops — it never crashes and never force-\n\
+                      pushes. When ready it commits on a FEATURE branch (creating\n\
+                      one first if HEAD is on the default branch — it never commits\n\
+                      directly on the default branch), pushes, and `gh pr create`s\n\
+                      with the generated body. Without --create it is a dry run:\n\
+                      it writes the body + prints the plan, opening nothing.\n\
+                      \n\
+                      UmaDev owns no credentials — the push + PR run through your\n\
+                      own logged-in `git` / `gh`.",
+        after_help = "EXAMPLES:\n  \
+                      umadev pr                      # dry run: write body + show plan\n  \
+                      umadev pr --create             # actually open the PR\n  \
+                      umadev pr --create --slug my-app"
+    )]
+    Pr {
+        /// Project slug used in artifact filenames.
+        #[arg(long)]
+        slug: Option<String>,
+        /// Workspace root; defaults to current directory.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+        /// Actually open the PR (default is a dry run: write body + print plan).
+        #[arg(long)]
+        create: bool,
+    },
     /// Self-test: binary integrity, workspace permissions, manifest.
     #[command(
         hide = true,
@@ -777,6 +814,11 @@ async fn main() -> Result<()> {
             project_root,
             review,
         } => cmd_report(slug, project_root, review),
+        Command::Pr {
+            slug,
+            project_root,
+            create,
+        } => cmd_pr(slug, project_root, create),
         Command::Doctor { project_root } => cmd_doctor(project_root),
         Command::Examples => cmd_examples(),
         Command::Guide => cmd_guide(),
@@ -3378,6 +3420,208 @@ fn cmd_report(slug: Option<String>, project_root: Option<PathBuf>, review: bool)
             );
         }
     }
+    Ok(())
+}
+
+/// `umadev pr [--create]` — PR mode. Open a GitHub PR whose body is the run's
+/// own evidence (the `review.rs` review report + a proof-pack summary).
+///
+/// Two safety-first modes:
+///   - default (dry run): assess readiness, write the PR body, print the exact
+///     branch/commit/PR plan — opens NOTHING.
+///   - `--create`: when every readiness check passes, commit on a FEATURE
+///     branch (creating one first if HEAD is on the default branch — never
+///     committing directly on the default branch), push, and `gh pr create`
+///     with the generated body.
+///
+/// Fail-open throughout: any failing precondition or external-command error
+/// prints the manual recipe and returns Ok — never a crash, never a force-push,
+/// never a rewrite of the user's existing commits.
+fn cmd_pr(slug: Option<String>, project_root: Option<PathBuf>, create: bool) -> Result<()> {
+    let project_root = resolve_root(project_root)?;
+    let slug = match slug {
+        Some(s) if !s.is_empty() => s,
+        _ => infer_slug(&project_root),
+    };
+    let lang = umadev_i18n::current();
+    println!("{}", umadev_i18n::t(lang, "pr.scanning"));
+
+    // 1. Always (re)run the pre-PR security scan so the review report folds in a
+    //    fresh verdict, then render + persist the PR body. Fail-open: a write
+    //    error is reported, not fatal.
+    let scan = umadev_agent::run_security_scan(&project_root);
+    let _ = umadev_agent::write_security_scan(&project_root, &scan);
+    let body = umadev_agent::render_pr_body(&project_root, &slug);
+    let body_rel = umadev_agent::pr_body_rel_path(&slug);
+    let body_path = project_root.join(&body_rel);
+    if let Some(parent) = body_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::write(&body_path, &body) {
+        Ok(()) => println!(
+            "{}",
+            umadev_i18n::tf(lang, "pr.body_written", &[&body_path.display().to_string()])
+        ),
+        Err(e) => println!(
+            "{}",
+            umadev_i18n::tf(lang, "pr.body_write_failed", &[&e.to_string()])
+        ),
+    }
+
+    // 2. Assess readiness + compute the branch plan (pure).
+    let readiness = umadev_agent::assess_readiness(&project_root);
+    let plan = umadev_agent::plan_branches(&readiness, &slug);
+    println!("\n{}", umadev_i18n::t(lang, "pr.readiness"));
+    for c in &readiness.checks {
+        let mark = if c.ok { "[x]" } else { "[ ]" };
+        println!("  {mark} {}", c.label);
+    }
+    println!(
+        "{}",
+        umadev_i18n::tf(
+            lang,
+            "pr.plan",
+            &[
+                &plan.head_branch,
+                &plan.base_branch,
+                if plan.needs_new_branch {
+                    umadev_i18n::t(lang, "pr.plan_new_branch")
+                } else {
+                    umadev_i18n::t(lang, "pr.plan_reuse_branch")
+                }
+            ]
+        )
+    );
+
+    // 3. Not ready, or a dry run → print manual steps / the plan and stop. We
+    //    NEVER touch the repo unless the user explicitly opts in with --create
+    //    AND every precondition holds.
+    if !readiness.ready() {
+        println!(
+            "\n{}",
+            umadev_agent::manual_steps(&readiness, &slug, &body_rel)
+        );
+        return Ok(());
+    }
+    if !create {
+        println!("\n{}", umadev_i18n::t(lang, "pr.dry_run"));
+        return Ok(());
+    }
+
+    // 4. Ready + --create → drive git + gh. Each step is fail-open: on the first
+    //    error we stop and fall back to the manual recipe, leaving the repo as
+    //    we found it (no force, no history rewrite).
+    if plan.needs_new_branch {
+        // SAFETY: HEAD is on the default branch — branch first, never commit on
+        // it directly. `git switch -c` is non-destructive (creates + checks out).
+        println!(
+            "{}",
+            umadev_i18n::tf(lang, "pr.branching", &[&plan.head_branch])
+        );
+        if !run_pr_git(&project_root, &["switch", "-c", &plan.head_branch]) {
+            return pr_fallback(&readiness, &slug, &body_rel, lang);
+        }
+    }
+    println!("{}", umadev_i18n::t(lang, "pr.committing"));
+    if !run_pr_git(&project_root, &["add", "-A"]) {
+        return pr_fallback(&readiness, &slug, &body_rel, lang);
+    }
+    let commit_msg = format!("{slug}: UmaDev pipeline output");
+    if !run_pr_git(&project_root, &["commit", "-m", &commit_msg]) {
+        // A failed commit usually means "nothing staged" — non-fatal, but we
+        // can't open a PR with no commit, so fall back to manual.
+        return pr_fallback(&readiness, &slug, &body_rel, lang);
+    }
+    // Plain `push -u` (NEVER `--force`): if the remote rejects it we surface the
+    // error and stop rather than overwriting anything.
+    println!(
+        "{}",
+        umadev_i18n::tf(lang, "pr.pushing", &[&plan.head_branch])
+    );
+    if !run_pr_git(&project_root, &["push", "-u", "origin", &plan.head_branch]) {
+        return pr_fallback(&readiness, &slug, &body_rel, lang);
+    }
+
+    // 5. Open the PR with the generated body. `gh` reads our own login.
+    println!("{}", umadev_i18n::t(lang, "pr.opening"));
+    let body_arg = body_path.to_string_lossy().to_string();
+    let gh_out = std::process::Command::new("gh")
+        .args([
+            "pr",
+            "create",
+            "--base",
+            &plan.base_branch,
+            "--head",
+            &plan.head_branch,
+            "--title",
+            &slug,
+            "--body-file",
+            &body_arg,
+        ])
+        .current_dir(&project_root)
+        .output();
+    match gh_out {
+        Ok(out) if out.status.success() => {
+            let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            println!("{}", umadev_i18n::tf(lang, "pr.opened", &[&url]));
+            println!("{}", umadev_i18n::t(lang, "pr.review_loop"));
+        }
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            println!("{}", umadev_i18n::tf(lang, "pr.create_failed", &[&err]));
+            return pr_fallback(&readiness, &slug, &body_rel, lang);
+        }
+        Err(e) => {
+            println!(
+                "{}",
+                umadev_i18n::tf(lang, "pr.create_failed", &[&e.to_string()])
+            );
+            return pr_fallback(&readiness, &slug, &body_rel, lang);
+        }
+    }
+    Ok(())
+}
+
+/// Run a git subcommand in `project_root` for the PR flow, printing a fail-open
+/// notice on error. Returns `true` on success. Never panics, never `--force`.
+fn run_pr_git(project_root: &Path, args: &[&str]) -> bool {
+    match std::process::Command::new("git")
+        .args(args)
+        .current_dir(project_root)
+        .output()
+    {
+        Ok(out) if out.status.success() => true,
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let lang = umadev_i18n::current();
+            println!(
+                "{}",
+                umadev_i18n::tf(lang, "pr.git_failed", &[&args.join(" "), err.trim()])
+            );
+            false
+        }
+        Err(e) => {
+            let lang = umadev_i18n::current();
+            println!(
+                "{}",
+                umadev_i18n::tf(lang, "pr.git_failed", &[&args.join(" "), &e.to_string()])
+            );
+            false
+        }
+    }
+}
+
+/// Common fail-open exit for the `--create` path: a step failed, so print the
+/// manual recipe (which is safe + force-free) and return Ok. The repo is left
+/// as we found it; we never retry destructively.
+fn pr_fallback(
+    readiness: &umadev_agent::PrReadiness,
+    slug: &str,
+    body_rel: &str,
+    lang: umadev_i18n::Lang,
+) -> Result<()> {
+    println!("\n{}", umadev_i18n::t(lang, "pr.fallback"));
+    println!("{}", umadev_agent::manual_steps(readiness, slug, body_rel));
     Ok(())
 }
 

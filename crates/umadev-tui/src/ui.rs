@@ -1388,6 +1388,7 @@ fn render_help_overlay(frame: &mut Frame, app: &App) {
                     ("/preview", "start the dev server + open the browser"),
                     ("/stop-preview", "stop the running preview server"),
                     ("/deploy", "run the deploy command → live URL"),
+                    ("/pr", "open a GitHub PR (review report + proof-pack body)"),
                     ("/export", "export the latest proof-pack"),
                 ],
             );
@@ -1532,7 +1533,9 @@ mod tests {
     }
 
     fn render_to_string(app: &App) -> String {
-        let backend = TestBackend::new(120, 70);
+        // Tall enough that the full grouped help overlay (which has grown with
+        // the command set) renders without the bottom session group being clipped.
+        let backend = TestBackend::new(120, 110);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(f, app)).unwrap();
         let buffer = terminal.backend().buffer().clone();

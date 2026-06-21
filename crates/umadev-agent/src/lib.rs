@@ -50,6 +50,7 @@ pub mod lessons;
 pub mod manifest;
 pub mod phases;
 pub mod planner;
+pub mod pr;
 pub mod review;
 pub mod run_lock;
 pub mod runner;
@@ -87,6 +88,10 @@ pub use manifest::{ConformanceLevel, Profile, SpecManifest};
 pub use phases::{knowledge_top_files, phase_knowledge_digest, PhaseOutput};
 pub use planner::{
     phase_from_id, plan as plan_phases, plan_light, redoable_phase_ids, PhasePlan, TaskKind,
+};
+pub use pr::{
+    assess_readiness, feature_branch_name, latest_proof_pack, manual_steps, plan_branches,
+    pr_body_rel_path, proof_pack_summary, render_pr_body, PrPlan, PrReadiness, ReadinessCheck,
 };
 pub use review::{
     build_review_report, render_review_md, review_report_rel_path, scan_ci_weakening,

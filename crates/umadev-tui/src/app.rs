@@ -903,6 +903,10 @@ impl App {
         ("preview", "start the dev server + open the browser"),
         ("stop-preview", "stop the running preview dev server"),
         ("deploy", "run the recorded deploy command to go live"),
+        (
+            "pr",
+            "open a GitHub PR with the review report + proof-pack as the body",
+        ),
         ("usage", "show your worker-call usage statistics"),
         ("animations", "toggle spinner animation on/off"),
         ("bug", "collect diagnostics to report a bug"),
@@ -2395,6 +2399,18 @@ impl App {
             "preview" => self.slash_preview(),
             "stop-preview" => self.slash_stop_preview(),
             "deploy" => self.slash_deploy(rest),
+            "pr" => {
+                // PR mode shares ONE implementation with the `umadev pr` verb —
+                // delegate to the subprocess (fail-open there) so the TUI never
+                // force-pushes on its own and the readiness rails live in one
+                // place. `/pr` is a dry run; `/pr create` opens the PR.
+                let wants_create = rest.eq_ignore_ascii_case("create");
+                self.push(ChatRole::UmaDev, umadev_i18n::t(self.lang, "pr.scanning"));
+                let output =
+                    self.run_subprocess_cli(if wants_create { "pr --create" } else { "pr" });
+                self.push(ChatRole::System, output);
+                Action::None
+            }
             "usage" => self.slash_usage(),
             "animations" => self.slash_toggle_animations(),
             "bug" => self.slash_bug(),
