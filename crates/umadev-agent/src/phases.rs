@@ -1958,6 +1958,10 @@ fn build_and_zip_proof_pack(
         format!("output/knowledge-cache/{slug}-knowledge-bundle.json"),
         ".umadev/audit/frontend-api-calls.jsonl".to_string(),
         ".umadev/audit/tool-calls.jsonl".to_string(),
+        // Runtime evidence — proof the app actually BOOTS + answers, not just
+        // that it compiles. Written by `verify --runtime`; absent (skipped)
+        // when no runtime check ran, in which case the pack simply omits it.
+        crate::runtime_proof::runtime_proof_rel_path().to_string(),
         ".umadev/workflow-state.json".to_string(),
     ] {
         let p = project_root.join(&name);
@@ -1997,6 +2001,7 @@ fn build_and_zip_proof_pack(
          | `output/{slug}-quality-gate.json` | Quality gate scores (per-check) |\n\
          | `output/{slug}-quality-gate.md` | Human-readable quality report |\n\
          | `output/{slug}-compliance-mapping.json` | SOC2/ISO27001/EU-AI-Act mapping |\n\
+         | `.umadev/audit/runtime-proof.json` | Runtime evidence: dev server booted + routes answered |\n\
          | `.umadev/audit/tool-calls.jsonl` | Audit trail |\n\
          | `knowledge/design-systems/*.md` | Design system definitions |\n\
          | `knowledge/seed-templates/*.md` | Page structure templates |\n\n\

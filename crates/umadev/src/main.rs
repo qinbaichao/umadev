@@ -369,15 +369,26 @@ enum Command {
         hide = true,
         long_about = "Print a structured conformance report for the workspace:\n\
                       spec manifest health, workflow state, evidence chain row counts,\n\
-                      latest quality-gate score, and proof-pack zips.",
+                      latest quality-gate score, and proof-pack zips.\n\
+                      \n\
+                      With --runtime, additionally PROVE the app runs: boot the\n\
+                      detected dev server, wait for it to answer, probe the documented\n\
+                      routes over HTTP, and write `.umadev/audit/runtime-proof.json`\n\
+                      (folded into the delivery proof-pack). Fail-open — a missing dev\n\
+                      server / curl / routes is recorded as 'not verified', never an\n\
+                      error.",
         after_help = "EXAMPLES:\n  \
                       umadev verify\n  \
-                      umadev verify --project-root ./app"
+                      umadev verify --runtime\n  \
+                      umadev verify --runtime --project-root ./app"
     )]
     Verify {
         /// Workspace root; defaults to current directory.
         #[arg(long)]
         project_root: Option<PathBuf>,
+        /// Boot the app and prove it actually runs (dev server + route probes).
+        #[arg(long)]
+        runtime: bool,
     },
     /// Emit the UD-EVID-004 compliance mapping document.
     #[command(
@@ -700,7 +711,10 @@ async fn main() -> Result<()> {
         Command::Usage => cmd_usage(),
         Command::Lessons { project_root } => cmd_lessons(project_root),
         Command::Spec { clauses } => cmd_spec(clauses),
-        Command::Verify { project_root } => cmd_verify(project_root),
+        Command::Verify {
+            project_root,
+            runtime,
+        } => cmd_verify(project_root, runtime).await,
         Command::Report { slug, project_root } => cmd_report(slug, project_root),
         Command::Doctor { project_root } => cmd_doctor(project_root),
         Command::Examples => cmd_examples(),
@@ -2851,7 +2865,7 @@ fn cmd_rollback(timestamp: String, project_root: Option<PathBuf>) -> Result<()> 
     Ok(())
 }
 
-fn cmd_verify(project_root: Option<PathBuf>) -> Result<()> {
+async fn cmd_verify(project_root: Option<PathBuf>, runtime: bool) -> Result<()> {
     let project_root = resolve_root(project_root)?;
     println!("workspace: {}", project_root.display());
     println!(
@@ -2939,7 +2953,91 @@ fn cmd_verify(project_root: Option<PathBuf>) -> Result<()> {
             println!("  - {} ({} KiB)", p.display(), size / 1024);
         }
     }
+
+    // --- runtime proof (UD-EVID-005 runtime evidence) ---
+    // Only when --runtime: boot the app, prove it answers, probe its routes,
+    // and write `.umadev/audit/runtime-proof.json` (folded into the proof-pack).
+    if runtime {
+        let lang = umadev_i18n::current();
+        println!("\n## {}", umadev_i18n::t(lang, "runtime.header"));
+        println!("  {}", umadev_i18n::t(lang, "runtime.running"));
+        let proof = umadev_agent::run_runtime_proof(&project_root).await;
+        match umadev_agent::write_runtime_proof(&project_root, &proof) {
+            Ok(path) => println!(
+                "  {}",
+                umadev_i18n::tf(lang, "runtime.written", &[&path.display().to_string()])
+            ),
+            Err(e) => println!(
+                "  {}",
+                umadev_i18n::tf(lang, "runtime.write_failed", &[&e.to_string()])
+            ),
+        }
+        print_runtime_proof(lang, &proof);
+    }
+
     Ok(())
+}
+
+/// Print the human-readable runtime-proof summary (localized). The structured
+/// JSON is the authoritative artifact; this is the at-a-glance view.
+fn print_runtime_proof(lang: umadev_i18n::Lang, proof: &umadev_agent::RuntimeProof) {
+    use umadev_agent::RuntimeStatus;
+    if let Some(label) = &proof.dev_server {
+        println!(
+            "  {}",
+            umadev_i18n::tf(lang, "runtime.dev_server", &[label])
+        );
+    }
+    if let Some(url) = &proof.base_url {
+        println!("  {}", umadev_i18n::tf(lang, "runtime.base_url", &[url]));
+    }
+    match &proof.status {
+        RuntimeStatus::Verified => {
+            let ready = proof
+                .ready_ms
+                .map_or_else(|| "-".to_string(), |ms| format!("{ms}ms"));
+            println!("  {}", umadev_i18n::tf(lang, "runtime.verified", &[&ready]));
+            let ok = proof.routes.iter().filter(|r| r.ok).count();
+            println!(
+                "  {}",
+                umadev_i18n::tf(
+                    lang,
+                    "runtime.routes",
+                    &[&ok.to_string(), &proof.routes.len().to_string()]
+                )
+            );
+            for r in &proof.routes {
+                let mark = if r.ok { "ok" } else { "!!" };
+                println!(
+                    "    [{mark}] {} → {} ({}ms)",
+                    r.path,
+                    if r.status == 0 {
+                        umadev_i18n::t(lang, "runtime.no_response").to_string()
+                    } else {
+                        r.status.to_string()
+                    },
+                    r.ms
+                );
+            }
+            if let Some(e2e) = &proof.e2e {
+                let key = if e2e.passed {
+                    "runtime.e2e_passed"
+                } else {
+                    "runtime.e2e_failed"
+                };
+                println!(
+                    "  {}",
+                    umadev_i18n::tf(lang, key, &[&e2e.command, &e2e.ms.to_string()])
+                );
+            }
+        }
+        RuntimeStatus::NotVerified(reason) => {
+            println!(
+                "  {}",
+                umadev_i18n::tf(lang, "runtime.not_verified", &[reason])
+            );
+        }
+    }
 }
 
 fn latest_quality_report(root: &Path) -> Option<(PathBuf, bool, i64)> {

@@ -51,6 +51,7 @@ pub mod phases;
 pub mod planner;
 pub mod run_lock;
 pub mod runner;
+pub mod runtime_proof;
 pub mod scaffolding;
 pub mod state;
 pub mod tech_debt;
@@ -78,6 +79,10 @@ pub use planner::{
     phase_from_id, plan as plan_phases, plan_light, redoable_phase_ids, PhasePlan, TaskKind,
 };
 pub use runner::{AgentRunner, RunOptions, RunReport};
+pub use runtime_proof::{
+    run_runtime_proof, runtime_proof_rel_path, write_runtime_proof, E2eResult, RouteProbe,
+    RuntimeProof, RuntimeStatus,
+};
 pub use state::{
     list_snapshots, read_workflow_state, read_workflow_state_diagnostic, restore_snapshot,
     write_workflow_state, ReadState, WorkflowState,

@@ -345,3 +345,17 @@
 "adopt.note_line" = "    · {}"
 "adopt.next_steps" = "下一步:像往常一样描述需求 —— UmaDev 会做增量改动而非重写。可读 UMADEV.md 了解边界与命令。"
 "adopt.tui_running" = "正在接入当前工作区(检测栈 / 索引源码 / 逆向契约)……"
+
+# --- runtime proof (umadev verify --runtime) ---
+"runtime.header" = "运行时证据"
+"runtime.running" = "正在启动 dev server 并探测路由(证明 app 真能跑)……"
+"runtime.written" = "  已写入运行时证据:{}(已并入 proof-pack)"
+"runtime.write_failed" = "  运行时证据写入失败(fail-open,不阻断):{}"
+"runtime.dev_server" = "dev server:{}"
+"runtime.base_url" = "基址:{}"
+"runtime.verified" = "已验证:app 启动并响应(就绪耗时 {})"
+"runtime.routes" = "路由探测:{}/{} 条返回响应"
+"runtime.no_response" = "无响应"
+"runtime.not_verified" = "未验证运行时(fail-open):{}"
+"runtime.e2e_passed" = "e2e 通过:{}({}ms)"
+"runtime.e2e_failed" = "e2e 失败:{}({}ms)"

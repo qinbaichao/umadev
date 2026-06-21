@@ -345,3 +345,17 @@
 "adopt.note_line" = "    · {}"
 "adopt.next_steps" = "Next: describe your requirement as usual — UmaDev will make incremental changes, not a rewrite. See UMADEV.md for boundaries + commands."
 "adopt.tui_running" = "Adopting the current workspace (detect stack / index source / derive contract)…"
+
+# --- runtime proof (umadev verify --runtime) ---
+"runtime.header" = "Runtime evidence"
+"runtime.running" = "Booting the dev server and probing routes (proving the app actually runs)…"
+"runtime.written" = "  Runtime evidence written: {} (folded into the proof-pack)"
+"runtime.write_failed" = "  Runtime evidence write failed (fail-open, not blocking): {}"
+"runtime.dev_server" = "dev server: {}"
+"runtime.base_url" = "base URL: {}"
+"runtime.verified" = "Verified: app booted and answered (ready in {})"
+"runtime.routes" = "Route probes: {}/{} route(s) answered"
+"runtime.no_response" = "no response"
+"runtime.not_verified" = "Runtime not verified (fail-open): {}"
+"runtime.e2e_passed" = "e2e passed: {} ({}ms)"
+"runtime.e2e_failed" = "e2e failed: {} ({}ms)"
