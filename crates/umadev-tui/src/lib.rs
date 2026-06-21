@@ -1242,9 +1242,13 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                 }
                             }
                             Action::RunDeploy { command } => {
-                                // Deploy runs in a background task: `sh -c` the
-                                // recorded command in the workspace, capture
-                                // output, surface success/failure + the live URL.
+                                // Deploy runs in a background task: the deploy
+                                // adapter (fail-open) runs the command in the
+                                // workspace, captures the live URL + log tail
+                                // into a structured DeployProof, and writes
+                                // `.umadev/audit/deploy-proof.json` so the deploy
+                                // is folded into the next proof-pack. We surface
+                                // success/failure + the live URL to the user.
                                 let sink2 = sink.clone();
                                 let root = opts.project_root.clone();
                                 tokio::spawn(async move {
@@ -1252,32 +1256,17 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                         "deploy.running",
                                         &[&command],
                                     )));
-                                    // stdin = /dev/null: the TUI owns the real
-                                    // terminal, so a deploy CLI that wants an
-                                    // interactive login must FAIL FAST on EOF
-                                    // rather than hang invisibly behind the
-                                    // alt-screen. A timeout is the final backstop.
-                                    let fut = tokio::process::Command::new("sh")
-                                        .arg("-c")
-                                        .arg(&command)
-                                        .current_dir(&root)
-                                        .stdin(std::process::Stdio::null())
-                                        .output();
                                     let login_hint = umadev_i18n::tl("deploy.login_hint");
-                                    match tokio::time::timeout(
-                                        std::time::Duration::from_secs(300),
-                                        fut,
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(o)) if o.status.success() => {
-                                            let stdout = String::from_utf8_lossy(&o.stdout);
-                                            // Many deploy CLIs print the live URL.
-                                            let url = stdout
-                                                .lines()
-                                                .find(|l| l.contains("https://"))
-                                                .map(str::to_string);
-                                            let addr = url.clone().unwrap_or_else(|| {
+                                    // stdin = /dev/null inside run_deploy: the TUI
+                                    // owns the real terminal, so a deploy CLI that
+                                    // wants an interactive login must FAIL FAST on
+                                    // EOF rather than hang invisibly behind the
+                                    // alt-screen. A timeout is the final backstop.
+                                    let proof =
+                                        umadev_agent::run_deploy(&root, Some(&command)).await;
+                                    match &proof.status {
+                                        umadev_agent::DeployStatus::Deployed => {
+                                            let addr = proof.url.clone().unwrap_or_else(|| {
                                                 umadev_i18n::tl("deploy.done_no_url").into()
                                             });
                                             sink2.emit(EngineEvent::Note(umadev_i18n::tlf(
@@ -1285,29 +1274,25 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                                 &[&addr],
                                             )));
                                         }
-                                        Ok(Ok(o)) => {
-                                            let stderr = String::from_utf8_lossy(&o.stderr);
+                                        umadev_agent::DeployStatus::NotDeployed(reason) => {
+                                            let exit = proof
+                                                .exit_code
+                                                .map_or_else(|| "-".to_string(), |c| c.to_string());
                                             sink2.emit(EngineEvent::Note(umadev_i18n::tlf(
                                                 "deploy.failed",
-                                                &[
-                                                    &o.status.code().unwrap_or(-1).to_string(),
-                                                    &stderr.chars().take(500).collect::<String>(),
-                                                    login_hint,
-                                                ],
+                                                &[&exit, reason, login_hint],
                                             )));
                                         }
-                                        Ok(Err(e)) => {
-                                            sink2.emit(EngineEvent::Note(umadev_i18n::tlf(
-                                                "deploy.exec_failed",
-                                                &[&command, &e.to_string()],
-                                            )));
-                                        }
-                                        Err(_) => {
-                                            sink2.emit(EngineEvent::Note(umadev_i18n::tlf(
-                                                "deploy.timeout",
-                                                &[login_hint, &command],
-                                            )));
-                                        }
+                                    }
+                                    // Persist the proof (fail-open: a write error
+                                    // never blocks — just no proof-pack capture).
+                                    if let Ok(path) =
+                                        umadev_agent::write_deploy_proof(&root, &proof)
+                                    {
+                                        sink2.emit(EngineEvent::Note(umadev_i18n::tlf(
+                                            "deploy.proof_written",
+                                            &[&path.display().to_string()],
+                                        )));
                                     }
                                 });
                             }

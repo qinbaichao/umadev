@@ -316,6 +316,9 @@
 "deploy.failed" = "[warn] 部署失败(退出码 {}): {}\n  {}"
 "deploy.exec_failed" = "[warn] 无法执行部署命令 ({}): {}"
 "deploy.timeout" = "[warn] 部署超时(>5 分钟,已中止)。{}\n  或在终端手动执行:`{}`"
+"deploy.detected" = "[deploy] 已识别部署目标:{}(若底座未记录部署命令,将自动选用对应命令)。"
+"deploy.proof_written" = "[ok] 已写入部署证据:{}(并入下一个 proof-pack)。"
+"deploy.no_target" = "未识别到部署目标(没有 vercel.json / netlify.toml / Dockerfile / fly.toml / 构建产物)。请补一个平台配置,或手动部署。"
 
 # --- usage / lessons read-only views (umadev usage · umadev lessons · /usage · /lessons) ---
 "usage.empty" = "还没有使用记录。跑一次需求(run)后会自动按阶段统计 token 用量。\n(UmaDev 驱动的是你自己的底座订阅,不会向你计费。)"

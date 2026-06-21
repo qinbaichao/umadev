@@ -12,9 +12,9 @@
 //! - `init`                  write the `umadev.yaml` spec manifest
 //! - `install --host <id>`   wire the real-time governance hook into a base CLI
 //!
-//! The rest (`run` / `continue` / `revise` / `spec` / `verify` / `report` /
-//! `doctor` / `examples` / `guide` / `rollback` / `history`) are hidden from
-//! `--help` but still work for scripts, and mirror TUI slash commands.
+//! The rest (`run` / `continue` / `revise` / `spec` / `verify` / `deploy` /
+//! `report` / `doctor` / `examples` / `guide` / `rollback` / `history`) are
+//! hidden from `--help` but still work for scripts, and mirror TUI slash commands.
 //! `hook` / `uninstall` are hidden internals.
 //!
 //! Anything outside this surface is intentionally absent.
@@ -400,6 +400,40 @@ enum Command {
         #[arg(long)]
         runtime: bool,
     },
+    /// Ship the project: detect the deploy target and (optionally) deploy.
+    #[command(
+        hide = true,
+        long_about = "The post-delivery handoff step. Detect the deploy target from\n\
+                      the workspace's own files (vercel.json / Next.js → Vercel,\n\
+                      netlify.toml → Netlify, fly.toml → Fly, wrangler.* → Cloudflare\n\
+                      Pages, Dockerfile → container image, a built dist/out → static\n\
+                      host) and print the exact deploy command.\n\
+                      \n\
+                      Without --run, this only DETECTS and prints the recipe (safe to\n\
+                      run anywhere). With --run it actually executes the deploy command\n\
+                      against your own logged-in platform CLI, captures the preview URL\n\
+                      + log, and writes `.umadev/audit/deploy-proof.json` (folded into\n\
+                      the delivery proof-pack). UmaDev owns no credentials and injects\n\
+                      nothing — the deploy runs through whatever CLI you've logged in.\n\
+                      \n\
+                      Fail-open: an unknown platform / missing CLI / failed deploy is\n\
+                      recorded as 'not deployed' with a manual hint, never an error.",
+        after_help = "EXAMPLES:\n  \
+                      umadev deploy                 # detect + print the command\n  \
+                      umadev deploy --run           # actually deploy + write proof\n  \
+                      umadev deploy --run --command \"npx vercel --prod\""
+    )]
+    Deploy {
+        /// Workspace root; defaults to current directory.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+        /// Actually run the deploy (default is detect-and-print only).
+        #[arg(long)]
+        run: bool,
+        /// Override the deploy command (defaults to the detected platform's).
+        #[arg(long)]
+        command: Option<String>,
+    },
     /// Emit the UD-EVID-004 compliance mapping document.
     #[command(
         hide = true,
@@ -733,6 +767,11 @@ async fn main() -> Result<()> {
             project_root,
             runtime,
         } => cmd_verify(project_root, runtime).await,
+        Command::Deploy {
+            project_root,
+            run,
+            command,
+        } => cmd_deploy(project_root, run, command).await,
         Command::Report {
             slug,
             project_root,
@@ -3022,6 +3061,29 @@ async fn cmd_verify(project_root: Option<PathBuf>, runtime: bool) -> Result<()> 
         println!("  <no review report yet — `umadev report --review` or the `delivery` phase>");
     }
 
+    // --- deploy proof (post-delivery handoff) ---
+    // Read-only: show any recorded deploy + the detected target so the user
+    // knows whether the product is live and, if not, how to ship it.
+    println!("\n## Deploy");
+    let deploy_proof_path = project_root.join(umadev_agent::deploy_proof_rel_path());
+    if let Some(p) = std::fs::read_to_string(&deploy_proof_path)
+        .ok()
+        .and_then(|b| serde_json::from_str::<umadev_agent::DeployProof>(&b).ok())
+    {
+        println!("  {}", p.summary_line());
+    } else {
+        let target = umadev_agent::detect_deploy_target(&project_root);
+        if let Some(cmd) = target.deploy_command() {
+            println!(
+                "  <not deployed yet — detected {}: `{}` (run `umadev deploy --run`)>",
+                target.label(),
+                cmd
+            );
+        } else {
+            println!("  <no deploy target detected — `umadev deploy` to check>");
+        }
+    }
+
     // --- runtime proof (UD-EVID-005 runtime evidence) ---
     // Only when --runtime: boot the app, prove it answers, probe its routes,
     // and write `.umadev/audit/runtime-proof.json` (folded into the proof-pack).
@@ -3106,6 +3168,78 @@ fn print_runtime_proof(lang: umadev_i18n::Lang, proof: &umadev_agent::RuntimePro
             );
         }
     }
+}
+
+/// `umadev deploy` — the post-delivery handoff. Detects the deploy target and,
+/// with `--run`, executes the deploy (fail-open) and writes the deploy-proof
+/// that folds into the proof-pack. Without `--run` it only prints the recipe.
+async fn cmd_deploy(
+    project_root: Option<PathBuf>,
+    run: bool,
+    command: Option<String>,
+) -> Result<()> {
+    let project_root = resolve_root(project_root)?;
+    let lang = umadev_i18n::current();
+    println!("workspace: {}", project_root.display());
+
+    let target = umadev_agent::detect_deploy_target(&project_root);
+    if target == umadev_agent::DeployTarget::None && command.is_none() {
+        println!("{}", umadev_i18n::t(lang, "deploy.no_target"));
+        return Ok(());
+    }
+    println!(
+        "{}",
+        umadev_i18n::tf(lang, "deploy.detected", &[target.label()])
+    );
+    let recipe = command
+        .clone()
+        .or_else(|| target.deploy_command())
+        .unwrap_or_default();
+    if !recipe.is_empty() {
+        println!(
+            "{}",
+            umadev_i18n::tf(lang, "deploy.confirm_preflight", &[&recipe])
+        );
+    }
+
+    // Detect-and-print only: stop here unless the user explicitly opts in to a
+    // real deploy. The deploy is the user's outward-facing action.
+    if !run {
+        return Ok(());
+    }
+
+    println!("{}", umadev_i18n::tf(lang, "deploy.running", &[&recipe]));
+    let proof = umadev_agent::run_deploy(&project_root, command.as_deref()).await;
+    match &proof.status {
+        umadev_agent::DeployStatus::Deployed => {
+            let addr = proof
+                .url
+                .clone()
+                .unwrap_or_else(|| umadev_i18n::t(lang, "deploy.done_no_url").to_string());
+            println!("{}", umadev_i18n::tf(lang, "deploy.done", &[&addr]));
+        }
+        umadev_agent::DeployStatus::NotDeployed(reason) => {
+            let exit = proof
+                .exit_code
+                .map_or_else(|| "-".to_string(), |c| c.to_string());
+            let login_hint = umadev_i18n::t(lang, "deploy.login_hint");
+            println!(
+                "{}",
+                umadev_i18n::tf(lang, "deploy.failed", &[&exit, reason, login_hint])
+            );
+        }
+    }
+    match umadev_agent::write_deploy_proof(&project_root, &proof) {
+        Ok(path) => println!(
+            "{}",
+            umadev_i18n::tf(lang, "deploy.proof_written", &[&path.display().to_string()])
+        ),
+        Err(e) => println!(
+            "{}",
+            umadev_i18n::tf(lang, "deploy.exec_failed", &[&recipe, &e.to_string()])
+        ),
+    }
+    Ok(())
 }
 
 fn latest_quality_report(root: &Path) -> Option<(PathBuf, bool, i64)> {

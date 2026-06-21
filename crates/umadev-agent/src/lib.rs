@@ -41,6 +41,7 @@ pub mod coach;
 pub mod config;
 pub mod coverage;
 pub mod critics;
+pub mod deploy;
 pub mod error_kb;
 pub mod events;
 pub mod experts;
@@ -68,6 +69,10 @@ pub use adopt::{
 pub use critics::{
     append_team_ledger, docs_team_for_kind, ArchitectureCritic, CriticArtifacts, CriticConsult,
     PmCritic, RoleCritic, RoleVerdict,
+};
+pub use deploy::{
+    deploy_proof_rel_path, detect_deploy_target, run_deploy, write_deploy_proof, DeployProof,
+    DeployStatus, DeployTarget,
 };
 pub use events::{ChannelSink, EngineEvent, EventSink, NullSink, RecordingSink};
 pub use gates::{classify_reply, Gate, GateOutcome};

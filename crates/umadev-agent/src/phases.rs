@@ -2075,6 +2075,11 @@ fn build_and_zip_proof_pack(
         // that it compiles. Written by `verify --runtime`; absent (skipped)
         // when no runtime check ran, in which case the pack simply omits it.
         crate::runtime_proof::runtime_proof_rel_path().to_string(),
+        // Deploy evidence — proof the app was shipped to a live URL (platform /
+        // command / preview URL / status / log tail). Written by `umadev deploy`
+        // / the TUI `/deploy` handoff; absent (skipped) when no deploy ran, in
+        // which case the pack simply omits it.
+        crate::deploy::deploy_proof_rel_path().to_string(),
         ".umadev/workflow-state.json".to_string(),
     ] {
         let p = project_root.join(&name);
@@ -2117,6 +2122,7 @@ fn build_and_zip_proof_pack(
          | `output/{slug}-compliance-mapping.json` | SOC2/ISO27001/EU-AI-Act mapping |\n\
          | `.umadev/audit/security-scan.json` | Pre-PR security scan: leaked-secret + dependency advisories |\n\
          | `.umadev/audit/runtime-proof.json` | Runtime evidence: dev server booted + routes answered |\n\
+         | `.umadev/audit/deploy-proof.json` | Deploy evidence: platform + command + live URL + status |\n\
          | `.umadev/audit/tool-calls.jsonl` | Audit trail |\n\
          | `knowledge/design-systems/*.md` | Design system definitions |\n\
          | `knowledge/seed-templates/*.md` | Page structure templates |\n\n\

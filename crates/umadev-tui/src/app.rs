@@ -4131,11 +4131,23 @@ impl App {
     /// (e.g. `npx vercel --prod`). We run it in the foreground so its login
     /// prompts / output reach the user; the URL is surfaced after.
     fn slash_deploy(&mut self, arg: &str) -> Action {
-        // Pre-flight: check deploy CLI installed.
-        let deploy_cli = ["vercel", "netlify", "wrangler"]
-            .iter()
-            .find(|c| which_on_path(c))
-            .copied();
+        // Detect the deploy target from the workspace's own files (Vercel /
+        // Netlify / Fly / Cloudflare / Docker / static host). This drives both
+        // the CLI pre-flight check and the fallback command when the base never
+        // recorded one.
+        let target = umadev_agent::detect_deploy_target(&self.project_root);
+
+        // Pre-flight: check the deploy CLI is installed. Prefer the detected
+        // platform's CLI; fall back to the common set so a generic project still
+        // gets a useful answer.
+        let deploy_cli = target
+            .cli_binary()
+            .filter(|c| which_on_path(c))
+            .or_else(|| {
+                ["vercel", "netlify", "wrangler", "flyctl", "docker"]
+                    .into_iter()
+                    .find(|c| which_on_path(c))
+            });
         if deploy_cli.is_none() {
             self.push(
                 ChatRole::System,
@@ -4147,7 +4159,22 @@ impl App {
                 umadev_i18n::t(self.lang, "deploy.cli_ready").to_string(),
             );
         }
-        let Some(cmd) = self.deploy_command_from_notes() else {
+
+        // Surface the detected platform so the user sees what we'll deploy to.
+        if target != umadev_agent::DeployTarget::None {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::tf(self.lang, "deploy.detected", &[target.label()]),
+            );
+        }
+
+        // Command priority: the base-recorded `## Deploy command` (most precise),
+        // then the detected platform's canonical command (fail-open fallback so
+        // /deploy still works when the base didn't fill in the recipe).
+        let Some(cmd) = self
+            .deploy_command_from_notes()
+            .or_else(|| target.deploy_command())
+        else {
             self.push(
                 ChatRole::System,
                 umadev_i18n::t(self.lang, "deploy.no_command").to_string(),

@@ -316,6 +316,9 @@
 "deploy.failed" = "[warn] Deploy failed (exit code {}): {}\n  {}"
 "deploy.exec_failed" = "[warn] Could not run the deploy command ({}): {}"
 "deploy.timeout" = "[warn] Deploy timed out (>5 minutes, aborted). {}\n  Or run it manually in your terminal: `{}`"
+"deploy.detected" = "[deploy] Detected deploy target: {} (deploy command auto-selected if the base recorded none)."
+"deploy.proof_written" = "[ok] Deploy evidence written: {} (folded into the next proof-pack)."
+"deploy.no_target" = "No deploy target detected (no vercel.json / netlify.toml / Dockerfile / fly.toml / built bundle). Add a platform config, or deploy manually."
 
 # --- usage / lessons read-only views (umadev usage · umadev lessons · /usage · /lessons) ---
 "usage.empty" = "No usage records yet. After a `run`, per-phase token usage is tracked automatically.\n(UmaDev drives your own base CLI subscription — it never bills you.)"
