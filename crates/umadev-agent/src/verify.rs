@@ -298,6 +298,34 @@ pub fn detect_dev_server(workspace: &Path) -> Option<DevServer> {
     None
 }
 
+/// Resolve a bare program name to a spawnable path. Mirrors the host crate:
+/// on Windows npm-installed tools are `.cmd`/`.exe`/`.bat` shims that
+/// `Command::new("npm")` won't find (CreateProcess only appends `.exe`), so we
+/// search `PATH` over `PATHEXT`. Unchanged off Windows, for explicit paths, or
+/// when nothing matches.
+fn resolve_program(program: &str) -> String {
+    if !cfg!(windows) || program.contains(std::path::is_separator) {
+        return program.to_string();
+    }
+    let Ok(path_var) = std::env::var("PATH") else {
+        return program.to_string();
+    };
+    let pathext =
+        std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    for dir in path_var.split(';') {
+        if dir.is_empty() {
+            continue;
+        }
+        for ext in std::iter::once("").chain(pathext.split(';')) {
+            let candidate = Path::new(dir).join(format!("{program}{ext}"));
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    program.to_string()
+}
+
 /// Check whether a PATH-resolvable binary exists. Used to decide whether a
 /// step is genuinely missing (→ skip) vs the project being broken (→ fail).
 ///
@@ -593,7 +621,7 @@ pub async fn run_verify(workspace: &Path) -> Vec<VerifyOutcome> {
         // produced even when it times out. `wait_with_output` would own the
         // pipes and drop partial output on timeout; instead we detach the
         // readers, race wait() against the timer, then drain the buffers.
-        let mut child = match Command::new(&step.program)
+        let mut child = match Command::new(resolve_program(&step.program))
             .args(&step.args)
             .current_dir(workspace)
             .stdin(Stdio::null())

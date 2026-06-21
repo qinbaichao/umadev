@@ -276,11 +276,42 @@ fn apply_provider_env(cmd: &mut Command, env: &[(String, String)]) {
     }
 }
 
+/// Resolve a bare program name to a spawnable path. On Windows the base CLIs
+/// installed via npm are `.cmd`/`.exe`/`.bat` shims, but `CreateProcess` (and
+/// thus `Command::new`) only auto-appends `.exe` to a bare name -- so a bare
+/// `claude` never finds `claude.cmd` and the base reads as "not installed". We
+/// search `PATH` over `PATHEXT` ourselves and return the first hit's full path
+/// (modern Rust runs `.cmd`/`.bat` via cmd.exe with proper escaping). Returns
+/// the input unchanged off Windows, when it already looks like a path, or when
+/// nothing matches (so the spawn surfaces the real error).
+pub fn resolve_program(program: &str) -> String {
+    if !cfg!(windows) || program.contains(std::path::is_separator) {
+        return program.to_string();
+    }
+    let Ok(path_var) = std::env::var("PATH") else {
+        return program.to_string();
+    };
+    let pathext =
+        std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    for dir in path_var.split(';') {
+        if dir.is_empty() {
+            continue;
+        }
+        for ext in std::iter::once("").chain(pathext.split(';')) {
+            let candidate = std::path::Path::new(dir).join(format!("{program}{ext}"));
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    program.to_string()
+}
+
 /// Run a host CLI subprocess. Errors carry a human-readable string suitable for
 /// `RuntimeError::HostProcess`.
 pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<SubprocessOutput, String> {
     let started = Instant::now();
-    let mut cmd = Command::new(call.program);
+    let mut cmd = Command::new(resolve_program(call.program));
     cmd.args(call.args);
     if matches!(call.channel, PromptChannel::Arg) {
         cmd.arg(call.prompt);
@@ -401,7 +432,7 @@ pub(crate) async fn run_subprocess_streaming(
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     let started = Instant::now();
-    let mut cmd = Command::new(call.program);
+    let mut cmd = Command::new(resolve_program(call.program));
     cmd.args(call.args);
     if matches!(call.channel, PromptChannel::Arg) {
         cmd.arg(call.prompt);
