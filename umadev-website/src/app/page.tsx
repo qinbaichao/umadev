@@ -3,7 +3,7 @@
 import Image from "next/image";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { useEffect, useRef, useState } from "react";
-import { docs, gallery, i18n, releases, type DocBlock, type Lang, type View } from "./content";
+import { asset, docs, gallery, i18n, releases, type DocBlock, type Lang, type View } from "./content";
 import styles from "./page.module.css";
 
 const githubUrl = "https://github.com/umacloud/umadev";
@@ -121,7 +121,7 @@ export default function Home() {
         <button className={styles.brand} type="button" onClick={() => go("home")}>
           <Image
             className={styles.logo}
-            src="/assets/umadev-icon.png"
+            src={asset("/assets/umadev-icon.png")}
             alt="UmaDev logo"
             width={42}
             height={42}
@@ -179,7 +179,7 @@ export default function Home() {
             <section className={styles.hero}>
               <div className={styles.heroBackdrop} aria-hidden="true">
                 <Image
-                  src="/assets/umadev/hero-agent-backdrop.png"
+                  src={asset("/assets/umadev/hero-agent-backdrop.png")}
                   alt=""
                   fill
                   priority
@@ -237,7 +237,7 @@ export default function Home() {
               <div className={styles.heroVisual}>
                 <Image
                   className={styles.heroMark}
-                  src="/assets/umadev/neon-logo-cut.png"
+                  src={asset("/assets/umadev/neon-logo-cut.png")}
                   alt=""
                   width={760}
                   height={760}
@@ -270,7 +270,7 @@ export default function Home() {
               <div className={styles.mascotRail}>
                 {t.mascots.cards.map((card, index) => (
                   <article className={styles.mascotCard} key={card.title}>
-                    <Image src={card.img} alt={card.title} width={360} height={360} />
+                    <Image src={asset(card.img)} alt={card.title} width={360} height={360} />
                     <div>
                       <small>
                         {String(index + 1).padStart(2, "0")} / {card.role}
@@ -409,7 +409,7 @@ export default function Home() {
               <div className={styles.ipCards}>
                 {t.ip.cards.map((card) => (
                   <figure key={card.cap}>
-                    <Image src={card.img} alt={card.cap} width={390} height={390} />
+                    <Image src={asset(card.img)} alt={card.cap} width={390} height={390} />
                     <figcaption>{card.cap}</figcaption>
                   </figure>
                 ))}
@@ -572,7 +572,7 @@ export default function Home() {
           <div className={styles.footerBrand}>
             <Image
               className={styles.logo}
-              src="/assets/umadev-icon.png"
+              src={asset("/assets/umadev-icon.png")}
               alt="UmaDev logo"
               width={42}
               height={42}

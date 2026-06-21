@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { JetBrains_Mono, Manrope, Space_Grotesk } from "next/font/google";
 import "./globals.css";
+import { asset } from "./content";
 
 const manrope = Manrope({
   variable: "--font-manrope",
@@ -26,15 +27,15 @@ export const metadata: Metadata = {
   description:
     "Turn Claude Code, Codex, or OpenCode into a project-director agent that ships PRD, architecture, UI/UX, code, quality gates and proof packs.",
   icons: {
-    icon: "/assets/umadev-icon.png",
-    apple: "/assets/umadev-icon.png",
+    icon: asset("/assets/umadev-icon.png"),
+    apple: asset("/assets/umadev-icon.png"),
   },
   openGraph: {
     title: "UmaDev - AI coding project director",
     description:
       "From one sentence to PRD, architecture, UI/UX, code, quality gate and delivery pack.",
     type: "website",
-    images: [{ url: "/assets/wide-1.png", width: 1672, height: 941 }],
+    images: [{ url: asset("/assets/wide-1.png"), width: 1672, height: 941 }],
   },
 };
 
