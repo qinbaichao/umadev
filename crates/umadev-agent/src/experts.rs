@@ -331,17 +331,39 @@ pub fn uiux_prompt(slug: &str, requirement: &str, prd_excerpt: &str) -> Prompt {
          2. The `:root` CSS block must have 10+ semantic color tokens.\n\
          3. Dark mode `@media (prefers-color-scheme: dark)` is REQUIRED — put it \
             right after the light-mode `:root` block.\n\n\
+         TOKEN ARCHITECTURE (mandatory, how real shipped systems work): three \
+         layers — primitive (raw `--blue-600`) → semantic (`--color-primary: \
+         var(--blue-600)`) → component (`--button-bg: var(--color-primary)`). \
+         Components reference ONLY the semantic/component layer, never raw hex. \
+         Dark mode overrides the SEMANTIC layer only. A complete token set covers \
+         8 categories: color, typography, spacing, radius, border/hairline, \
+         elevation/shadow, z-index (semantic names, never 999/9999), motion.\n\n\
          Required sections (in this EXACT order):\n\
          - # UI/UX — {slug}\n\
+         - ## Visual direction — COMMIT to ONE named direction (editorial-clean / \
+           modern-minimal / tech-utility / soft-warm / bold-geometric / brutalist-bold / \
+           glass-aurora / premium-luxury). Cite 1-3 REAL products as anchors with the \
+           SPECIFIC move to borrow (\"density like Linear, type like Stripe\"), name \
+           THE ONE memorable thing a user will remember, and write one AVOID line \
+           (which direction this product is NOT). Reference-based beats descriptive.\n\
          - ## Color palette — `:root` CSS block with: --color-bg, --color-surface, \
            --color-text, --color-text-secondary, --color-primary, --color-primary-hover, \
            --color-accent, --color-border, --color-error, --color-success. \
-           Add more semantic tokens as the project needs (surface, surface-hover, etc).\n\
+           Name text tokens by EMPHASIS (ink/body/muted), not gray-number; name surfaces \
+           by ELEVATION step (surface-1/2/3); pair every dark surface with an on-dark \
+           text token. Use a near-black/near-white (NEVER #000/#fff), tint neutrals \
+           toward the brand hue. ONE scarce accent (≤3% of viewport, CTA/focus/link only).\n\
          - ## Dark mode — `@media (prefers-color-scheme: dark)` overriding \
            bg/surface/text/border tokens. NOT optional.\n\
          - ## Typography system — font stack (2 families max), 7-step type scale \
-           (--text-xs through --text-3xl), line-height + weight tokens.\n\
-         - ## Spacing scale — 4px base, 8+ steps.\n\
+           (--text-xs through --text-3xl) with BIG jumps (ratio ≥1.25, display 48-96px), \
+           line-height + weight tokens. Scale negative letter-spacing with size on \
+           display (-0.01 to -0.04em), POSITIVE tracking on uppercase eyebrows \
+           (+0.05 to +0.12em); display weight ceiling ≤600. Add ONE signature detail \
+           (an OpenType stylistic set on body, e.g. ss01/ss03, or tabular-nums on money) \
+           so the type is not generic default Inter.\n\
+         - ## Spacing scale — 4px base, 8+ steps. Section rhythm ~64-96px; tight \
+           interior, large gaps between bands.\n\
          - ## Icon library — exactly ONE: Lucide / Heroicons / Tabler.\n\
          - ## Page hierarchy — nested list with route paths.\n\
          - ## Component inventory — for each component:\n\
@@ -360,18 +382,28 @@ pub fn uiux_prompt(slug: &str, requirement: &str, prd_excerpt: &str) -> Prompt {
            describe the state machine: State A → [user action] → State B → ...\n\
            Include: form submit flow, auth flow, CRUD operations, \
            drag-and-drop (if applicable)\n\
-         - ## Motion guidelines — transition tokens + guidelines:\n\
+         - ## Motion guidelines — duration buckets as tokens (fast ~120ms / base \
+           ~220ms / slow ~420ms; exit ≈ 75%% of enter), a crafted ease-out \
+           (cubic-bezier(0.16,1,0.3,1)) NOT bounce/elastic, animate transform/opacity \
+           only (never width/height), one orchestrated staggered page-load reveal over \
+           scattered micro-interactions, plus:\n\
            - When to animate (state changes, reveals, feedback)\n\
            - When NOT to animate (data updates, navigation)\n\
-           - Respect `prefers-reduced-motion`\n\
+           - Respect `prefers-reduced-motion` (a `@media (prefers-reduced-motion: reduce)` block is REQUIRED)\n\
          - ## Accessibility\n\
            - Color contrast ratios (body text ≥ 4.5:1, large text ≥ 3:1)\n\
            - Keyboard navigation order\n\
            - Screen reader landmarks and live regions\n\
            - Focus management (modals trap focus, drawers return focus)\n\
-           - Touch targets (≥ 44px on mobile)\n\n\
-         Self-check: 10+ tokens? Dark mode? Typography 7 sizes? \
-         Every component has states? Every page has interaction spec?"
+           - Touch targets (≥ 44px on mobile)\n\
+         - ## Known gaps — honestly list what this spec does NOT pin down \
+           (so the frontend phase asks rather than inventing a generic default).\n\n\
+         Self-check: ONE named direction + real-product anchor + memorable thing? \
+         10+ semantic tokens (3-layer, no raw hex in components)? Dark mode? \
+         Typography 7 sizes with big jumps + scaled tracking + a signature detail? \
+         Motion duration buckets + reduced-motion? Every component has states? \
+         Every page has interaction spec? Thumbnail test — would a stranger know \
+         WHICH product this is, not just \"an AI page\"?"
     ) + "\n\n"
         + ANTI_SLOP_LAW;
     let user = format!(

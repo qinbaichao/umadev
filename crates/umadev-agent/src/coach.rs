@@ -739,27 +739,44 @@ fn render_docs(slug: &str, req: &str, design_inject: &str) -> String {
            - **Bold Geometric** — high contrast, oversized type, asymmetric grid. \
              Best for: creative agencies, portfolios, brand launches.\n\
            State which you chose and ONE sentence why it fits this product. \
-           Then define ALL tokens deterministically from that choice — the frontend \
-           phase COPIES these tokens, it does not reinvent them.\n\
-         - `## Color palette` — a `:root` CSS block with semantic tokens. \
+           Cite 1-3 REAL products as anchors with the SPECIFIC move to borrow \
+           (\"density like Linear, type like Stripe\"), name THE ONE memorable thing, \
+           and write one AVOID line. Then define ALL tokens deterministically from \
+           that choice — the frontend phase COPIES these tokens, it does not reinvent them.\n\
+         - `## Color palette` — a `:root` CSS block with semantic tokens in a 3-layer \
+           architecture (primitive `--blue-600` → semantic `--color-primary` → \
+           component); components reference ONLY semantic/component tokens, never raw hex; \
+           dark mode overrides the SEMANTIC layer. \
            Require at minimum: `--color-bg`, `--color-surface`, `--color-text`, \
            `--color-text-secondary`, `--color-primary`, `--color-primary-hover`, \
            `--color-accent`, `--color-border`, `--color-error`, `--color-success`. \
+           Name text tokens by EMPHASIS (ink/body/muted) not gray-number; name surfaces \
+           by ELEVATION step; pair every dark surface with an on-dark text token; use a \
+           near-black/near-white (NEVER #000/#fff) with neutrals tinted toward the brand \
+           hue; ONE scarce accent (≤3%% of viewport). \
            NO purple/pink gradients unless the product domain demands it.\n\
          - `## Dark mode` (put this RIGHT AFTER color palette) — a complete \
            `@media (prefers-color-scheme: dark)` block that overrides \
            bg/surface/text/border/shadow tokens. This is NOT optional.\n\
          - `## Typography system` — font stack (2 families max: one for headings, \
-           one for body), type scale (7 steps: `--text-xs` through `--text-3xl`), \
-           line-height tokens, font-weight tokens. NO system-font-only.\n\
+           one for body), type scale (7 steps: `--text-xs` through `--text-3xl`) with \
+           BIG jumps (ratio ≥1.25, display 48-96px). Scale negative letter-spacing with \
+           size on display (-0.01 to -0.04em), POSITIVE tracking on uppercase eyebrows \
+           (+0.05 to +0.12em); display weight ceiling ≤600; line-height + weight tokens. \
+           Add ONE signature detail (an OpenType stylistic set on body — ss01/ss03 — or \
+           tabular-nums on money) so the type is not generic default Inter. NO \
+           system-font-only.\n\
          - `## Spacing scale` — mathematical progression (4px base), at least 8 \
            steps from `--space-1` (4px) to `--space-12` (48px).\n\
          - `## Icon library` — declare exactly ONE: Lucide / Heroicons / Tabler.\n\
          - `## Page hierarchy` — nested list with route paths.\n\
          - `## Component inventory` — list every component the frontend needs, with \
            states: default / hover / active / disabled / loading / error.\n\
-         - `## Motion guidelines` — transition durations + easing functions as tokens \
-           (`--transition-fast: 150ms ease-out`).\n\
+         - `## Motion guidelines` — duration buckets as tokens (fast ~120ms / base \
+           ~220ms / slow ~420ms; exit ≈ 75%% of enter), a crafted ease-out \
+           (`cubic-bezier(0.16,1,0.3,1)`) NOT bounce/elastic, animate transform/opacity \
+           only, one orchestrated page-load reveal, and a required \
+           `@media (prefers-reduced-motion: reduce)` block.\n\
          - `## Anti-patterns` — 5 things this design explicitly avoids \
            (e.g. \"no decorative hero gradients\", \"no AI-chat-shell layout\", \
            \"no emoji as functional icons\").\n\

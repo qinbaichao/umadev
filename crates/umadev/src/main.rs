@@ -1266,6 +1266,10 @@ fn scaffold_design_infrastructure(workspace: &Path) -> usize {
             include_str!("../../../knowledge/design-systems/aesthetic-families.md"),
         ),
         (
+            "knowledge/design-systems/design-system-deep-dive.md",
+            include_str!("../../../knowledge/design-systems/design-system-deep-dive.md"),
+        ),
+        (
             "knowledge/seed-templates/saas-landing.md",
             include_str!("../../../knowledge/seed-templates/saas-landing.md"),
         ),

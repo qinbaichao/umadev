@@ -239,7 +239,122 @@ pub fn scan_design_quality(file_path: &str, content: &str) -> Vec<DesignFinding>
         });
     }
 
+    // 10. Pure black / white as a SURFACE fill. Shipped systems use an off-black /
+    //     off-white (a near-black with a faint brand tint), never literal #000 /
+    //     #fff as a page or panel background — the pure value is a generic tell.
+    //     Scoped to `background`/`background-color` so `color: #fff` (legit text on
+    //     a dark fill) is not flagged.
+    if let Some(hex) = pure_bw_surface(&lower) {
+        out.push(DesignFinding {
+            rule: "pure-bw-surface",
+            severity: DesignSeverity::Soft,
+            note: format!(
+                "Pure `{hex}` as a surface fill — reads as a default template. Use an \
+                 off-black / off-white with a faint brand tint (e.g. #0a0a0b / #fafaf9)."
+            ),
+        });
+    }
+
+    // 11. Heavy display weight. Real design systems cap display/heading weight at
+    //     ≤600 — a `font-weight: 800/900` (or `font-weight: bold` paired with a
+    //     large `font-size`) reads as bombastic AI-template type. Flags 800/900
+    //     anywhere; 700 only when it sits with a display-scale font-size.
+    if let Some(w) = heavy_display_weight(&lower) {
+        out.push(DesignFinding {
+            rule: "heavy-display-weight",
+            severity: DesignSeverity::Soft,
+            note: format!(
+                "Display weight `{w}` — shipped systems cap display type at ≤600 for \
+                 editorial air. Lower the weight and let size/tracking carry hierarchy."
+            ),
+        });
+    }
+
     out
+}
+
+/// Find a pure `#000`/`#fff` (3- or 6-digit) used as a `background` /
+/// `background-color` value. Returns the matched hex for the message. Scoped to
+/// background declarations so legitimate `color: #fff` on a dark fill is ignored.
+fn pure_bw_surface(lower: &str) -> Option<String> {
+    for marker in ["background-color:", "background:"] {
+        let mut from = 0;
+        while let Some(idx) = lower[from..].find(marker) {
+            let start = from + idx + marker.len();
+            let decl = &lower[start..];
+            // The value up to the statement/line end (char-safe cap).
+            let end = decl
+                .find([';', '\n', '}', '{'])
+                .unwrap_or_else(|| floor_boundary(decl, 120));
+            let value = &decl[..end];
+            for pure in ["#000000", "#ffffff", "#000", "#fff"] {
+                // Require the pure hex as a standalone token (next char is not a
+                // hex digit) so `#000` doesn't match inside `#0001ff`.
+                if let Some(p) = value.find(pure) {
+                    let after = value[p + pure.len()..].chars().next();
+                    if after.is_none_or(|c| !c.is_ascii_hexdigit()) {
+                        return Some(pure.to_string());
+                    }
+                }
+            }
+            from = start;
+        }
+    }
+    None
+}
+
+/// Detect a heavy display weight: `font-weight: 800` / `900` anywhere, or `700`
+/// when a display-scale `font-size` (≥ 32px / ≥ 2rem / ≥ 2em) appears in source.
+/// Returns the offending weight for the message.
+fn heavy_display_weight(lower: &str) -> Option<&'static str> {
+    let has_display_size = font_size_has_display_scale(lower);
+    let mut from = 0;
+    while let Some(idx) = lower[from..].find("font-weight:") {
+        let start = from + idx + "font-weight:".len();
+        let decl = &lower[start..];
+        let end = decl
+            .find([';', '\n', '}', '{'])
+            .unwrap_or_else(|| floor_boundary(decl, 24));
+        let value = decl[..end].trim();
+        let weight = value.split_whitespace().next().unwrap_or("");
+        if weight == "900" || weight == "800" {
+            return Some(if weight == "900" { "900" } else { "800" });
+        }
+        if has_display_size && (weight == "700" || weight == "bold") {
+            return Some("700");
+        }
+        from = start;
+    }
+    None
+}
+
+/// Whether any `font-size` declaration uses a display-scale value
+/// (≥ 32px, ≥ 2rem, or ≥ 2em) — used to qualify a `font-weight: 700` as a
+/// display weight rather than a normal bold body run.
+fn font_size_has_display_scale(lower: &str) -> bool {
+    let mut from = 0;
+    while let Some(idx) = lower[from..].find("font-size:") {
+        let start = from + idx + "font-size:".len();
+        let decl = &lower[start..];
+        let end = decl
+            .find([';', '\n', '}', '{'])
+            .unwrap_or_else(|| floor_boundary(decl, 24));
+        let value = decl[..end].trim();
+        let num: f64 = value
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0.0);
+        if (value.ends_with("px") && num >= 32.0)
+            || (value.ends_with("rem") && num >= 2.0)
+            || (value.ends_with("em") && !value.ends_with("rem") && num >= 2.0)
+        {
+            return true;
+        }
+        from = start;
+    }
+    false
 }
 
 /// Find a 6-digit hex that lands in the AI "cream/beige" band: very light,
@@ -547,8 +662,42 @@ mod tests {
     }
 
     #[test]
+    fn flags_pure_black_white_surface_not_text() {
+        // Pure black/white as a SURFACE fill → flagged.
+        assert!(rules("src/a.css", "body{background:#fff}").contains(&"pure-bw-surface"));
+        assert!(rules("src/a.css", "body{background-color:#000000}").contains(&"pure-bw-surface"));
+        // Pure white as TEXT color on a dark fill → legit, not flagged.
+        assert!(
+            !rules("src/a.css", ".btn{color:#fff;background:#0a0a0b}").contains(&"pure-bw-surface")
+        );
+        // A real hex that merely starts with the pure digits is not a false match.
+        assert!(!rules("src/a.css", "body{background:#0001ff}").contains(&"pure-bw-surface"));
+        // An off-black / off-white surface passes.
+        assert!(!rules("src/a.css", "body{background:#fafaf9}").contains(&"pure-bw-surface"));
+    }
+
+    #[test]
+    fn flags_heavy_display_weight() {
+        // 800 / 900 anywhere → flagged.
+        assert!(rules("src/a.css", "h1{font-weight:900}").contains(&"heavy-display-weight"));
+        assert!(rules("src/a.css", ".x{font-weight:800}").contains(&"heavy-display-weight"));
+        // 700 only counts as a display weight when a display-scale size is present.
+        assert!(rules("src/a.css", "h1{font-size:56px;font-weight:700}")
+            .contains(&"heavy-display-weight"));
+        // 700 on body-scale text is a normal bold run, not flagged.
+        assert!(
+            !rules("src/a.css", ".label{font-size:14px;font-weight:700}")
+                .contains(&"heavy-display-weight")
+        );
+        // A restrained display weight (≤600) passes.
+        assert!(!rules("src/a.css", "h1{font-size:64px;font-weight:600}")
+            .contains(&"heavy-display-weight"));
+    }
+
+    #[test]
     fn clean_premium_code_passes() {
         let css = "h1 { font-family: \"Clash Display\", system-ui; color: var(--color-text); \
+                   font-size: 64px; font-weight: 600; background: #0a0a0b; \
                    transition: 200ms cubic-bezier(0.16,1,0.3,1); }";
         assert!(scan_design_quality("src/a.css", css).is_empty());
     }
@@ -585,6 +734,9 @@ mod tests {
             &format!("font-family:{} sans", "黑体".repeat(40)), // overused cap @120
             "标标标9x more",
             &"图".repeat(500),
+            &format!("background:{}", "色".repeat(80)), // pure_bw_surface cap @120
+            &format!("font-weight:{}", "粗".repeat(40)), // heavy_display_weight cap @24
+            &format!("font-size:{}px大", "字".repeat(40)), // font_size_has_display_scale cap @24
         ];
         for c in cases {
             // Must not panic; result is irrelevant.
