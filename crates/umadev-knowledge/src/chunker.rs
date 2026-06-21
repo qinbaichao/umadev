@@ -102,7 +102,7 @@ pub fn chunk_file(knowledge_root: &Path, abs_path: &Path) -> Vec<Chunk> {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default()
         },
-        |p| p.to_string_lossy().to_string(),
+        |p| p.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"),
     );
     // Normalize separators to `/` so the segment-aware phase filter in
     // `retrieve` (which tests `path.starts_with("<dir>/")`) matches on Windows

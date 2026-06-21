@@ -50,9 +50,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo test
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --no-fail-fast
       - name: cargo test (doctests)
-        run: cargo test --workspace --doc
+        run: cargo test --workspace --doc --no-fail-fast
 
   build-release:
     name: build release (${{ matrix.os }})

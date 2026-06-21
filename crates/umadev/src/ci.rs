@@ -87,7 +87,7 @@ pub fn run(opts: &CiOptions) -> std::io::Result<CiResult> {
             .strip_prefix(&opts.project_root)
             .unwrap_or(file)
             .to_string_lossy()
-            .to_string();
+            .replace(std::path::MAIN_SEPARATOR, "/");
         // Read the file (best-effort; skip unreadable files).
         let Ok(content) = std::fs::read_to_string(file) else {
             continue;

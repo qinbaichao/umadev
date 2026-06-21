@@ -100,7 +100,11 @@ pub fn code_digest(project_root: &Path, max_bytes: usize) -> String {
         }
         if let Ok(content) = std::fs::read_to_string(&f) {
             let rel = f.strip_prefix(project_root).unwrap_or(&f);
-            buf.push_str(&format!("\n// ===== {} =====\n", rel.display()));
+            buf.push_str(&format!(
+                "\n// ===== {} =====\n",
+                rel.to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/")
+            ));
             // Truncate by BYTES on a char boundary — `max_bytes` is a byte
             // budget; taking N *chars* would overshoot ~3× on CJK source.
             for ch in content.chars() {

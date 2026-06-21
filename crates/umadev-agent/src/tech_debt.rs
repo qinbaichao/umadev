@@ -120,7 +120,7 @@ pub fn scan_debt(output_dir: &Path) -> Vec<DebtItem> {
             .strip_prefix(output_dir.parent().unwrap_or(Path::new("")))
             .unwrap_or(&p)
             .to_string_lossy()
-            .to_string();
+            .replace(std::path::MAIN_SEPARATOR, "/");
         let Ok(content) = fs::read_to_string(&p) else {
             continue;
         };

@@ -182,8 +182,11 @@ pub fn extract_frontend_calls(project_root: &Path) -> Vec<FrontendCall> {
         };
         let rel = file
             .strip_prefix(project_root)
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| file.to_string_lossy().to_string());
+            .map(|p| p.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"))
+            .unwrap_or_else(|_| {
+                file.to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/")
+            });
         calls.extend(extract_from_file(&rel, &content));
     }
     // Dedupe across ALL files by (method, path). `Vec::dedup` only removes

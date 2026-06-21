@@ -2289,7 +2289,7 @@ impl<R: Runtime> AgentRunner<R> {
                     .strip_prefix(&self.options.project_root)
                     .unwrap_or(f)
                     .to_string_lossy()
-                    .to_string();
+                    .replace(std::path::MAIN_SEPARATOR, "/");
                 let d = umadev_governance::scan_content_with_policy(&rel, &content, &policy);
                 if d.block {
                     out.push(format!(

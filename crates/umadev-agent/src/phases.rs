@@ -2016,7 +2016,9 @@ fn build_and_zip_proof_pack(
 
     for t in &targets {
         let rel = t.strip_prefix(project_root).unwrap_or(t.as_path());
-        let name = rel.to_string_lossy().to_string();
+        let name = rel
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
         if zw.start_file(&name, opts).is_err() {
             continue;
         }
