@@ -399,3 +399,23 @@
 "pr.create_failed" = "`gh pr create` failed (fail-open): {}"
 "pr.git_failed" = "git `{}` failed (fail-open): {}"
 "pr.fallback" = "Could not finish automatically — falling back to the manual steps below. Your repo is left as it was (no force-push, no rewritten commits)."
+
+# auto mode — clarify skip + per-path gate auto-approval announcement
+"auto.clarify_skipped" = "[auto] Skipped clarifying questions automatically (using the original requirement as-is). Switch to /mode guarded if you'd rather answer them."
+"auto.gate_approved" = "[auto] Auto-approved checkpoint `{}` — driving the pipeline forward…"
+
+# failure diagnosis — root-cause guess + concrete next step (appended to errors)
+"diag.rate_limit" = "Likely cause: the base hit a rate limit / quota. Wait a bit, or check your plan; then /redo to re-run."
+"diag.not_logged_in" = "Likely cause: the base isn't logged in (or its key is invalid). Run that base's CLI once in your terminal to log in, then `umadev doctor` to confirm, then /redo."
+"diag.network" = "Likely cause: the network is unreachable or the provider is down. Check your connection / proxy, then /redo."
+"diag.timeout" = "Likely cause: the base took too long (big task or a slow connection). Try /redo; if it keeps timing out, simplify the requirement or run `umadev doctor`."
+"diag.base_missing" = "Likely cause: the base CLI isn't installed or isn't on PATH. Run `umadev doctor` to check, install the base, then /redo."
+"diag.generic" = "Run `umadev doctor` to diagnose the base, then /redo to re-run this phase once it's healthy."
+"diag.empty_body" = "[warn] {} phase: the base returned an EMPTY reply — this artifact is an OFFLINE SKELETON, not a real generation. Once the base is healthy, run /redo to get the real output."
+"diag.transient_retry" = "[warn] Worker call failed transiently ({} phase: {}); retrying in {}ms ({}/{})… ({})"
+"diag.call_failed" = "[warn] {} phase: base call failed ({}) — falling back to an OFFLINE SKELETON for this phase (not a real generation). {}"
+
+# quality gate — inline score + findings instead of pointing at the JSON
+"quality.gate_unreadable" = "[warn] Quality gate file was written but can't be read back ({}) — treating as not-passed to avoid masking a write failure."
+"quality.gate_blocked" = "[warn] Quality gate did NOT pass (score {}/100) — blocking delivery (UD-EVID-003). Fix the items below, then:\n  /redo to re-run the whole pipeline\n  or /continue after fixing to resume"
+"quality.top_findings_header" = "Top findings to fix:"

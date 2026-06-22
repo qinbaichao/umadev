@@ -928,6 +928,21 @@ impl<R: Runtime> AgentRunner<R> {
     /// [`Gate::ClarifyGate`]. The user answers in the TUI; on resume the
     /// answers fold into the requirement and research runs.
     pub async fn run_clarify(&self, use_runtime: bool) -> std::io::Result<RunReport> {
+        // `auto` tier promised "every checkpoint auto-approves and the pipeline
+        // drives end-to-end" — but clarify ALWAYS paused at `ClarifyGate` for a
+        // human to answer, so an `auto` user who said "just go" was still stopped
+        // by the very first question. In `auto`, skip clarify entirely: take the
+        // requirement as-is (empty clarify answers) and drive straight into the
+        // initial block, which pauses at the next checkpoint the auto loop then
+        // also advances. `plan` / `guarded` keep the existing stop-and-ask. We do
+        // NOT hold the run-lock here — `run_initial_block` acquires its own; a
+        // double-acquire from the same PID would `WouldBlock` and wedge the run.
+        if self.options.mode.gates_auto_approve() {
+            self.emit(EngineEvent::Note(
+                umadev_i18n::tl("auto.clarify_skipped").to_string(),
+            ));
+            return self.run_initial_block(use_runtime, None).await;
+        }
         let _run_lock = crate::run_lock::RunLock::acquire(&self.options.project_root)?;
         self.emit(EngineEvent::PipelineStarted {
             slug: self.options.effective_slug(),
@@ -1015,10 +1030,10 @@ impl<R: Runtime> AgentRunner<R> {
                 // lean plan with no further gates). Done.
                 return Ok(report);
             };
-            self.emit(EngineEvent::Note(format!(
-                "[auto] 自动通过检查点 `{}`,继续推进流水线…",
-                gate.id_str()
-            )));
+            // The `[auto] auto-approved …` announcement now lives in
+            // `continue_from_gate` itself, so EVERY auto path — this headless
+            // loop, the TUI's `Block::Continue` auto-advance, any future caller —
+            // reports identically instead of only the loop announcing it.
             report = self.continue_from_gate(gate).await?;
         }
         // Hit the safety ceiling: return the last report rather than loop
@@ -1965,10 +1980,13 @@ impl<R: Runtime> AgentRunner<R> {
                 }
                 Ok(_) => {
                     tracing::warn!(runtime = %runtime.kind().id(), "empty body");
-                    self.emit(EngineEvent::Note(format!(
-                        "[warn] {} 阶段:底座返回空内容 —— 本阶段改用离线模板占位(\
-                         非真实生成,只是骨架)。底座恢复后用 /redo 重跑拿真实产物。",
-                        phase.id()
+                    // Empty body is usually a flaky base reply (truncated stream,
+                    // a base that printed only stderr). Make the downgrade-to-
+                    // offline-skeleton LOUD so the user knows this artifact is a
+                    // placeholder, not a real generation, and how to re-run.
+                    self.emit(EngineEvent::Note(umadev_i18n::tlf(
+                        "diag.empty_body",
+                        &[phase.id()],
                     )));
                     return None;
                 }
@@ -2005,11 +2023,18 @@ impl<R: Runtime> AgentRunner<R> {
                         // before the next attempt — without it the retry hits
                         // the same 429 immediately and wastes the attempt.
                         let delay_ms = base_ms.saturating_mul(2u64.saturating_pow(attempt as u32));
-                        self.emit(EngineEvent::Note(format!(
-                            "[warn] Worker 调用瞬时失败({} 阶段: {err}), {delay_ms}ms 后重试 {}/{}...",
-                            phase.id(),
-                            attempt + 2,
-                            max_retries
+                        // Tag the transient failure with a root-cause guess so the
+                        // user reads "疑似限流, retrying" not a bare error string.
+                        self.emit(EngineEvent::Note(umadev_i18n::tlf(
+                            "diag.transient_retry",
+                            &[
+                                phase.id(),
+                                &err.to_string(),
+                                &delay_ms.to_string(),
+                                &(attempt + 2).to_string(),
+                                &max_retries.to_string(),
+                                umadev_i18n::tl(diagnose_failure(&err_str)),
+                            ],
                         )));
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                         continue;
@@ -2019,10 +2044,18 @@ impl<R: Runtime> AgentRunner<R> {
                         error = %err,
                         "runtime call failed"
                     );
-                    self.emit(EngineEvent::Note(format!(
-                        "[warn] {} 阶段:底座调用失败({err})—— 本阶段改用离线模板占位(\
-                         非真实生成,只是骨架)。/doctor 排查底座,修好后 /redo 重跑拿真实产物。",
-                        phase.id()
+                    // A bare `{err}` left the user with no direction. Append a
+                    // root-cause guess + concrete next step derived from the error
+                    // signature (rate-limit / network / not-logged-in / …). The
+                    // diagnosis is fail-open: an unknown error yields the generic
+                    // "run `umadev doctor`" hint, so we never show LESS than before.
+                    self.emit(EngineEvent::Note(umadev_i18n::tlf(
+                        "diag.call_failed",
+                        &[
+                            phase.id(),
+                            &err.to_string(),
+                            umadev_i18n::tl(diagnose_failure(&err_str)),
+                        ],
                     )));
                     return None;
                 }
@@ -3769,24 +3802,29 @@ impl<R: Runtime> AgentRunner<R> {
             "{}-quality-gate.json",
             self.options.effective_slug()
         ));
-        let quality_passed = if let Ok(qg) = std::fs::read_to_string(&qg_path) {
-            let score = crate::phases::extract_quality_score(&qg);
+        // Keep the gate JSON around: we need it both for the score line AND, when
+        // the gate blocks, to inline the top findings instead of telling the user
+        // to open the file themselves.
+        let qg_body = std::fs::read_to_string(&qg_path).ok();
+        let mut qg_score = "?".to_string();
+        let quality_passed = if let Some(qg) = qg_body.as_deref() {
+            let (score_str, passed) = crate::phases::extract_quality_score(qg);
             self.emit(EngineEvent::Note(format!(
-                "质量门结果: {}/100 · {}",
-                score.0,
-                if score.1 {
+                "质量门结果: {score_str}/100 · {}",
+                if passed {
                     "PASSED [ok]"
                 } else {
                     "BLOCKED [fail]"
                 }
             )));
-            score.1
+            qg_score = score_str;
+            passed
         } else if produced_gate_file {
             // The quality phase wrote the file but we can't read it back —
             // treat as a real failure rather than silently assuming pass.
-            self.emit(EngineEvent::Note(format!(
-                "[warn] 质量门文件写出后无法读回 ({}) — 判定未通过以防掩盖写盘失败。",
-                qg_path.display()
+            self.emit(EngineEvent::Note(umadev_i18n::tlf(
+                "quality.gate_unreadable",
+                &[&qg_path.display().to_string()],
             )));
             false
         } else {
@@ -3794,12 +3832,31 @@ impl<R: Runtime> AgentRunner<R> {
         };
 
         if !quality_passed && use_runtime {
-            self.emit(EngineEvent::Note(
-                "[warn] 质量门未通过 — 阻断 delivery（UD-EVID-003）。请修复后重跑:\n  \
-                 /redo 重跑整个流水线\n  \
-                 或修复后 /continue 继续"
-                    .to_string(),
-            ));
+            // Inline the score + top findings so the user sees WHAT failed and by
+            // HOW much, right here — no need to open the JSON. Fail-open: an
+            // unparsable gate yields no findings block, and we still print the
+            // blocked banner + next steps.
+            let findings = qg_body
+                .as_deref()
+                .map(|b| crate::phases::quality_findings(b, 5))
+                .unwrap_or_default();
+            let findings_block = if findings.is_empty() {
+                String::new()
+            } else {
+                let list = findings
+                    .iter()
+                    .map(|f| format!("  · {f}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!(
+                    "\n{}\n{list}",
+                    umadev_i18n::tl("quality.top_findings_header")
+                )
+            };
+            self.emit(EngineEvent::Note(format!(
+                "{}{findings_block}",
+                umadev_i18n::tlf("quality.gate_blocked", &[&qg_score])
+            )));
             // UD-EVID-003: a worker-backed run that emits passed:false MUST
             // refuse to advance to delivery. Pause at quality so the next
             // `continue` re-checks the gate. Offline/template runs skip this
@@ -4363,6 +4420,18 @@ impl<R: Runtime> AgentRunner<R> {
                 ));
             }
         }
+        // In `auto`, announce the auto-approval on EVERY path into this method
+        // (the headless `run_auto_to_completion` loop, the TUI's `Block::Continue`
+        // auto-advance, any future caller) so the user always sees that the gate
+        // was passed without them — previously only the headless loop announced
+        // it, so the TUI auto-advance was silent. `guarded` / `plan` reach here
+        // only after a real human approval, so no auto note is emitted for them.
+        if self.options.mode.gates_auto_approve() {
+            self.emit(EngineEvent::Note(umadev_i18n::tlf(
+                "auto.gate_approved",
+                &[approved_gate.id_str()],
+            )));
+        }
         let use_runtime_for = |_: &str| !self.runtime.is_offline();
         match approved_gate {
             Gate::ClarifyGate => {
@@ -4866,6 +4935,62 @@ fn phase_progress_hint(phase: Phase) -> &'static str {
     }
 }
 
+/// Classify a base/runtime failure string into a one-line root-cause guess +
+/// concrete next step, returned as a localised string (so a bare `{err}` no
+/// longer leaves the user with no direction).
+///
+/// Pattern-matches the lower-cased error text against the well-known failure
+/// signatures (rate-limit / quota, network unreachable, not-logged-in, timeout,
+/// empty body) and returns the matching i18n hint. Fail-open: an unrecognised
+/// error falls through to a generic "run `umadev doctor`" hint — it never panics
+/// and never blocks, so the worst case is still the original `{err}` plus a
+/// generic pointer, never less information than before.
+fn diagnose_failure(err_lower: &str) -> &'static str {
+    if err_lower.contains("429")
+        || err_lower.contains("too many requests")
+        || err_lower.contains("rate limit")
+        || err_lower.contains("rate_limit")
+        || err_lower.contains("quota")
+        || err_lower.contains("overloaded")
+        || err_lower.contains("529")
+    {
+        "diag.rate_limit"
+    } else if err_lower.contains("not logged in")
+        || err_lower.contains("not authenticated")
+        || err_lower.contains("unauthorized")
+        || err_lower.contains("401")
+        || err_lower.contains("403")
+        || err_lower.contains("login")
+        || err_lower.contains("auth")
+        || err_lower.contains("api key")
+        || err_lower.contains("credential")
+    {
+        "diag.not_logged_in"
+    } else if err_lower.contains("connection refused")
+        || err_lower.contains("connection reset")
+        || err_lower.contains("dns")
+        || err_lower.contains("network")
+        || err_lower.contains("unreachable")
+        || err_lower.contains("502")
+        || err_lower.contains("503")
+        || err_lower.contains("504")
+        || err_lower.contains("bad gateway")
+        || err_lower.contains("service unavailable")
+    {
+        "diag.network"
+    } else if err_lower.contains("timed out") || err_lower.contains("timeout") {
+        "diag.timeout"
+    } else if err_lower.contains("no such file")
+        || err_lower.contains("command not found")
+        || err_lower.contains("not found")
+        || err_lower.contains("enoent")
+    {
+        "diag.base_missing"
+    } else {
+        "diag.generic"
+    }
+}
+
 /// Read the exponential-retry base delay (ms) from
 /// `UMADEV_RETRY_BASE_MS`, defaulting to 2000 (2s). Used by
 /// [`crate::runner::AgentRunner::try_generate`] so transient failures back off
@@ -5246,6 +5371,26 @@ not json at all
                 model: "flaky".into(),
                 usage: Usage::default(),
             })
+        }
+    }
+
+    /// A runtime that ALWAYS fails with a fixed (non-transient) error message —
+    /// used to prove the final failure Note carries a root-cause guess + next
+    /// step rather than a bare error string.
+    struct AlwaysFailRuntime {
+        msg: &'static str,
+    }
+
+    #[async_trait]
+    impl Runtime for AlwaysFailRuntime {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Anthropic
+        }
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> Result<CompletionResponse, RuntimeError> {
+            Err(RuntimeError::HostProcess(self.msg.to_string()))
         }
     }
 
@@ -5658,6 +5803,202 @@ error TS2304: Cannot find name 'Foo'
             );
             assert_eq!(r.final_phase, Phase::Research);
         }
+    }
+
+    #[tokio::test]
+    async fn auto_mode_skips_clarify_gate_and_enters_initial_block() {
+        // 第四波-a #1: `auto` must NOT stop at ClarifyGate. run_clarify should
+        // drive straight into the initial block (paused at docs_confirm, not
+        // clarify) and announce the auto-skip.
+        use crate::events::{EngineEvent, RecordingSink};
+        use std::sync::Arc;
+        let tmp = TempDir::new().unwrap();
+        let mut o = opts(tmp.path());
+        o.mode = crate::trust::TrustMode::Auto;
+        let sink = RecordingSink::new();
+        let runner = AgentRunner::new(
+            umadev_runtime::OfflineRuntime::new(RuntimeKind::Anthropic),
+            o,
+        )
+        .with_event_sink(Arc::new(sink.clone()));
+        runner.start().unwrap();
+        let r = runner.run_clarify(false).await.unwrap();
+        // It did NOT pause at the clarify gate — it ran the initial block and
+        // paused at the docs checkpoint instead.
+        assert_ne!(
+            r.paused_at,
+            Some(Gate::ClarifyGate),
+            "auto must not stop at the clarify gate"
+        );
+        assert_eq!(r.paused_at, Some(Gate::DocsConfirm));
+        // No ClarifyGate was ever opened.
+        assert_eq!(
+            sink.count(|e| matches!(
+                e,
+                EngineEvent::GateOpened {
+                    gate: Gate::ClarifyGate
+                }
+            )),
+            0,
+            "auto must not open the clarify gate"
+        );
+        // It announced the auto-skip ([auto] is the locale-stable marker).
+        let notes: Vec<String> = sink
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::Note(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notes.iter().any(|n| n.starts_with("[auto]")),
+            "auto must announce it skipped clarify: {notes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_still_stops_at_clarify_gate() {
+        // Regression guard for #1: only `auto` skips clarify. `guarded` keeps
+        // stopping at the gate so the human still answers the questions.
+        let tmp = TempDir::new().unwrap();
+        let o = opts(tmp.path()); // default mode = Guarded
+        let runner = AgentRunner::new(
+            umadev_runtime::OfflineRuntime::new(RuntimeKind::Anthropic),
+            o,
+        );
+        runner.start().unwrap();
+        let r = runner.run_clarify(false).await.unwrap();
+        assert_eq!(r.paused_at, Some(Gate::ClarifyGate));
+    }
+
+    #[test]
+    fn diagnose_failure_classifies_known_signatures() {
+        // The root-cause classifier maps each known error family to its own
+        // hint key; an unknown error falls through to the generic key.
+        assert_eq!(
+            diagnose_failure("error 429 too many requests"),
+            "diag.rate_limit"
+        );
+        assert_eq!(diagnose_failure("provider overloaded"), "diag.rate_limit");
+        assert_eq!(
+            diagnose_failure("you are not logged in"),
+            "diag.not_logged_in"
+        );
+        assert_eq!(
+            diagnose_failure("http 401 unauthorized"),
+            "diag.not_logged_in"
+        );
+        assert_eq!(diagnose_failure("connection refused"), "diag.network");
+        assert_eq!(diagnose_failure("502 bad gateway"), "diag.network");
+        assert_eq!(diagnose_failure("operation timed out"), "diag.timeout");
+        assert_eq!(
+            diagnose_failure("command not found: claude"),
+            "diag.base_missing"
+        );
+        assert_eq!(
+            diagnose_failure("something totally unexpected"),
+            "diag.generic"
+        );
+        // Each hint must resolve to non-empty localized text (fail-open never
+        // yields a blank line).
+        for key in [
+            "diag.rate_limit",
+            "diag.not_logged_in",
+            "diag.network",
+            "diag.timeout",
+            "diag.base_missing",
+            "diag.generic",
+        ] {
+            assert!(!umadev_i18n::tl(key).is_empty(), "{key} must be localized");
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_note_carries_root_cause_and_next_step() {
+        // 第四波-a #3①: a base failure Note must append a root-cause guess +
+        // concrete next step, not a bare error string. We drive a phase against
+        // a runtime that always fails with a not-logged-in signature.
+        use crate::events::{EngineEvent, RecordingSink};
+        use std::sync::Arc;
+        let tmp = TempDir::new().unwrap();
+        set_retry_base_ms_for_tests(1);
+        let sink = RecordingSink::new();
+        let runner = AgentRunner::new(
+            AlwaysFailRuntime {
+                msg: "Error: not logged in. Run `claude login`.",
+            },
+            opts(tmp.path()),
+        )
+        .with_event_sink(Arc::new(sink.clone()));
+        runner.start().unwrap();
+        let p = crate::experts::research_prompt("demo", "req", "");
+        let out = runner.try_generate(Phase::Research, p).await;
+        assert!(out.is_none(), "an always-failing base yields no text");
+        let notes: Vec<String> = sink
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::Note(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        // The final failure note must (a) still surface the raw error AND (b)
+        // append a next-step pointer (`umadev doctor` is locale-stable and
+        // appears in the not-logged-in hint).
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("[warn]") && n.contains("umadev doctor")),
+            "failure note must carry a next-step pointer: {notes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn quality_block_note_inlines_score_and_findings() {
+        // 第四波-a #3②: when the quality gate blocks delivery, the Note must
+        // inline the score + top findings so the user doesn't have to open the
+        // JSON.
+        use crate::events::{EngineEvent, RecordingSink};
+        use std::sync::Arc;
+        let tmp = TempDir::new().unwrap();
+        let mut o = opts(tmp.path());
+        o.backend = "claude-code".into(); // use_runtime = true
+        let sink = RecordingSink::new();
+        let runner = AgentRunner::new(FakeRuntime, o).with_event_sink(Arc::new(sink.clone()));
+        runner.start().unwrap();
+        runner.run_initial_block(true, None).await.unwrap();
+        runner.continue_after_docs_confirm().await.unwrap();
+        // The preview→delivery block re-runs the quality phase, which (with a
+        // FakeRuntime that returns "stub") produces a SUB-THRESHOLD gate — so the
+        // delivery-blocked note fires for real. We assert on the SHAPE of that
+        // note: it carries the score line (`/100`) AND a findings block, not that
+        // it matches a hand-written gate (the phase would overwrite it).
+        runner.continue_after_preview_confirm().await.unwrap();
+        let notes: Vec<String> = sink
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::Note(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        // Find the blocked note (locale-stable markers: [warn] + UD-EVID-003).
+        let blocked = notes
+            .iter()
+            .find(|n| n.contains("[warn]") && n.contains("UD-EVID-003"))
+            .unwrap_or_else(|| panic!("a blocked-delivery note must be emitted: {notes:?}"));
+        // It inlines the score (`/100`) so the user doesn't open the JSON…
+        assert!(
+            blocked.contains("/100"),
+            "blocked note must inline the score: {blocked}"
+        );
+        // …and a findings list under the header (`·` bullet from quality_findings).
+        let header = umadev_i18n::tl("quality.top_findings_header");
+        assert!(
+            blocked.contains(header) && blocked.contains("·"),
+            "blocked note must inline the top findings: {blocked}"
+        );
     }
 
     #[tokio::test]

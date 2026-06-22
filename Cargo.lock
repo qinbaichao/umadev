@@ -3137,6 +3137,7 @@ dependencies = [
  "tracing",
  "umadev-contract",
  "umadev-governance",
+ "umadev-i18n",
  "umadev-knowledge",
  "umadev-runtime",
  "umadev-spec",

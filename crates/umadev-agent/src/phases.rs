@@ -2866,6 +2866,50 @@ pub fn extract_quality_score(json: &str) -> (String, bool) {
     (score, passed)
 }
 
+/// Pull the top failing findings out of a quality-gate JSON so they can be shown
+/// INLINE when the gate blocks delivery — instead of telling the user to go open
+/// the JSON file themselves. Returns up to `max` short strings, each
+/// `"<check name>: <details>"`, preferring the lowest-scoring failed/warning
+/// checks and any explicit `critical_failures`. Fail-open: a malformed or
+/// unparsable gate file yields an empty vec (the caller then just omits the
+/// findings block), never an error.
+#[must_use]
+pub fn quality_findings(json: &str, max: usize) -> Vec<String> {
+    let Ok(report) = serde_json::from_str::<QualityReport>(json) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    // Explicit critical failures first — these are the gate's hard blockers.
+    for f in &report.critical_failures {
+        out.push(f.clone());
+        if out.len() >= max {
+            return out;
+        }
+    }
+    // Then the lowest-scoring non-passing checks (worst first), so the user sees
+    // what actually dragged the score down.
+    let mut failing: Vec<&QualityCheck> = report
+        .checks
+        .iter()
+        .filter(|c| c.status != "passed")
+        .collect();
+    failing.sort_by_key(|c| c.score);
+    for c in failing {
+        let line = if c.details.trim().is_empty() {
+            format!("{} ({})", c.name, c.status)
+        } else {
+            format!("{}: {}", c.name, c.details)
+        };
+        if !out.contains(&line) {
+            out.push(line);
+        }
+        if out.len() >= max {
+            break;
+        }
+    }
+    out
+}
+
 /// When the worker returns text via stdout AND already wrote a file to
 /// disk, the disk version is often the richer one (full document) while
 /// stdout may be just a summary. Pick whichever has more substance.
@@ -4093,6 +4137,57 @@ mod tests {
         let json = r#"{"passed":false}"#;
         let (_score, passed) = extract_quality_score(json);
         assert!(!passed);
+    }
+
+    #[test]
+    fn quality_findings_extracts_top_failing_checks() {
+        // critical_failures come first, then the lowest-scoring non-passing
+        // checks (worst first); passing checks never appear.
+        let json = r#"{
+            "passed": false,
+            "total_score": 42,
+            "weighted_score": 42.0,
+            "scenario": "test",
+            "critical_failures": ["Build & test results"],
+            "recommendations": [],
+            "summary": {"executive_summary":"fail","summary_context":{}},
+            "checks": [
+                {"name":"Clean","category":"a","description":"d","status":"passed","score":100,"weight":1.0,"details":"ok"},
+                {"name":"Contract","category":"a","description":"d","status":"failed","score":10,"weight":1.0,"details":"3 calls unmatched"},
+                {"name":"Coverage","category":"a","description":"d","status":"warning","score":55,"weight":1.0,"details":"low FR coverage"}
+            ]
+        }"#;
+        let f = quality_findings(json, 5);
+        // Critical failure first.
+        assert_eq!(f[0], "Build & test results");
+        // Then worst-scoring failing check (Contract, score 10) before Coverage.
+        assert!(f
+            .iter()
+            .any(|x| x.contains("Contract") && x.contains("3 calls unmatched")));
+        let contract_pos = f.iter().position(|x| x.contains("Contract")).unwrap();
+        let coverage_pos = f.iter().position(|x| x.contains("Coverage")).unwrap();
+        assert!(
+            contract_pos < coverage_pos,
+            "worst score must come first: {f:?}"
+        );
+        // The passing check is excluded.
+        assert!(
+            !f.iter().any(|x| x.contains("Clean")),
+            "passed checks excluded: {f:?}"
+        );
+    }
+
+    #[test]
+    fn quality_findings_respects_max_and_fails_open() {
+        let json = r#"{
+            "passed": false, "total_score": 0, "weighted_score": 0.0, "scenario": "t",
+            "critical_failures": ["a","b","c"], "recommendations": [],
+            "summary": {"executive_summary":"x","summary_context":{}}, "checks": []
+        }"#;
+        assert_eq!(quality_findings(json, 2).len(), 2, "max is honoured");
+        // Malformed JSON → empty vec (fail-open), never a panic.
+        assert!(quality_findings("not json at all", 5).is_empty());
+        assert!(quality_findings("{}", 5).is_empty());
     }
 
     #[test]

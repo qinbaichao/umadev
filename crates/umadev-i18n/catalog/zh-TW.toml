@@ -399,3 +399,23 @@
 "pr.create_failed" = "`gh pr create` 失敗(fail-open):{}"
 "pr.git_failed" = "git `{}` 失敗(fail-open):{}"
 "pr.fallback" = "無法自動完成 — 回退到下方手動步驟。儲存庫保持原樣(不 force-push、不改寫既有提交)。"
+
+# auto 模式 — 自動跳過釐清 + 每條路徑一致的自動通過播報
+"auto.clarify_skipped" = "[auto] 已自動通過釐清(用原始需求,不再追問)。想逐條回答就切到 /mode guarded。"
+"auto.gate_approved" = "[auto] 自動通過檢查點 `{}`,繼續推進流水線…"
+
+# 失敗診斷 — 根因猜測 + 下一步(拼接到報錯後)
+"diag.rate_limit" = "疑似原因:底座觸發了限流 / 配額上限。稍等片刻,或檢查你的方案用量;再用 /redo 重跑。"
+"diag.not_logged_in" = "疑似原因:底座未登入(或金鑰失效)。先在終端把該底座 CLI 跑一次完成登入,再 `umadev doctor` 確認,然後 /redo。"
+"diag.network" = "疑似原因:網路不通或服務方不可用。檢查網路 / 代理後,/redo 重跑。"
+"diag.timeout" = "疑似原因:底座耗時過長(任務大或網路慢)。先 /redo;若反覆逾時,簡化需求或 `umadev doctor` 排查。"
+"diag.base_missing" = "疑似原因:底座 CLI 未安裝或不在 PATH。用 `umadev doctor` 檢查,裝好底座後 /redo。"
+"diag.generic" = "用 `umadev doctor` 排查底座,健康後再 /redo 重跑本階段。"
+"diag.empty_body" = "[warn] {} 階段:底座回傳空內容 —— 本階段產物是【離線骨架】,不是真實生成。底座恢復後用 /redo 重跑拿真實產物。"
+"diag.transient_retry" = "[warn] Worker 呼叫瞬時失敗({} 階段:{}), {}ms 後重試 {}/{}…({})"
+"diag.call_failed" = "[warn] {} 階段:底座呼叫失敗({})—— 本階段改用【離線骨架】佔位(非真實生成)。{}"
+
+# 品質門 — 內聯分數 + 問題清單,別讓使用者另開 json
+"quality.gate_unreadable" = "[warn] 品質門檔案寫出後無法讀回 ({}) — 判定未通過以防掩蓋寫盤失敗。"
+"quality.gate_blocked" = "[warn] 品質門未通過(得分 {}/100)— 阻斷 delivery(UD-EVID-003)。修復下列問題後重跑:\n  /redo 重跑整個流水線\n  或修復後 /continue 繼續"
+"quality.top_findings_header" = "待修復的主要問題:"
