@@ -410,6 +410,14 @@ mod tests {
             "continuous.team.cross_review_header",
             "continuous.team.seat_passed",
             "continuous.team.seat_blocking",
+            "continuous.verify_failed",
+            "continuous.quality_gate_result",
+            "continuous.quality_gate_findings",
+            "continuous.quality_gate_blocked",
+            "continuous.governance_catchup",
+            "continuous.governance_clean",
+            "continuous.governance_remaining",
+            "continuous.governance_rework_intro",
         ];
         let cats = catalogs();
         for lang in Lang::ALL {

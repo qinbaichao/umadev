@@ -225,11 +225,51 @@ pub async fn run_block(
         }
         events.emit(EngineEvent::PhaseCompleted { phase });
 
-        // Quality is a REVIEW node too (not a confirm gate): after the quality
-        // phase runs the real build/test/lint, the QA / security / backend /
-        // DevOps seats review the delivered code on read-only forks, and any
-        // blocking findings drive a bounded rework on the main session before
-        // delivery. Advisory + fail-open; never blocks the run.
+        // DETERMINISTIC POST-WRITE GOVERNANCE CATCH-UP — after a code-writing
+        // phase (frontend / backend), scan the WHOLE real source tree for
+        // governance violations (emoji-as-icon / hardcoded colors / AI-slop) and
+        // drive ONE bounded rework round. Critically this is the ONLY governance
+        // path for bases WITHOUT a real-time PreToolUse hook (codex / opencode):
+        // in the continuous loop `govern_tool_call` only OBSERVES + audits the
+        // base's already-applied edits, it does not pre-screen them, so without
+        // this catch-up a non-claude base's written files were never governed.
+        // Fail-open + advisory: it re-delegates a fix but never stops the run.
+        if matches!(phase, Phase::Frontend | Phase::Backend) {
+            governance_catchup(session, options, events).await;
+        }
+
+        // DETERMINISTIC QUALITY GATE (the moat — HARD signal). Before the LLM
+        // critic review, run the SAME deterministic floor the single-shot path
+        // runs: a real build/test/lint via `run_verify` (persisted so the gate
+        // consumes it) + `run_quality` (the scored gate JSON: zero-source hard
+        // check, contract conformance, governance-audit checks, coverage).
+        //
+        // The HARD-STOP semantics mirror the single-shot path EXACTLY: a
+        // heavyweight GATED plan (Greenfield / one-sided) that wrote the three
+        // docs is held to the full scored gate — `passed:false` on a code run is a
+        // disguised failure, so we stop at quality and never deliver. A lean
+        // GATELESS plan (Light / Bugfix / Refactor) wrote NO docs, so it can never
+        // satisfy the document-structure checks; the single-shot lean fast-track
+        // therefore keeps the gate ADVISORY (it still runs verify + writes the
+        // scorecard, but doesn't block) — and so do we, gated on `produces_code`
+        // AND the plan being a heavyweight one. Fail-open: a gate that can't be
+        // produced/read degrades to "pass" so a governor bug never wedges a run.
+        if phase == Phase::Quality {
+            let gated = plan.includes(Phase::DocsConfirm) || plan.includes(Phase::PreviewConfirm);
+            let hard = produces_code && gated;
+            if let Some(stop) = run_quality_gate(options, events, hard).await {
+                return stop;
+            }
+        }
+
+        // Quality is a REVIEW node too (not a confirm gate): after the
+        // deterministic gate above, the QA / security / backend / DevOps seats
+        // review the delivered code on read-only forks — and they now receive the
+        // DETERMINISTIC floor (coverage gaps + contract drift + governance
+        // findings) as context so the LLM pass builds on real findings rather than
+        // an empty floor. Any blocking findings drive a bounded rework on the main
+        // session. Advisory + fail-open; never blocks the run (the gate above is
+        // the hard signal).
         if phase == Phase::Quality {
             review_and_rework(session, options, events, ReviewKind::Quality).await;
         }
@@ -458,6 +498,280 @@ fn finish_turn(events: &Arc<dyn EventSink>, phase: Phase, status: TurnStatus) ->
         TurnStatus::Interrupted => PhaseResult::Failed(format!("{} interrupted", phase.id())),
         TurnStatus::Failed(reason) => PhaseResult::Failed(reason),
     }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Deterministic gatekeepers — the moat, reattached to the continuous default
+// path. These REUSE the single-shot path's deterministic functions rather than
+// re-implementing them, and they are the HARD signal: the LLM critic team stays
+// purely advisory. Every one is fail-open: an error degrades to "pass / no
+// finding" so a governor bug can never wedge the host.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Run the DETERMINISTIC quality gate at the quality phase and decide whether to
+/// HARD STOP. Mirrors the single-shot path's quality block: it ALWAYS runs a real
+/// build/test/lint (`run_verify`, persisted so the gate consumes it) and the
+/// scored gate (`run_quality`, which leaves the auditable scorecard), then reads
+/// the gate JSON back. Returns `Some(HardStop)` to stop the block at quality;
+/// `None` to proceed.
+///
+/// `hard_block` selects the SEMANTICS, matching the single-shot path: a
+/// heavyweight gated code run sets it `true` and a `passed:false` gate becomes a
+/// HARD STOP (refuse to deliver); a lean / docs-only run sets it `false` and the
+/// gate is purely ADVISORY (verify still runs, the scorecard is still written,
+/// but the run is never blocked — a lean plan writes no docs and can't satisfy
+/// the document checks).
+///
+/// **Fail-open by contract:** even with `hard_block`, the gate is only a HARD
+/// signal when it produced a READABLE `passed:false` gate file. `run_quality`
+/// erroring, no gate file, or an unreadable/unparsable gate all degrade to
+/// "proceed" — a governor bug must never wedge a real run. The zero-source hard
+/// gate downstream still independently catches an empty run.
+async fn run_quality_gate(
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    hard_block: bool,
+) -> Option<RunOutcome> {
+    // 1. Real build/test/lint, persisted to `.umadev/audit/verify.jsonl` so
+    //    `run_quality`'s `verify_results_check` folds it into the gate — exactly
+    //    how the single-shot `maybe_verify` feeds the gate. Each step is
+    //    independent + fail-open (a missing manifest yields no steps).
+    let outcomes = crate::verify::run_verify(&options.project_root).await;
+    for o in &outcomes {
+        let _ = crate::verify::record_verify_outcome(&options.project_root, Phase::Quality.id(), o);
+    }
+    if outcomes.iter().any(|o| !o.passed && !o.skipped) {
+        events.emit(EngineEvent::Note(
+            umadev_i18n::tl("continuous.verify_failed").to_string(),
+        ));
+    }
+
+    // 2. The scored gate (zero-source hard check + contract conformance +
+    //    governance-audit checks + coverage), written to
+    //    `output/<slug>-quality-gate.json`. Fail-open: a write error → proceed.
+    let Ok(quality_out) = crate::phases::run_quality(options) else {
+        return None;
+    };
+    let produced_gate_file = quality_out
+        .artifacts
+        .iter()
+        .any(|p| p.to_string_lossy().ends_with("-quality-gate.json"));
+
+    // 3. Read the gate JSON back and extract `(score, passed)` the same way the
+    //    single-shot path does.
+    let qg_path = options
+        .project_root
+        .join("output")
+        .join(format!("{}-quality-gate.json", options.effective_slug()));
+    let qg_body = std::fs::read_to_string(&qg_path).ok();
+    let (score, passed) = match qg_body.as_deref() {
+        Some(qg) => crate::phases::extract_quality_score(qg),
+        // The gate phase wrote a file we can't read back → a disk/permission
+        // failure, not "offline". Treat as not-passed so a write failure can't
+        // masquerade as success — but only when the gate file was actually
+        // produced; otherwise (no gate at all) fail-open to pass.
+        None if produced_gate_file => ("?".to_string(), false),
+        None => return None,
+    };
+
+    events.emit(EngineEvent::Note(umadev_i18n::tlf(
+        "continuous.quality_gate_result",
+        &[&score, if passed { "PASSED" } else { "BLOCKED" }],
+    )));
+
+    // 4. HARD STOP only when the caller asked for hard-block semantics (a
+    //    heavyweight gated code run) AND the gate actually failed. A lean /
+    //    docs-only run keeps the gate advisory — verify ran + the scorecard is
+    //    written, but the run proceeds (matches the single-shot guard exactly).
+    if passed || !hard_block {
+        return None;
+    }
+
+    // Surface the top findings inline so the user sees WHAT failed without
+    // opening the JSON.
+    let findings = qg_body
+        .as_deref()
+        .map(|b| crate::phases::quality_findings(b, 5))
+        .unwrap_or_default();
+    if !findings.is_empty() {
+        let list = findings
+            .iter()
+            .map(|f| format!("  · {f}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        events.emit(EngineEvent::Note(umadev_i18n::tlf(
+            "continuous.quality_gate_findings",
+            &[&list],
+        )));
+    }
+    events.emit(EngineEvent::Note(umadev_i18n::tlf(
+        "continuous.quality_gate_blocked",
+        &[&score],
+    )));
+    Some(RunOutcome::HardStop(format!(
+        "quality gate failed ({score}/100) — pipeline stopped at quality, nothing delivered \
+         (continuous deterministic gate)"
+    )))
+}
+
+/// DETERMINISTIC post-write governance catch-up — scan the whole real source
+/// tree for governance violations and drive ONE bounded rework round on the MAIN
+/// session. Reuses `umadev_governance::scan_content_with_policy` over
+/// [`crate::acceptance::source_files`] (the same scan the single-shot
+/// `run_governance_catchup` and the quality gate use).
+///
+/// This is the ONLY governance feedback loop for bases WITHOUT a real-time
+/// PreToolUse hook: only `claude-code` installs one, so codex / opencode write
+/// files that the continuous loop's `govern_tool_call` merely OBSERVES (it can't
+/// pre-screen an already-applied edit). For those bases this catch-up closes the
+/// gap; for `claude-code` it is skipped (the hook already blocked these at write
+/// time). Keyed off the backend id — a deterministic, host-free check.
+///
+/// **Fail-open + advisory:** a clean scan returns immediately; a rework turn that
+/// fails just leaves the findings for the quality gate to catch — never stops the
+/// run.
+async fn governance_catchup(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+) {
+    if backend_has_realtime_governance(&options.backend) {
+        return;
+    }
+    let violations = governance_scan(options);
+    if violations.is_empty() {
+        return;
+    }
+    events.emit(EngineEvent::Note(umadev_i18n::tlf(
+        "continuous.governance_catchup",
+        &[&violations.len().to_string()],
+    )));
+    let directive = governance_rework_directive(&violations);
+    if !drive_rework_turn(session, options, events, directive).await {
+        return; // rework turn failed → fail-open, leave for the quality gate
+    }
+    let remaining = governance_scan(options);
+    if remaining.is_empty() {
+        events.emit(EngineEvent::Note(
+            umadev_i18n::tl("continuous.governance_clean").to_string(),
+        ));
+    } else {
+        events.emit(EngineEvent::Note(umadev_i18n::tlf(
+            "continuous.governance_remaining",
+            &[&remaining.len().to_string()],
+        )));
+    }
+}
+
+/// Whether a backend id drives a base that governs writes in REAL TIME (a
+/// PreToolUse hook fires before each write). Only `claude-code` does; every other
+/// base writes ungoverned in real time and needs the post-hoc
+/// [`governance_catchup`]. Deterministic + host-free (matches the
+/// `realtime_governance` capability the host crate reports for these bases).
+fn backend_has_realtime_governance(backend: &str) -> bool {
+    backend.eq_ignore_ascii_case("claude-code")
+}
+
+/// Scan every real source file with the governance kernel, returning a bounded
+/// list of `"<rel>: <reason> (<clause>)"` violation strings. Empty = clean. Pure
+/// and fail-open: an unreadable file is skipped, never a panic. Shared by the
+/// catch-up rework loop (which reads it twice) and the critic floor.
+fn governance_scan(options: &RunOptions) -> Vec<String> {
+    let policy = umadev_governance::Policy::load(&options.project_root);
+    let mut out = Vec::new();
+    for f in crate::acceptance::source_files(&options.project_root) {
+        let Ok(content) = std::fs::read_to_string(&f) else {
+            continue;
+        };
+        let rel = f
+            .strip_prefix(&options.project_root)
+            .unwrap_or(&f)
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        let d = umadev_governance::scan_content_with_policy(&rel, &content, &policy);
+        if d.block {
+            out.push(format!(
+                "{rel}: {} ({})",
+                d.reason.split('.').next().unwrap_or("violation").trim(),
+                d.clause
+            ));
+        }
+        if out.len() >= 25 {
+            break;
+        }
+    }
+    out
+}
+
+/// Build ONE imperative governance-rework directive from the scanned violations.
+/// Reuses the single-shot path's wording (design tokens / an icon library / no
+/// AI filler) so the base fixes exactly the flagged files and nothing else.
+fn governance_rework_directive(violations: &[String]) -> String {
+    let mut list = String::new();
+    for v in violations.iter().take(25) {
+        list.push_str("- ");
+        list.push_str(v);
+        list.push('\n');
+    }
+    format!(
+        "{}\n\nViolations:\n{list}\nWhen all are fixed, end your turn.",
+        umadev_i18n::tl("continuous.governance_rework_intro")
+    )
+}
+
+/// The DETERMINISTIC floor for the quality-node critic team — coverage gaps
+/// (`uncovered_requirements`), interface-acceptance gaps, and frontend↔contract
+/// drift fold into `qa_floor`; governance findings fold into `security_floor`.
+/// These are the HARD signal the critics receive as CONTEXT so their semantic
+/// pass builds on real findings instead of an empty floor (the review P0-2 fix).
+/// Pure + fail-open: every contributor swallows its own errors → empty floor.
+fn quality_floor(options: &RunOptions) -> (String, String) {
+    let slug = options.effective_slug();
+    let root = &options.project_root;
+
+    // qa_floor: requirement coverage + interface-acceptance gaps + frontend /
+    // contract drift — the spec→tasks and spec→code halves of the loop.
+    let mut qa: Vec<String> = Vec::new();
+    for r in crate::coverage::uncovered_requirements(root, &slug) {
+        qa.push(format!("coverage gap: {r}"));
+    }
+    for g in crate::acceptance::task_acceptance_gaps(root, &slug) {
+        qa.push(format!("acceptance gap: {g}"));
+    }
+    for v in frontend_contract_drift(options, &slug) {
+        qa.push(format!("contract drift: {v}"));
+    }
+
+    // security_floor: the governance content scan over the real source files.
+    let security = governance_scan(options);
+
+    (qa.join("\n- "), security.join("\n- "))
+}
+
+/// Frontend↔backend contract drift: parse the architecture API table into a
+/// typed contract, extract the frontend's real `fetch`/`axios` calls, and return
+/// the mismatch details (a fetch URL with no matching backend route). Reuses
+/// `umadev_contract` exactly like the single-shot quality gate. Fail-open: an
+/// unreadable architecture doc → empty contract → no drift.
+fn frontend_contract_drift(options: &RunOptions, slug: &str) -> Vec<String> {
+    let arch_text = std::fs::read_to_string(
+        options
+            .project_root
+            .join("output")
+            .join(format!("{slug}-architecture.md")),
+    )
+    .unwrap_or_default();
+    let arch_spec = umadev_contract::parse_architecture(&arch_text, &format!("{slug} API"));
+    let derived = umadev_contract::derive_endpoints_from_requirement(&options.requirement);
+    let contract_spec = umadev_contract::merge_specs(&arch_spec, &derived);
+    if contract_spec.is_empty() {
+        return Vec::new();
+    }
+    let fe_calls = umadev_contract::extract_frontend_calls(&options.project_root);
+    umadev_contract::validate_frontend_vs_contract(&fe_calls, &contract_spec)
+        .into_iter()
+        .map(|v| v.detail)
+        .collect()
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1050,16 +1364,24 @@ impl Blackboard {
         } else {
             String::new()
         };
+        // The deterministic floors are surfaced as CONTEXT to the QA / security
+        // seats (so their semantic pass focuses on what a static check can't see).
+        // At the QUALITY node these are the REAL deterministic findings — coverage
+        // gaps + frontend↔contract drift (→ qa_floor) and governance violations
+        // (→ security_floor) — so the critics build on hard findings rather than an
+        // empty floor (the review P0-2 fix). Empty for the docs / preview nodes.
+        let (qa_floor, security_floor) = if matches!(kind, ReviewKind::Quality) {
+            quality_floor(options)
+        } else {
+            (String::new(), String::new())
+        };
         Self {
             prd,
             architecture,
             uiux,
             code,
-            // The deterministic floors are surfaced as CONTEXT to the QA /
-            // security seats (so their semantic pass focuses on what a static
-            // check can't see). Empty for the docs / preview nodes.
-            qa_floor: String::new(),
-            security_floor: String::new(),
+            qa_floor,
+            security_floor,
         }
     }
 
@@ -2162,5 +2484,210 @@ mod tests {
             Some(v) => std::env::set_var("UMADEV_LEGACY_RUN", v),
             None => std::env::remove_var("UMADEV_LEGACY_RUN"),
         }
+    }
+
+    // ── Deterministic gatekeepers reattached to the continuous default path ──
+    //
+    // These exercise the four moat functions wired back into `run_block`:
+    // (1) the quality HARD GATE (`run_quality_gate`), (2) the contract/coverage
+    // critic floor (`quality_floor`), (3) the post-write governance catch-up
+    // (`governance_catchup`, the codex/opencode no-hook gap), and that the LLM
+    // critic stays advisory while the deterministic gate is the hard signal.
+
+    /// A source file with a hardcoded (non-token) color — trips the governance
+    /// color rule (UD-CODE-002) so the catch-up scan + security floor have a
+    /// real, deterministic finding. A `.tsx` so the color rule's guarded-ext set
+    /// applies.
+    fn seed_ungoverned_source(root: &std::path::Path) {
+        std::fs::write(
+            root.join("App.tsx"),
+            "export const App = () => <div style={{ color: \"#3a7bd5\" }}>hi</div>;\n",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn quality_gate_hard_stops_when_gate_fails_on_code_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Source EXISTS (so the separate zero-source gate is satisfied) but there
+        // are NO docs/evidence, so the deterministic quality gate scores well
+        // below the 90 threshold → `passed:false`. On a code-producing run that is
+        // a HARD STOP at quality — never disguised as success, never delivered.
+        seed_source(tmp.path());
+        let options = opts(
+            tmp.path(),
+            "build a SaaS dashboard web app with login and charts",
+            TrustMode::Auto,
+        );
+        let (events, _rec) = sink();
+
+        let stop = run_quality_gate(&options, &events, true).await;
+        match stop {
+            Some(RunOutcome::HardStop(reason)) => {
+                assert!(
+                    reason.to_lowercase().contains("quality gate failed"),
+                    "hard stop names the quality gate: {reason}"
+                );
+            }
+            other => panic!("code run with a failing gate must hard-stop, got {other:?}"),
+        }
+        // The gate file was actually produced by the deterministic `run_quality`.
+        assert!(tmp.path().join("output/demo-quality-gate.json").exists());
+    }
+
+    #[tokio::test]
+    async fn quality_gate_does_not_block_a_non_code_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `produces_code = false` (a docs/research-only plan): the gate is advisory
+        // here and must NEVER hard-stop, even when the score is poor — the
+        // single-shot path has the identical guard.
+        let options = opts(tmp.path(), "write a research brief only", TrustMode::Auto);
+        let (events, _rec) = sink();
+
+        let stop = run_quality_gate(&options, &events, false).await;
+        assert!(
+            stop.is_none(),
+            "a non-code-producing run must not hard-stop on the quality gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn quality_gate_failure_blocks_inside_the_block_loop() {
+        // End-to-end through `run_block`: the post-preview block drives
+        // Backend → Quality → Delivery. With source present but no docs the gate
+        // fails, so the block HARD-STOPS at quality and NEVER reaches delivery.
+        let tmp = tempfile::tempdir().unwrap();
+        seed_source(tmp.path());
+        let options = opts(
+            tmp.path(),
+            "build a SaaS dashboard web app with login and a database",
+            TrustMode::Auto,
+        );
+        let (events, rec) = sink();
+        // backend turn + quality turn, both clean (the BASE narrates success) —
+        // the deterministic gate is what stops the run, not the base.
+        let mut session = FakeBaseSession::new(vec![vec![done()], vec![done()]]);
+
+        let outcome = run_block(&mut session, &options, &events, Phase::Backend).await;
+        assert!(
+            matches!(outcome, RunOutcome::HardStop(_)),
+            "block must hard-stop at quality, got {outcome:?}"
+        );
+        // It must NOT have emitted a Delivery PhaseStarted — delivery is unreached.
+        let evs = rec.events();
+        assert!(
+            !evs.iter().any(|e| matches!(
+                e,
+                EngineEvent::PhaseStarted {
+                    phase: Phase::Delivery
+                }
+            )),
+            "delivery must be unreached when the quality gate blocks"
+        );
+    }
+
+    #[tokio::test]
+    async fn governance_catchup_runs_for_a_non_claude_base_and_reworks() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_ungoverned_source(tmp.path());
+        // A codex base has NO real-time PreToolUse hook → the catch-up scan must
+        // fire, find the hardcoded-color violation, and inject ONE rework turn.
+        let mut options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
+        options.backend = "codex".to_string();
+        let (events, _rec) = sink();
+        let mut session = FakeBaseSession::new(vec![vec![done()]]);
+        let sent = session.sent_handle();
+
+        governance_catchup(&mut session, &options, &events).await;
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "exactly one governance rework turn injected");
+        assert!(
+            sent[0].to_lowercase().contains("governance violations")
+                || sent[0].contains("治理违规"),
+            "rework directive carries the governance intro: {}",
+            sent[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn governance_catchup_is_skipped_for_claude_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_ungoverned_source(tmp.path());
+        // claude-code governs at WRITE time (PreToolUse hook), so the post-write
+        // catch-up is a no-op — no rework turn, even with a real violation on disk.
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto); // backend = claude-code
+        let (events, _rec) = sink();
+        let mut session = FakeBaseSession::new(vec![vec![done()]]);
+        let sent = session.sent_handle();
+
+        governance_catchup(&mut session, &options, &events).await;
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "claude-code already governs at write time — no catch-up rework"
+        );
+    }
+
+    #[test]
+    fn backend_realtime_governance_only_for_claude() {
+        assert!(backend_has_realtime_governance("claude-code"));
+        assert!(backend_has_realtime_governance("CLAUDE-CODE"));
+        assert!(!backend_has_realtime_governance("codex"));
+        assert!(!backend_has_realtime_governance("opencode"));
+    }
+
+    #[test]
+    fn quality_floor_collects_coverage_and_governance_findings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // A PRD declaring FR ids that NO task covers → a coverage gap in qa_floor.
+        std::fs::create_dir_all(root.join("output")).unwrap();
+        std::fs::write(
+            root.join("output/demo-prd.md"),
+            "| FR-001 | login |\n| FR-002 | logout |\n",
+        )
+        .unwrap();
+        // A real source file with a hardcoded color → a security_floor finding.
+        seed_ungoverned_source(root);
+        let options = opts(root, "build a dashboard", TrustMode::Auto);
+
+        let (qa, security) = quality_floor(&options);
+        assert!(
+            qa.contains("coverage gap") && (qa.contains("FR-001") || qa.contains("FR-002")),
+            "qa_floor surfaces the uncovered requirements: {qa}"
+        );
+        assert!(
+            !security.trim().is_empty() && security.contains("App.tsx"),
+            "security_floor surfaces the governance violation: {security}"
+        );
+    }
+
+    #[tokio::test]
+    async fn quality_node_critic_team_receives_the_deterministic_floor() {
+        // The quality-node blackboard must hand the critics a NON-empty floor (the
+        // review P0-2 fix): the seat's judge prompt is built from `CriticArtifacts`
+        // whose `qa_floor` / `security_floor` come from `quality_floor`. Read the
+        // Quality blackboard directly and assert the floors are populated.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("output")).unwrap();
+        std::fs::write(root.join("output/demo-prd.md"), "| FR-001 | login |\n").unwrap();
+        seed_ungoverned_source(root);
+        let options = opts(root, "build a dashboard", TrustMode::Auto);
+
+        let bb = Blackboard::read(&options, ReviewKind::Quality);
+        let arts = bb.artifacts(&options.requirement);
+        assert!(
+            !arts.qa_floor.trim().is_empty(),
+            "quality critics must get a non-empty qa_floor (coverage/contract)"
+        );
+        assert!(
+            !arts.security_floor.trim().is_empty(),
+            "quality critics must get a non-empty security_floor (governance)"
+        );
+        // The docs node, by contrast, has no code floor.
+        let docs_bb = Blackboard::read(&options, ReviewKind::Docs);
+        let docs_arts = docs_bb.artifacts(&options.requirement);
+        assert!(docs_arts.qa_floor.is_empty() && docs_arts.security_floor.is_empty());
     }
 }
