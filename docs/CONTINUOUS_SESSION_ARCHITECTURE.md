@@ -19,6 +19,29 @@
 一个**持续的 agentic 会话**,连续用工具干活。`umadev` 该退回去做编排 + 治理 + 设门,
 而不是把活剁成 9 段单发。
 
+## 1.5 最本质的原则:UmaDev 是一个持续存在的总监 Agent
+
+UmaDev **本身就是一个 Agent**,加载了底座的大脑(一个常驻的持续会话就是它的"意识")。
+它不是"聊天模式 / 运行模式"两套割裂的东西 —— 它是**一个总监,用底座这个脑子理解用户说的每句话,
+然后决定要不要驱动底座去干活、干什么活**。我们是**一个 Agent,驱动底座去做任何事**。
+
+```
+用户输入 → 总监(底座大脑)理解意图 → 驱动同一个持续会话做对应的事:
+  · 闲聊/提问("你好"/"这怎么用")     → 正常对话,不启动流水线
+  · 完整需求("做一个 SaaS 仪表盘")   → 驱动底座 + 调团队跑 9 阶段
+  · 临时任务("审这段代码"/"改个bug") → 驱动底座做这件具体的活(agentic,非全流水线)
+```
+
+**关键统一**:聊天、临时任务、完整流水线 **不是三个独立代码路径**,而是**同一个总监 Agent
+对同一个持续底座会话的不同驱动**。它们共享:
+- **同一个持续会话**(底座大脑全程在线,不为每件事重开)
+- **同一份记忆 / 上下文**(它记得刚聊过什么、刚改过什么、需求是什么)
+- **同一套治理 + 团队 + 门**(干活时按规范拦截、调团队、设门;闲聊时不打扰)
+
+这取代现在 chat / agentic / run 三套分叉。意图判定(闲聊 vs 任务 vs 需求)只决定"总监把这个持续
+会话导向做什么",不再为每种意图 spawn 不同的东西。`run_lock` 等单写者约束依然保证"真正改文件的活"
+串行、可治理;闲聊和只读评审不占写锁。
+
 ## 2. 统一抽象:`BaseSession`
 
 三个底座的持续模式形状完全一致,抽象成一个 trait(取代现有 `Runtime::complete` 单发语义):
@@ -93,6 +116,35 @@ for phase in plan.phases() {                        // research,docs,[门],spec,
 **治理两条路**(并存):
 - **常态** — 安装 `settings.json` 的 `PreToolUse` hook 调 `umadev hook`(claude);opencode/codex 走事件流里的 tool-call 审计 + ruleset。
 - **关键节点** — 在线裁决(claude `can_use_tool` / codex `requestApproval` / opencode `permission.asked`),可改写入参(强制去 emoji/紫色)或打回。
+
+## 3.5 总监的团队花名册(顶级开发团队作为可调度的角色席位)
+
+UmaDev = **项目总监 Agent**,不是"调 LLM 的脚本"。底座是干活的工程师,总监不亲自敲代码,
+它**调度一支完整的顶级团队、把关、拍板**。每个角色是一种**可调用的能力**(注入专属 persona + 职责 + 评审标准)。
+
+| 席位 | 类型 | 职责 | 总监在哪调用 | 现状 |
+|---|---|---|---|---|
+| 产品经理(PM) | 评审 | 需求拆解、范围、验收标准、KPI | docs 门 | `PmCritic` 已有 |
+| 架构师 | 评审 | 技术选型、分层分包、接口契约 | docs 门 / spec | `ArchitectureCritic` 已有 |
+| UI/UX 设计师 | 评审 | 设计系统、令牌、信息架构、反 AI-slop | docs 门 / 预览门 | **待补 `UiuxCritic`** |
+| 前端工程师 | 干活 + 评审 | 写前端代码 / 审前端实现质量 | frontend 阶段 / 预览门 | persona 有,**待补 `FrontendCritic`** |
+| 后端工程师 | 干活 + 评审 | 写后端代码 / 审接口数据服务层 | backend 阶段 | persona 有,**待补 `BackendCritic`** |
+| 测试 / QA | 评审 | 测试策略、用例、真跑 verify、覆盖率 | quality | `QaCritic` 已有 |
+| 安全 / 红队 | 评审 | 漏洞扫描、攻击面、合规、pre-PR | quality / delivery | `SecurityCritic` 已有 |
+| 运维 / DevOps | 评审 | 部署、CI、运行时证据、上线 | delivery | **待补 `DevOpsCritic`** |
+| 总监评审 | 决策 | 汇总各席位裁决 + 硬门 + 质量,拍板过/不过 | 每个门 / 最终交付 | runner(确定性)兼任,可显式化 |
+
+**两种调用方式**(对应两类工作):
+- **干活角色**(前端/后端工程师)→ 在**主持续会话**里注入该角色 persona 的命令式指令,底座连续用工具真写代码。
+- **评审角色**(PM/架构/UIUX/QA/安全/DevOps)→ `fork()` 出**只读分叉会话**,各自独立评审主线产出,返回 `RoleVerdict{accepts, blocking[], advisory[], evidence[]}`(`critics.rs` 已有的强 schema)。总监汇总:任一 blocking → 打回返工;全 accept → 过门。
+
+**总监按节点点名组队**(团队规模随任务复杂度缩放,`*_team_for_kind`):
+- docs 门 → PM + 架构 + UIUX
+- 预览门 → UIUX + 前端
+- quality → QA + 安全 + DevOps
+- 每门 / 交付 → 总监汇总拍板
+
+**硬不变量**(`critics.rs` 已锁):评审角色**只读不写**(fork 隔离),fail-open(评审够不到底座 → 空裁决=ACCEPT,绝不阻塞),确定性地板(coverage/contract/verify/硬门)才是真硬门,critic 是 advisory 叠加。
 
 ## 4. 三底座各自实现(`umadev-host`)
 
