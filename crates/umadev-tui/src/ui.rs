@@ -1234,20 +1234,26 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
         umadev_agent::TrustMode::Plan => theme::INFO(),
     };
     let mode_chip = umadev_i18n::t(app.lang, mode.chip_key());
-    meta_row(
-        frame,
-        prompt_chunks[1],
-        border_color,
-        &[
-            ("UmaDev".into(), theme::ACCENT()),
-            ("·".into(), theme::BORDER()),
-            (backend.into(), theme::TEXT_MUTED()),
-            ("·".into(), theme::BORDER()),
-            (mode_chip.into(), mode_color),
-            ("·".into(), theme::BORDER()),
-            (hint.into(), theme::TEXT_MUTED()),
-        ],
-    );
+    let mut parts: Vec<(String, Color)> = vec![
+        ("UmaDev".into(), theme::ACCENT()),
+        ("·".into(), theme::BORDER()),
+        (backend.into(), theme::TEXT_MUTED()),
+        ("·".into(), theme::BORDER()),
+        (mode_chip.into(), mode_color),
+    ];
+    // Persistent "queued N" chip — stays visible the whole time input is parked
+    // (a routed turn still in flight, or a steer waiting on a gate), so the user
+    // never has to remember a one-off System note that has since scrolled away.
+    // Bracket-tag style (emoji-free) to match the existing [gate] / [queued]
+    // markers. Hidden when nothing is queued.
+    let queued = app.queued_count();
+    if queued > 0 {
+        parts.push(("·".into(), theme::BORDER()));
+        parts.push((format!("[queued {queued}]"), theme::WARNING()));
+    }
+    parts.push(("·".into(), theme::BORDER()));
+    parts.push((hint.into(), theme::TEXT_MUTED()));
+    meta_row(frame, prompt_chunks[1], border_color, &parts);
 }
 
 /// Helper to render the meta row as a sequence of styled spans, left-aligned.
@@ -2097,5 +2103,36 @@ mod tests {
             let _ = app.apply_key(KeyCode::PageDown);
         }
         assert!(render(&app).contains("Editing & exit"));
+    }
+
+    #[test]
+    fn queued_chip_appears_in_meta_row_when_queue_non_empty() {
+        let mut app = app_with(Some("offline"));
+        // Nothing queued → no chip.
+        assert!(
+            !render_to_string(&app).contains("queued"),
+            "no queued chip when the queue is empty"
+        );
+        // Park two chat turns → the persistent chip shows the count.
+        app.queued_chat.push_back("a".into());
+        app.queued_chat.push_back("b".into());
+        let out = render_to_string(&app);
+        assert!(
+            out.contains("[queued 2]"),
+            "the meta row must show a persistent queued count: {out}"
+        );
+    }
+
+    #[test]
+    fn queued_chip_disappears_when_queue_drains() {
+        let mut app = app_with(Some("offline"));
+        app.queued_chat.push_back("a".into());
+        assert!(render_to_string(&app).contains("[queued 1]"));
+        // Drain it → the chip is gone again (purely display-driven, no residue).
+        let _ = app.take_next_queued_chat();
+        assert!(
+            !render_to_string(&app).contains("queued"),
+            "the chip must disappear once the queue empties"
+        );
     }
 }

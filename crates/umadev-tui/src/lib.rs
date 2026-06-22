@@ -218,6 +218,12 @@ In chat mode just reply conversationally — do NOT perform the task, edit files
 enum RouteDecision {
     Chat(String),
     Run(String),
+    /// The route produced no usable reply (base init failed, an empty reply, or
+    /// a hard error). Carries the human-readable reason. Routed through the same
+    /// channel as `Chat` / `Run` — instead of a bare `EngineEvent::Note` — so
+    /// the event loop clears the "thinking…" status on EVERY terminal route
+    /// outcome, and a plain progress Note never has to (and no longer does).
+    Failed(String),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -487,7 +493,9 @@ fn spawn_route(
         ) {
             Ok(b) => b,
             Err(e) => {
-                sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                // Terminal route outcome → flow through `route_tx` so the event
+                // loop clears `thinking` (a bare Note no longer does).
+                let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
                     "base.init_failed",
                     &[&label, &e.to_string()],
                 )));
@@ -531,7 +539,9 @@ fn spawn_route(
                 } else {
                     let body = response.text.trim();
                     if body.is_empty() {
-                        sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                        // Terminal route outcome → route channel (clears
+                        // `thinking`), not a bare Note.
+                        let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
                             "base.empty_reply",
                             &[&label],
                         )));
@@ -543,13 +553,81 @@ fn spawn_route(
                 }
             }
             Err(e) => {
-                sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                // Terminal route outcome → route channel (clears `thinking`).
+                let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
                     "route.failed",
                     &[&label, &e.to_string()],
                 )));
             }
         }
     });
+}
+
+/// Build a [`RouteTurn`] from the current app state and spawn it. The single
+/// place a chat turn is dispatched — used both by the `Action::Route` key path
+/// and by the queue-drain that fires the next parked turn once the current
+/// route result lands. Marks `thinking` so the status animates immediately, and
+/// flips `host_chat_session_active` so a host-CLI base resumes (not cold-starts)
+/// the NEXT turn. Routing same-session turns is kept strictly serial: the only
+/// callers fire one turn and wait for its `RouteDecision` before firing another.
+fn fire_route(
+    app: &mut App,
+    sink: &Arc<ChannelSink>,
+    route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+    text: String,
+) {
+    let spec = app.brain_spec();
+    let host_cli = matches!(spec, BrainSpec::HostCli(_));
+    let continue_session = app.host_chat_session_active;
+    // Pin a stable id so a host CLI (claude) resumes OUR chat session by id,
+    // never "the most recent in this dir".
+    let session_id = if host_cli {
+        Some(app.ensure_chat_session_id())
+    } else {
+        None
+    };
+    // A re-fired queued turn starts a fresh in-flight route → animate again.
+    // (The renderer reads `thinking` directly each frame, so no explicit
+    // status refresh is needed here; the loop redraws on the next tick.)
+    app.thinking = true;
+    app.thinking_started = Some(std::time::Instant::now());
+    app.last_output_at = None;
+    app.tool_in_progress = false;
+    spawn_route(
+        RouteTurn {
+            text,
+            history: app.conversation_snapshot(),
+            spec: spec.clone(),
+            continue_session,
+            session_id,
+            fallback_model: app.effective_model(),
+            project_root: app.project_root.clone(),
+        },
+        sink.clone(),
+        route_tx.clone(),
+    );
+    // A host-CLI base persists its own session — mark it active so the NEXT
+    // turn resumes instead of starting cold. HTTP / offline bases keep their
+    // memory elsewhere and ignore this flag.
+    if host_cli {
+        app.host_chat_session_active = true;
+    }
+}
+
+/// After a TERMINAL chat route outcome (`Chat` / `Failed`), fire the next turn
+/// the user parked while the route was in flight, keeping same-session routing
+/// serial. Returns `true` if a parked turn was dispatched.
+fn drain_next_queued_chat(
+    app: &mut App,
+    sink: &Arc<ChannelSink>,
+    route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+) -> bool {
+    if let Some(text) = app.take_next_queued_chat() {
+        fire_route(app, sink, route_tx, text);
+        true
+    } else {
+        false
+    }
 }
 
 fn parse_route_decision(text: &str) -> Option<RouteDecision> {
@@ -938,14 +1016,34 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                 match maybe_route {
                     // The base chose to talk: render the reply and remember it
                     // as the assistant turn so the next message has continuity.
+                    // Then fire the next turn the user parked while this route
+                    // was in flight (serial — never two routes at once).
                     Some(RouteDecision::Chat(reply)) => {
                         app.record_chat_reply(reply);
+                        drain_next_queued_chat(app, &sink, &route_tx);
+                    }
+                    // The route produced no usable reply. `record_route_failed`
+                    // clears `thinking`; then drain the parked queue so a failed
+                    // turn doesn't strand the messages typed behind it.
+                    Some(RouteDecision::Failed(note)) => {
+                        app.record_route_failed(note);
+                        drain_next_queued_chat(app, &sink, &route_tx);
                     }
                     // The base chose to build: note it in conversation memory,
                     // then kick off the 9-phase pipeline.
                     Some(RouteDecision::Run(requirement)) => {
                         app.record_run_started(&requirement);
                         app.prepare_worker_routed_run(&requirement);
+                        // Any chat turns the user parked while routing now belong
+                        // to this run — fold them into the pipeline steer queue so
+                        // they fire at the first gate (instead of being dropped by
+                        // the run reset). `prepare_worker_routed_run` already
+                        // cleared the prior steer, so this is a clean handoff.
+                        let parked: Vec<String> =
+                            std::iter::from_fn(|| app.take_next_queued_chat()).collect();
+                        if !parked.is_empty() {
+                            app.queued_steer = Some(parked.join("\n"));
+                        }
                         let run_opts = RunOptions {
                             project_root: opts.project_root.clone(),
                             requirement,
@@ -1123,35 +1221,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                 ));
                             }
                             Action::Route(text) => {
-                                let spec = app.brain_spec();
-                                let host_cli = matches!(spec, BrainSpec::HostCli(_));
-                                let continue_session = app.host_chat_session_active;
-                                // Pin a stable id so a host CLI (claude) resumes
-                                // OUR chat session by id, never "the most recent
-                                // in this dir".
-                                let session_id =
-                                    if host_cli { Some(app.ensure_chat_session_id()) } else { None };
-                                spawn_route(
-                                    RouteTurn {
-                                        text,
-                                        history: app.conversation_snapshot(),
-                                        spec: spec.clone(),
-                                        continue_session,
-                                        session_id,
-                                        fallback_model: app.effective_model(),
-                                        project_root: app.project_root.clone(),
-                                    },
-                                    sink.clone(),
-                                    route_tx.clone(),
-                                );
-                                // A host-CLI base persists its own session —
-                                // mark it active so the NEXT turn resumes
-                                // instead of starting cold. HTTP / offline
-                                // bases keep their memory elsewhere and ignore
-                                // this flag.
-                                if host_cli {
-                                    app.host_chat_session_active = true;
-                                }
+                                fire_route(app, &sink, &route_tx, text);
                             }
                             Action::Revise(text) => {
                                 // Re-run the block that PRODUCED the current
@@ -1504,7 +1574,7 @@ mod tests {
             .expect("route channel should stay open until event");
         match route {
             RouteDecision::Chat(body) => assert!(body.contains("UmaDev")),
-            other @ RouteDecision::Run(_) => {
+            other @ (RouteDecision::Run(_) | RouteDecision::Failed(_)) => {
                 panic!("expected local chat fallback, got {other:?}")
             }
         }

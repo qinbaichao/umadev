@@ -430,6 +430,16 @@ pub struct App {
     /// producing block with the queued text folded in as a revision.
     pub pending_steer: Option<String>,
 
+    /// Chat turns the user typed WHILE a routed turn was still in flight
+    /// (`thinking == true`). We never spawn a second `spawn_route` against the
+    /// same chat session concurrently — that would resume one `session_id` in
+    /// two base subprocesses at once and scramble the reply order / memory.
+    /// Instead each extra turn is parked here (FIFO) and the event loop fires
+    /// the next one only after the current route result lands. Kept distinct
+    /// from [`queued_steer`], which is the *pipeline-run* queue (fires at a
+    /// gate), not the chat-routing queue.
+    pub queued_chat: std::collections::VecDeque<String>,
+
     /// **Streaming throttle** — tracks the last tool-use name + count so
     /// consecutive same-type tool calls (e.g. 10 × Read) collapse into one
     /// line `[read] Read (10): file1, file2, …` instead of flooding the chat.
@@ -536,6 +546,7 @@ impl App {
             pending_auto_continue: None,
             queued_steer: None,
             pending_steer: None,
+            queued_chat: std::collections::VecDeque::new(),
             stream_tool_batch: None,
             stream_text_active: false,
             last_output_at: None,
@@ -1467,13 +1478,16 @@ impl App {
                 }
             }
             EngineEvent::Note(note) => {
-                // A Note during routing usually means the route resolved (often
-                // an error/fallback) — stop the "thinking…" status.
-                self.thinking = false;
-                self.thinking_started = None;
-                // A progress note is a sign of life (artifact written, a phase
-                // heartbeat, governance) → reset the stall clock so the red cue
-                // only fires when the pipeline is TRULY silent.
+                // A bare progress Note must NOT clear `thinking`. A route is
+                // still in flight here (its TERMINAL outcome arrives as a
+                // `RouteDecision` on the route channel — `Chat` / `Run` /
+                // `Failed` — each of which clears `thinking` itself). An
+                // unrelated heartbeat (`route.resume_retry`, a pipeline note,
+                // governance) reaching this arm used to prematurely kill the
+                // animation, making a live route look "stuck with no result".
+                // A progress note is still a sign of life (artifact written, a
+                // phase heartbeat, governance) → reset the stall clock so the
+                // red cue only fires when the pipeline is TRULY silent.
                 self.mark_output();
                 self.push(ChatRole::System, note);
             }
@@ -1955,8 +1969,33 @@ impl App {
                 Action::None
             }
             KeyCode::Char('c') if ctrl => {
-                // Ctrl+C: clear a non-empty input; on empty input behave like Esc
-                // (interrupt a run / quit-confirm).
+                // Ctrl+C parity with Claude Code / opencode: while work is in
+                // flight (a pipeline run OR a routed chat turn), Ctrl-C
+                // INTERRUPTS it immediately — regardless of whether the input
+                // box has text. The old behaviour (only-interrupt-on-empty)
+                // forced a second keystroke to actually stop a run when the
+                // user had half-typed the next message.
+                if self.is_pipeline_active() {
+                    // Defensive: dropping the input on an interrupt avoids a
+                    // half-typed turn silently submitting later.
+                    self.clear_input();
+                    return Action::Cancel;
+                }
+                if self.thinking {
+                    // A routed chat turn is in flight. Stop the spinner and drop
+                    // any chat turns parked behind it so the interrupt is clean;
+                    // the in-flight route task is fire-and-forget (it only chats,
+                    // no workspace mutation) so its late reply is simply ignored.
+                    self.thinking = false;
+                    self.thinking_started = None;
+                    self.queued_chat.clear();
+                    self.clear_input();
+                    self.push(ChatRole::System, umadev_i18n::t(self.lang, "run.cancelled"));
+                    self.refresh_status();
+                    return Action::None;
+                }
+                // Idle: clear a non-empty input; on empty input behave like Esc
+                // (quit-confirm).
                 if self.input.is_empty() {
                     return self.chat_key(KeyCode::Esc, crossterm::event::KeyModifiers::NONE);
                 }
@@ -1986,6 +2025,18 @@ impl App {
     /// the gate card so users don't have to type `/continue` every time.
     fn submit_text(&mut self, text: String) -> Action {
         self.push(ChatRole::You, text.clone());
+        // A routed turn is still in flight (`thinking`). Spawning a second
+        // `spawn_route` now would resume the SAME chat `session_id` in two base
+        // subprocesses at once → interleaved / out-of-order replies and a
+        // scrambled memory. Park this turn instead; the event loop fires it as
+        // the next route only after the current result lands. (A gate is never
+        // open while `thinking`, so this check sits ahead of gate handling.)
+        if self.thinking {
+            self.queued_chat.push_back(text);
+            self.push(ChatRole::System, umadev_i18n::t(self.lang, "run.queued"));
+            self.refresh_status();
+            return Action::None;
+        }
         if let Some(gate) = self.active_gate {
             // ClarifyGate: non-"c" text is an answer (append to
             // answers file); "c" submits all answers + continues.
@@ -2318,6 +2369,36 @@ impl App {
         self.trim_conversation();
     }
 
+    /// The route ended without a usable reply (base init failed, an empty
+    /// reply, or a hard error). This is a TERMINAL route outcome, so — like
+    /// [`record_chat_reply`] / [`record_run_started`] — it stops the
+    /// "thinking…" status; otherwise the animation would spin forever on a
+    /// route that already failed. The human-readable reason is surfaced as a
+    /// System note.
+    pub(crate) fn record_route_failed(&mut self, note: String) {
+        self.thinking = false;
+        self.thinking_started = None;
+        self.refresh_status();
+        self.push(ChatRole::System, note);
+    }
+
+    /// Pop the oldest chat turn parked by [`submit_text`] while a route was in
+    /// flight, if any. The event loop fires it as the NEXT route only after the
+    /// current route result has landed, keeping same-session routing strictly
+    /// serial (never two base subprocesses resuming one `session_id` at once).
+    pub(crate) fn take_next_queued_chat(&mut self) -> Option<String> {
+        self.queued_chat.pop_front()
+    }
+
+    /// Number of turns currently waiting to be sent — the chat-routing queue
+    /// plus a pending pipeline steer. Drives the persistent "queued N" chip so
+    /// the user can always see that parked input has NOT been lost, even after
+    /// the one-off System note scrolls away.
+    #[must_use]
+    pub fn queued_count(&self) -> usize {
+        self.queued_chat.len() + usize::from(self.queued_steer.is_some())
+    }
+
     /// A bounded clone of the conversation memory to hand to a routed turn.
     #[must_use]
     pub(crate) fn conversation_snapshot(&self) -> Vec<umadev_runtime::Message> {
@@ -2392,6 +2473,15 @@ impl App {
         self.reset_for_new_run();
         self.run_started_at = None;
         self.phase_started_at = None;
+        // A route may have been in flight when the run was cancelled (e.g. the
+        // turn that classified into this run, or a post-run chat). Clear the
+        // "thinking…" animation too, otherwise it spins forever after an
+        // interrupt with a route still notionally outstanding.
+        self.thinking = false;
+        self.thinking_started = None;
+        // Drop chat turns parked behind the in-flight route so they can't fire
+        // into a freshly-reset state.
+        self.queued_chat.clear();
         self.pending_quit_confirm = false;
         self.push(ChatRole::System, umadev_i18n::t(self.lang, "run.cancelled"));
     }
@@ -7598,5 +7688,137 @@ mod tests {
         a.active_gate = Some(Gate::PreviewConfirm);
         let _ = a.submit_text("把图标换成 lucide".to_string());
         assert_eq!(a.trust_ledger.consecutive("preview_confirm"), 0);
+    }
+
+    // ---- input-correctness hardening (wave 3) ----------------------------
+
+    #[test]
+    fn unrelated_note_does_not_clear_thinking_but_route_result_does() {
+        let mut a = fresh_app(Some("offline"));
+        // A routed chat turn is in flight.
+        a.thinking = true;
+        a.thinking_started = Some(std::time::Instant::now());
+        // An UNRELATED progress note (heartbeat / resume-retry / governance)
+        // must NOT extinguish the animation — the route is still running.
+        a.apply_engine(EngineEvent::Note("route.resume_retry: retrying".into()));
+        assert!(
+            a.thinking,
+            "a bare progress Note must not clear thinking while a route is in flight"
+        );
+        // A TERMINAL route outcome DOES clear it: first the failure path…
+        a.record_route_failed("route failed: boom".into());
+        assert!(!a.thinking, "a failed route result clears thinking");
+        assert!(a.thinking_started.is_none());
+        // …and the normal reply path too.
+        a.thinking = true;
+        a.thinking_started = Some(std::time::Instant::now());
+        a.record_chat_reply("hello back".into());
+        assert!(!a.thinking, "a chat reply clears thinking");
+        assert!(a.thinking_started.is_none());
+    }
+
+    #[test]
+    fn submitting_while_thinking_queues_instead_of_routing_concurrently() {
+        let mut a = fresh_app(Some("offline"));
+        // First turn: nothing running → routes, and marks thinking.
+        let first = a.submit_text("first message".to_string());
+        assert!(matches!(first, Action::Route(_)), "first turn routes");
+        assert!(a.thinking, "first routed turn marks thinking");
+        assert!(a.queued_chat.is_empty());
+        // Second turn WHILE thinking: must NOT spawn a second route — it parks.
+        let second = a.submit_text("second message".to_string());
+        assert_eq!(
+            second,
+            Action::None,
+            "a turn submitted while thinking must not route concurrently"
+        );
+        assert_eq!(a.queued_chat.len(), 1, "the extra turn is queued");
+        assert_eq!(
+            a.queued_chat.front().map(String::as_str),
+            Some("second message")
+        );
+        // A third also queues (FIFO order preserved).
+        let _ = a.submit_text("third message".to_string());
+        assert_eq!(a.queued_chat.len(), 2);
+        assert_eq!(a.take_next_queued_chat().as_deref(), Some("second message"));
+        assert_eq!(a.take_next_queued_chat().as_deref(), Some("third message"));
+    }
+
+    #[test]
+    fn ctrl_c_interrupts_a_running_pipeline_even_with_nonempty_input() {
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::PipelineStarted {
+            slug: "demo".into(),
+            requirement: "build".into(),
+        });
+        assert!(a.is_pipeline_active());
+        // Half-typed next message in the box.
+        for c in "half typed".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        assert!(!a.input.is_empty());
+        // Ctrl-C while running → INTERRUPT immediately (Claude Code parity),
+        // not just clear the input.
+        let action =
+            a.apply_key_with_mods(KeyCode::Char('c'), crossterm::event::KeyModifiers::CONTROL);
+        assert_eq!(
+            action,
+            Action::Cancel,
+            "Ctrl-C interrupts a running pipeline"
+        );
+        assert!(
+            a.input.is_empty(),
+            "the half-typed input is dropped on interrupt"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_while_thinking_stops_the_spinner_and_drops_the_queue() {
+        let mut a = fresh_app(Some("offline"));
+        // A route in flight, with extra turns parked behind it.
+        a.thinking = true;
+        a.thinking_started = Some(std::time::Instant::now());
+        a.queued_chat.push_back("parked".into());
+        for c in "typing".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let action =
+            a.apply_key_with_mods(KeyCode::Char('c'), crossterm::event::KeyModifiers::CONTROL);
+        assert_eq!(action, Action::None);
+        assert!(!a.thinking, "Ctrl-C while thinking stops the animation");
+        assert!(a.thinking_started.is_none());
+        assert!(
+            a.queued_chat.is_empty(),
+            "parked turns are cleared on interrupt"
+        );
+        assert!(a.input.is_empty());
+    }
+
+    #[test]
+    fn ctrl_c_on_empty_idle_input_arms_quit_confirm() {
+        // Regression guard for the idle path: with nothing running and an empty
+        // box, Ctrl-C still falls through to the Esc (quit-confirm) semantics.
+        let mut a = fresh_app(Some("offline"));
+        let action =
+            a.apply_key_with_mods(KeyCode::Char('c'), crossterm::event::KeyModifiers::CONTROL);
+        assert_eq!(action, Action::None);
+        assert!(
+            a.pending_quit_confirm,
+            "idle empty Ctrl-C arms quit confirm"
+        );
+    }
+
+    #[test]
+    fn queued_count_reflects_chat_queue_and_steer() {
+        let mut a = fresh_app(Some("offline"));
+        assert_eq!(a.queued_count(), 0, "nothing queued initially");
+        a.queued_chat.push_back("a".into());
+        a.queued_chat.push_back("b".into());
+        assert_eq!(a.queued_count(), 2, "chat queue counts");
+        a.queued_steer = Some("steer".into());
+        assert_eq!(a.queued_count(), 3, "a pending steer adds to the count");
+        a.queued_chat.clear();
+        a.queued_steer = None;
+        assert_eq!(a.queued_count(), 0, "clears back to zero");
     }
 }
