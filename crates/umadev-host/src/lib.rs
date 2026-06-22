@@ -297,7 +297,12 @@ pub fn resolve_program(program: &str) -> String {
         if dir.is_empty() {
             continue;
         }
-        for ext in std::iter::once("").chain(pathext.split(';')) {
+        // PATHEXT extensions FIRST, bare name LAST: npm installs a base as BOTH
+        // `codex` (a no-extension *nix shell shim) and `codex.cmd` (the Windows
+        // shim) in the same dir. Trying the bare name first matched the shell
+        // shim — not a PE — so spawning it gave os error 193 and the base read as
+        // "not installed". Preferring `.cmd`/`.exe`/`.bat` finds the runnable shim.
+        for ext in pathext.split(';').chain(std::iter::once("")) {
             let candidate = std::path::Path::new(dir).join(format!("{program}{ext}"));
             if candidate.is_file() {
                 return candidate.to_string_lossy().into_owned();

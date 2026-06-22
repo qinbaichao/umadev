@@ -446,7 +446,7 @@ fn render_picker(frame: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(2),              // top spacer (grows)
-            Constraint::Length(3),           // logo row (terminal icon + wordmark)
+            Constraint::Length(4),           // logo row (icon + wordmark) + breathing gap
             Constraint::Length(1),           // tagline
             Constraint::Length(1),           // gap
             Constraint::Length(card_height), // selection card
@@ -493,6 +493,8 @@ fn render_picker(frame: &mut Frame, app: &App) {
             Span::styled(" ▜▄▄▄▄▄▛  ", Style::default().fg(icon)),
             Span::raw("            "),
         ]),
+        // Breathing room between the logo box and the call-to-action tagline.
+        Line::from(""),
     ];
     frame.render_widget(Paragraph::new(logo_lines), center[1]);
 
