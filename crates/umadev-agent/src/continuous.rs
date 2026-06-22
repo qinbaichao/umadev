@@ -112,9 +112,22 @@ pub async fn run_block(
     let plan = crate::planner::plan(&options.requirement);
     let produces_code = plan.includes(Phase::Frontend) || plan.includes(Phase::Backend);
 
-    let phases = phases_for_block(start_after);
+    // The phases this block drives, tailored to the plan. A GATED plan
+    // (`Greenfield` / `FrontendOnly` / `BackendOnly` / `DocsOnly`) keeps the
+    // gate-anchored three-block split, intersected with the plan so a one-sided
+    // build skips the phase it doesn't need (e.g. `FrontendOnly` drops Backend) —
+    // the full pipeline + both confirm gates are unchanged. A GATELESS lean plan
+    // (`TaskKind::Light` / `Bugfix` / `Refactor`) has NO confirm gate to pause at,
+    // so its whole lean phase list (spec → implement → quality) is driven in ONE
+    // block from the fresh-run start; any gate-resume entry for such a plan has
+    // nothing left to do. This is what makes a simple "做一个待办单页应用" skip the
+    // research + three-doc + gate ceremony and head straight for spec → implement
+    // → verify (the 24-min → minutes fix), while a real product still pays for it.
+    let phases = block_phases(start_after, &plan);
     if phases.is_empty() {
-        // Nothing to drive (e.g. a docs-only plan resumed past its last phase).
+        // Nothing to drive (e.g. a docs-only plan resumed past its last phase, or
+        // a Light plan whose initial block was all research/docs — the next block
+        // picks up the code phases). Fail-open: report a clean completion.
         return RunOutcome::Completed;
     }
 
@@ -125,8 +138,14 @@ pub async fn run_block(
         });
     }
 
+    // The first directive carries the FULL priming context (role + anti-slop
+    // rules). On the standard pipeline that is the Research phase; on a lean plan
+    // that has no Research phase, the FIRST surviving phase of a fresh run (e.g.
+    // Spec for a Light plan) must carry that priming instead — otherwise the base
+    // implements with no role/spec context. Keyed off the fresh-run start_after so
+    // a resumed block (Spec/Backend after a gate) stays lean as before.
     let mut first_directive = start_after == Phase::Research;
-    for &phase in phases {
+    for &phase in &phases {
         // A gate is a pause point, not a base turn: stop here, let the caller
         // wait for the user, and resume on the next block.
         if phase.is_gate() {
@@ -169,6 +188,7 @@ pub async fn run_block(
             events,
             phase,
             std::mem::take(&mut first_directive),
+            plan.kind,
         )
         .await;
         // `first_directive` is consumed by `std::mem::take` only when this is
@@ -233,8 +253,9 @@ async fn drive_phase(
     events: &Arc<dyn EventSink>,
     phase: Phase,
     first_directive: bool,
+    kind: crate::planner::TaskKind,
 ) -> PhaseResult {
-    let directive = phase_directive(options, phase, first_directive);
+    let directive = phase_directive(options, phase, first_directive, kind);
     if let Err(e) = session.send_turn(directive).await {
         return PhaseResult::Failed(format!("send_turn: {e}"));
     }
@@ -438,6 +459,40 @@ fn phases_for_block(start_after: Phase) -> &'static [Phase] {
     }
 }
 
+/// The actual phases to drive this block, tailoring [`phases_for_block`] to the
+/// plan. Two regimes:
+///
+/// - **Gated plan** (any plan that still has a confirm gate — `Greenfield` /
+///   `FrontendOnly` / `BackendOnly` / `DocsOnly`): the unchanged gate-anchored
+///   block split, intersected with the plan so a one-sided build skips the phase
+///   it doesn't need (`FrontendOnly` keeps the preview gate but drops Backend;
+///   `BackendOnly` drops Frontend + its preview gate). The full pipeline + both
+///   human confirm gates are preserved exactly.
+/// - **Gateless lean plan** (`Light` / `Bugfix` / `Refactor` — no confirm gate at
+///   all): there is no gate to anchor a block split on, so the WHOLE lean phase
+///   list (e.g. Light: spec → frontend → backend → quality) is driven in ONE
+///   block at the fresh-run `Research` start. A gate-resume entry (Spec/Backend)
+///   for such a plan has nothing left → empty → a clean completion. This is the
+///   lightweight fast path on the continuous session: no research, no three docs,
+///   no gate pause — straight to implement + verify, governance + the zero-source
+///   hard gate + the quality node all still apply.
+fn block_phases(start_after: Phase, plan: &crate::planner::PhasePlan) -> Vec<Phase> {
+    let gateless = !plan.includes(Phase::DocsConfirm) && !plan.includes(Phase::PreviewConfirm);
+    if gateless {
+        // One unsplit block at the fresh start; nothing on a (spurious) resume.
+        return if start_after == Phase::Research {
+            plan.phases.clone()
+        } else {
+            Vec::new()
+        };
+    }
+    phases_for_block(start_after)
+        .iter()
+        .copied()
+        .filter(|p| plan.includes(*p))
+        .collect()
+}
+
 /// Whether a phase is one that writes real code (and so is subject to plan-mode
 /// read-only suppression + the zero-source hard gate).
 fn is_executing(phase: Phase) -> bool {
@@ -477,16 +532,38 @@ fn gate_for_phase(phase: Phase) -> Gate {
 /// the next instruction ("now implement the frontend from the approved docs you
 /// already wrote") rather than re-priming everything.
 ///
+/// `kind` tailors the FRAMING to the task: a heavyweight (`Greenfield` / one-sided)
+/// plan ran research + the three docs first, so its Spec/Frontend/Backend
+/// directives reference "the approved documents you wrote". A lean GATELESS plan
+/// (`Light` / `Bugfix` / `Refactor`) wrote NO docs — so it gets short,
+/// self-contained, directly-imperative directives ("implement these features now,
+/// write the code files") via [`lean_directive`], with no doc references and no
+/// heavy front matter, which is the per-`TaskKind` wording that keeps a simple
+/// "做一个待办单页应用" fast.
+///
 /// Crucially every directive is COMMAND-style: "produce X now, write the files
 /// directly, do NOT ask me whether to continue." This is the single fix for the
 /// single-shot path's "base replies a paragraph and asks 'shall I continue?'"
 /// failure — in a live agentic session the base just does it.
-fn phase_directive(options: &RunOptions, phase: Phase, first: bool) -> String {
+fn phase_directive(
+    options: &RunOptions,
+    phase: Phase,
+    first: bool,
+    kind: crate::planner::TaskKind,
+) -> String {
     let slug = options.effective_slug();
     let req = &options.requirement;
     let no_ask = "Work autonomously: use your tools to do this NOW, write all files \
          directly to disk, and do NOT ask me whether to continue — just produce the \
          deliverable. When done, end your turn.";
+
+    // Lean gateless plans (Light / Bugfix / Refactor) skip research + the three
+    // core docs, so their phase directives must NOT reference documents that were
+    // never written. Route them to the lean, self-contained, command-style
+    // directives instead of the heavyweight doc-anchored ones below.
+    if is_lean_kind(kind) {
+        return lean_directive(&slug, req, phase, first, kind, no_ask);
+    }
 
     match phase {
         Phase::Research => {
@@ -537,6 +614,95 @@ fn phase_directive(options: &RunOptions, phase: Phase, first: bool) -> String {
         // Gate phases never get a directive (the driver pauses before them); a
         // defensive empty directive keeps this total.
         Phase::DocsConfirm | Phase::PreviewConfirm => String::new(),
+    }
+}
+
+/// Whether `kind` is a lean, GATELESS plan — the lightweight fast path that
+/// skips research + the three core docs + both confirm gates. These get the
+/// short, self-contained [`lean_directive`] framing rather than the heavyweight
+/// doc-anchored [`phase_directive`] one.
+fn is_lean_kind(kind: crate::planner::TaskKind) -> bool {
+    use crate::planner::TaskKind::{Bugfix, Light, Refactor};
+    matches!(kind, Light | Bugfix | Refactor)
+}
+
+/// Short, self-contained, directly-imperative directives for a lean GATELESS plan
+/// (`Light` / `Bugfix` / `Refactor`). There is NO research and NO PRD /
+/// architecture / UI-UX to reference — so these directives carry the requirement
+/// itself and tell the base to act, with no heavy front matter and no doc
+/// dependencies. The `first` phase of a lean run carries a ONE-LINE role +
+/// anti-slop reminder (since the heavyweight Research priming never ran); later
+/// lean phases stay maximally terse.
+fn lean_directive(
+    slug: &str,
+    req: &str,
+    phase: Phase,
+    first: bool,
+    kind: crate::planner::TaskKind,
+    no_ask: &str,
+) -> String {
+    use crate::planner::TaskKind::{Bugfix, Refactor};
+    // A compact priming line ONLY on the first phase of a fresh lean run — names
+    // the role + the hard visual rules (no emoji icons, design-token colors only)
+    // so a Light frontend still respects the moat without the full Research+docs
+    // ceremony. Sourced from `experts::lean_priming` (prompts are agent policy, kept
+    // in one place). Empty on later phases (same session already holds the context).
+    let prime = if first {
+        format!("{}\n\n", crate::experts::lean_priming())
+    } else {
+        String::new()
+    };
+    match phase {
+        Phase::Spec => format!(
+            "{prime}Task for `{slug}`:\n{req}\n\n\
+             Write a SHORT, lean implementation plan for exactly this task — the \
+             concrete files to create/change and the steps, nothing more. No formal \
+             PRD/architecture; this is a small scoped change. Keep it to a few bullet \
+             points, then proceed.\n\n{no_ask}"
+        ),
+        Phase::Frontend => format!(
+            "{prime}Now IMPLEMENT this task as REAL code files, directly:\n{req}\n\n\
+             Write the actual source (HTML/CSS/JS or the project's framework), build \
+             working features end to end, and run the build/dev server to confirm it \
+             works. Icons from a declared library only — never emoji; colors via \
+             design tokens. Keep it proportional to this small scope — do NOT scaffold \
+             a large multi-module app.\n\n{no_ask}"
+        ),
+        Phase::Backend => format!(
+            "{prime}Now implement any backend/server logic this task needs as REAL \
+             code files, directly:\n{req}\n\n\
+             Validate inputs and handle errors. If this task is purely frontend / a \
+             static page and needs no backend, say so in one line and make no backend \
+             changes. Keep it proportional to the small scope.\n\n{no_ask}"
+        ),
+        Phase::Quality => {
+            let focus = match kind {
+                Bugfix => {
+                    "Confirm the bug is actually fixed (reproduce the original \
+                           failure path and verify it no longer happens). "
+                }
+                Refactor => {
+                    "Confirm behavior is UNCHANGED by the refactor (the existing \
+                             tests still pass). "
+                }
+                _ => "",
+            };
+            format!(
+                "{prime}Now VERIFY `{slug}`: run the project's real build + test + lint \
+                 and fix what fails. {focus}Do a quick security pass (no hardcoded \
+                 secrets, inputs validated). Summarize results in a few lines.\n\n{no_ask}"
+            )
+        }
+        // A lean plan never reaches Research / Docs / Delivery / the gates — but
+        // keep this total + fail-open: fall back to the requirement + no-ask so a
+        // stray phase can't produce an empty directive.
+        Phase::Research
+        | Phase::Docs
+        | Phase::Delivery
+        | Phase::DocsConfirm
+        | Phase::PreviewConfirm => {
+            format!("{prime}Task for `{slug}`:\n{req}\n\n{no_ask}")
+        }
     }
 }
 
@@ -1650,22 +1816,191 @@ mod tests {
         );
     }
 
+    // ── Lean GATELESS plan (Light / Bugfix / Refactor) on the continuous path ──
+
+    /// Drop a real source file so the zero-source hard gate is satisfied (a lean
+    /// plan still enforces "produced real code" — only the research/docs/gates are
+    /// skipped, the moat stands). A `.js` file counts toward the implementation
+    /// surface without tripping the governance CSP scanner on the test fixture.
+    fn seed_source(root: &Path) {
+        std::fs::write(
+            root.join("app.js"),
+            "function addTodo(t){ /* lean todo impl */ return t; }\n",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn light_build_runs_lean_block_with_no_gate_and_no_research() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_source(tmp.path());
+        // The dogfood case: an explicitly-simple single-page pure-frontend build.
+        let options = opts(
+            tmp.path(),
+            "做一个简单的待办清单单页应用,纯前端,支持添加删除",
+            TrustMode::Auto,
+        );
+        let (events, rec) = sink();
+        // spec, frontend, backend, quality — four lean turns, all clean.
+        let mut session =
+            FakeBaseSession::new(vec![vec![done()], vec![done()], vec![done()], vec![done()]]);
+        let sent = session.sent_handle();
+
+        // A Light plan is GATELESS → it drives the WHOLE lean list in one block
+        // from Research start, runs to completion, and NEVER pauses at a gate.
+        let outcome = run_block(&mut session, &options, &events, Phase::Research).await;
+        assert_eq!(outcome, RunOutcome::Completed);
+
+        let sent = sent.lock().unwrap();
+        // spec + frontend + backend + quality (no research, no docs).
+        assert_eq!(
+            sent.len(),
+            4,
+            "lean plan: spec/frontend/backend/quality only"
+        );
+        // The FIRST directive (spec) must NOT reference research / the three docs,
+        // and must carry the requirement + the lean priming + a small-scope cue.
+        let first = sent[0].to_lowercase();
+        assert!(!first.contains("three core documents"));
+        assert!(!first.contains("approved"));
+        assert!(first.contains("lean fast-track"));
+        assert!(sent[0].contains("待办清单"));
+        // No GateOpened anywhere — the lean path has no confirm gate.
+        let evs = rec.events();
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, EngineEvent::GateOpened { .. })),
+            "lean plan opens no confirm gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn light_build_with_zero_source_hard_stops() {
+        let tmp = tempfile::tempdir().unwrap();
+        // NO source seeded → the moat's zero-source hard gate must still fire even
+        // on the lean path (governance + the hard gate are NOT skipped).
+        let options = opts(
+            tmp.path(),
+            "做一个简单的待办清单单页应用,纯前端",
+            TrustMode::Auto,
+        );
+        let (events, _rec) = sink();
+        let mut session =
+            FakeBaseSession::new(vec![vec![done()], vec![done()], vec![done()], vec![done()]]);
+
+        let outcome = run_block(&mut session, &options, &events, Phase::Research).await;
+        match outcome {
+            RunOutcome::HardStop(reason) => {
+                assert!(reason.to_lowercase().contains("real") || reason.contains("代码"));
+            }
+            other => panic!("lean plan with no code must hard-stop, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn light_gate_resume_entry_is_a_clean_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_source(tmp.path());
+        let options = opts(
+            tmp.path(),
+            "做一个简单的待办清单单页应用,纯前端",
+            TrustMode::Auto,
+        );
+        let (events, _rec) = sink();
+        let mut session = FakeBaseSession::new(vec![vec![done()]]);
+        let sent = session.sent_handle();
+
+        // A lean plan never pauses, so a Continue-style resume entry has nothing
+        // left to drive — it must complete cleanly without sending any directive.
+        let outcome = run_block(&mut session, &options, &events, Phase::Spec).await;
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "gateless resume drives nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn bugfix_drives_lean_phases_with_bugfix_quality_focus() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_source(tmp.path());
+        let options = opts(tmp.path(), "修复登录按钮点击没反应", TrustMode::Auto);
+        let (events, _rec) = sink();
+        let mut session =
+            FakeBaseSession::new(vec![vec![done()], vec![done()], vec![done()], vec![done()]]);
+        let sent = session.sent_handle();
+
+        let outcome = run_block(&mut session, &options, &events, Phase::Research).await;
+        assert_eq!(outcome, RunOutcome::Completed);
+        let sent = sent.lock().unwrap();
+        // The quality directive carries the bug-fix-specific verification focus.
+        let quality = sent.last().unwrap().to_lowercase();
+        assert!(
+            quality.contains("bug is actually fixed") || quality.contains("reproduce"),
+            "bugfix quality focus: {quality}"
+        );
+    }
+
+    #[test]
+    fn block_phases_lean_is_one_block_then_empty() {
+        // Light is gateless → the whole lean list at Research start, nothing after.
+        let plan = crate::planner::plan_light("anything");
+        let first = block_phases(Phase::Research, &plan);
+        assert_eq!(first, plan.phases);
+        assert!(block_phases(Phase::Spec, &plan).is_empty());
+        assert!(block_phases(Phase::Backend, &plan).is_empty());
+    }
+
+    #[test]
+    fn block_phases_greenfield_keeps_gate_anchored_split() {
+        // A heavyweight plan is unchanged: the standard three-block split.
+        let plan = crate::planner::plan("build a SaaS dashboard with login and a database");
+        assert_eq!(plan.kind, crate::planner::TaskKind::Greenfield);
+        assert_eq!(
+            block_phases(Phase::Research, &plan),
+            vec![Phase::Research, Phase::Docs, Phase::DocsConfirm]
+        );
+        assert_eq!(
+            block_phases(Phase::Spec, &plan),
+            vec![Phase::Spec, Phase::Frontend, Phase::PreviewConfirm]
+        );
+    }
+
+    #[test]
+    fn block_phases_frontend_only_skips_backend_keeps_preview_gate() {
+        // A one-sided gated plan: the split is intersected with the plan, so the
+        // post-docs block keeps the preview gate but the post-preview block has no
+        // backend to drive.
+        let plan = crate::planner::plan("做一个前端落地页");
+        assert_eq!(plan.kind, crate::planner::TaskKind::FrontendOnly);
+        assert_eq!(
+            block_phases(Phase::Spec, &plan),
+            vec![Phase::Spec, Phase::Frontend, Phase::PreviewConfirm]
+        );
+        // Post-preview block: backend is NOT in a FrontendOnly plan → only quality
+        // + delivery survive.
+        assert_eq!(
+            block_phases(Phase::Backend, &plan),
+            vec![Phase::Quality, Phase::Delivery]
+        );
+    }
+
     #[tokio::test]
     async fn lean_tweak_seats_no_team_and_does_not_fork() {
         let tmp = tempfile::tempdir().unwrap();
-        seed_docs(tmp.path());
-        // A trivial tweak → no docs team → no fork at the gate.
-        let options = opts(
-            tmp.path(),
-            "fix a typo in the footer text",
-            TrustMode::Guarded,
-        );
+        // A trivial "fix a typo" is a lean GATELESS Bugfix plan now: it drives the
+        // lean phases straight through (no docs gate to pause at) and seats NO
+        // review team at any node → opens zero forks. Seed a source file so the
+        // zero-source hard gate is satisfied and the run completes cleanly.
+        seed_source(tmp.path());
+        let options = opts(tmp.path(), "fix a typo in the footer text", TrustMode::Auto);
         let (events, _rec) = sink();
-        let mut session = FakeBaseSession::new(vec![vec![done()], vec![done()]]);
+        let mut session =
+            FakeBaseSession::new(vec![vec![done()], vec![done()], vec![done()], vec![done()]]);
         let forks = session.forks_handle();
 
         let outcome = run_block(&mut session, &options, &events, Phase::Research).await;
-        assert_eq!(outcome, RunOutcome::PausedAtGate(Gate::DocsConfirm));
+        assert_eq!(outcome, RunOutcome::Completed);
         assert_eq!(*forks.lock().unwrap(), 0, "lean task opens no review forks");
     }
 }

@@ -294,6 +294,23 @@ pub fn classify(requirement: &str) -> TaskKind {
         "express",
         "微服务",
     ]);
+
+    // 5.5. A genuinely SIMPLE small build — the lightweight path. "做一个简单的
+    //      待办清单单页应用,纯前端" should NOT pay for research + three full core
+    //      documents + two confirm gates; it should go spec → implement → verify.
+    //      This is a SCOPED downgrade, guarded on BOTH sides:
+    //      (a) it fires only when an explicit "this is small" signal is present
+    //          (简单/单页/demo/小工具/静态页/single page/…), AND
+    //      (b) it NEVER fires when a heavyweight-product signal is present
+    //          (登录/auth/数据库/支付/SaaS/平台/多页/multi-module/…) — those keep
+    //          their full pipeline because the research + docs + gates ARE the value.
+    //      Fail-open: with no explicit-simple signal OR any heavy signal present,
+    //      we fall through to the existing FrontendOnly / BackendOnly / Greenfield
+    //      defaults, so a real product is never mis-downgraded.
+    if is_simple_build(&q) && !has_heavy_signal(&q) {
+        return TaskKind::Light;
+    }
+
     if frontend && !backend {
         return TaskKind::FrontendOnly;
     }
@@ -303,6 +320,125 @@ pub fn classify(requirement: &str) -> TaskKind {
 
     // 6. Default — a full product build.
     TaskKind::Greenfield
+}
+
+/// Whether `q` (already lowercased) carries an EXPLICIT "this is a small build"
+/// signal — the positive half of the lightweight-build heuristic. These are
+/// markers a user adds to say "keep it small": an explicit smallness word
+/// (简单 / 小 / mini / demo / toy / quick), a single-page / static-page shape, or
+/// a "tiny tool / small app" framing. A bare "做一个待办应用" carries NO such
+/// signal, so it stays on the full pipeline (a real product) — only when the
+/// user actually scoped it down do we consider the light path.
+fn is_simple_build(q: &str) -> bool {
+    let has = |needles: &[&str]| needles.iter().any(|n| q.contains(n));
+    has(&[
+        // Explicit smallness (zh).
+        "简单的",
+        "简易",
+        "简单小",
+        "极简",
+        "单页应用",
+        "单页面",
+        "单个页面",
+        "一个小",
+        "小工具",
+        "小demo",
+        "小 demo",
+        "小项目",
+        "静态页",
+        "静态网页",
+        "纯静态",
+        "练手",
+        "小练习",
+        "玩具项目",
+        // Explicit smallness (en).
+        "simple ",
+        "single page",
+        "single-page",
+        "one page",
+        "one-page",
+        "static page",
+        "static html",
+        "tiny app",
+        "small app",
+        "little app",
+        "mini app",
+        "small tool",
+        "tiny tool",
+        "demo app",
+        "toy app",
+        "toy project",
+        "just a simple",
+        "quick demo",
+        "quick prototype",
+        "basic html",
+    ])
+}
+
+/// Whether `q` (already lowercased) carries a HEAVYWEIGHT-product signal — the
+/// negative half of the lightweight-build heuristic. Any of these means "this is
+/// a real product even if phrased casually" (auth, persistence, payments,
+/// multi-module / multi-page surface, an explicit commercial / production /
+/// platform framing), so the light path is VETOED and the full pipeline stands.
+/// This is the guardrail that keeps "做一个带邮箱登录的 SaaS 数据分析仪表盘" on
+/// `Greenfield` no matter how the smallness words read.
+fn has_heavy_signal(q: &str) -> bool {
+    let has = |needles: &[&str]| needles.iter().any(|n| q.contains(n));
+    has(&[
+        // Persistence / accounts / payments / auth — anything that needs a backend
+        // surface, a data model, or a security posture is NOT a light build.
+        "登录",
+        "注册",
+        "账号",
+        "账户",
+        "鉴权",
+        "权限",
+        "数据库",
+        "持久化",
+        "后端",
+        "服务端",
+        "接口",
+        "api",
+        "支付",
+        "订单",
+        "结算",
+        "上传",
+        "实时",
+        "推送",
+        "auth",
+        "login",
+        "signup",
+        "sign up",
+        "sign-in",
+        "oauth",
+        "database",
+        "backend",
+        "server-side",
+        "payment",
+        "checkout",
+        "stripe",
+        // Commercial / scale / multi-surface framing — the research + docs + gates
+        // are the product value here, so never downgrade.
+        "商业级",
+        "可上线",
+        "上线",
+        "生产级",
+        "saas",
+        "平台",
+        "多页",
+        "多模块",
+        "后台管理",
+        "管理系统",
+        "仪表盘",
+        "dashboard",
+        "platform",
+        "production",
+        "multi-page",
+        "multi page",
+        "multi-module",
+        "enterprise",
+        "scalable",
+    ])
 }
 
 /// Parse a user-supplied phase name into a typed [`Phase`], for `umadev redo
@@ -515,6 +651,106 @@ mod tests {
         assert_eq!(classify("做一个待办事项应用"), TaskKind::Greenfield);
         assert_eq!(classify("做一个前端落地页"), TaskKind::FrontendOnly);
         assert_eq!(classify("写一个后端接口"), TaskKind::BackendOnly);
+    }
+
+    #[test]
+    fn simple_single_page_build_is_light() {
+        // The dogfood case: an explicitly-simple, single-page, pure-frontend build
+        // must take the lightweight path (spec -> implement -> verify), NOT the
+        // full research + three-docs + gate pipeline that took 24 minutes.
+        assert_eq!(
+            classify("做一个简单的待办清单单页应用,纯前端 HTML+CSS+JS,支持添加删除"),
+            TaskKind::Light
+        );
+        assert_eq!(classify("做一个简单的计算器单页面"), TaskKind::Light);
+        assert_eq!(classify("写一个静态页展示个人简介"), TaskKind::Light);
+        assert_eq!(
+            classify("a simple single-page todo app, pure HTML/CSS/JS"),
+            TaskKind::Light
+        );
+        assert_eq!(
+            classify("build a tiny demo app, just a static page"),
+            TaskKind::Light
+        );
+        assert_eq!(classify("做一个小工具帮我格式化 JSON"), TaskKind::Light);
+    }
+
+    #[test]
+    fn heavy_signal_vetoes_the_light_downgrade() {
+        // The boundary the planner must NOT cross: a smallness word does NOT make a
+        // real product lean. Any auth / database / payment / SaaS / platform / dashboard
+        // signal keeps the FULL pipeline — research + three docs + gates are its value.
+        assert_eq!(
+            classify("做一个带邮箱登录的 SaaS 数据分析仪表盘,要能上线"),
+            TaskKind::Greenfield
+        );
+        // "简单的" present but a database + login veto the light path → it routes to
+        // a heavyweight bucket (never the lean Light path).
+        assert_ne!(
+            classify("做一个简单的博客平台,带登录和数据库"),
+            TaskKind::Light
+        );
+        // "single page" present but it's a real dashboard with auth + a backend api
+        // → stays heavyweight (never the lean Light path).
+        assert_ne!(
+            classify("a single page dashboard with user login and a backend api"),
+            TaskKind::Light
+        );
+        // A simple-sounding but payment-bearing build is not light (it routes to a
+        // heavyweight path — the exact one depends on the surface words, but it must
+        // never be the lean Light path).
+        assert_ne!(
+            classify("做一个简单的小商城,支持下单和支付"),
+            TaskKind::Light
+        );
+    }
+
+    #[test]
+    fn light_classification_skips_research_docs_and_gates() {
+        // The whole point of the downgrade: a Light-classified simple build plans
+        // straight to spec -> implement -> verify, with NO research / docs / gates.
+        let p = plan("做一个简单的待办清单单页应用,纯前端 HTML+CSS+JS,支持添加删除");
+        assert_eq!(p.kind, TaskKind::Light);
+        assert!(!p.includes(Phase::Research));
+        assert!(!p.includes(Phase::Docs));
+        assert!(!p.includes(Phase::DocsConfirm));
+        assert!(!p.includes(Phase::PreviewConfirm));
+        assert!(!p.includes(Phase::Delivery));
+        // …but still plans the implementation + the quality (hard) gate.
+        assert!(p.includes(Phase::Spec));
+        assert!(p.includes(Phase::Frontend));
+        assert!(p.includes(Phase::Quality));
+    }
+
+    #[test]
+    fn classification_boundary_simple_vs_complex_samples() {
+        // A contrast battery: each LEFT sample is genuinely small (Light); each
+        // RIGHT sample is a real product (full pipeline). The classifier must split
+        // them correctly — simple stays light, complex stays full.
+        let light = [
+            "做一个简单的倒计时单页应用",
+            "写个静态网页放我的简历",
+            "a small tool to convert markdown to html",
+            "做一个极简的番茄钟,纯前端",
+        ];
+        for r in light {
+            assert_eq!(classify(r), TaskKind::Light, "should be Light: {r}");
+        }
+        let heavy = [
+            "做一个在线协作文档平台,带账号和实时同步",
+            "构建一个电商网站,商品、购物车、支付、后台管理",
+            "build a multi-page SaaS with authentication and a postgres database",
+            "做一个带后端接口和数据库的待办应用,支持多用户登录",
+        ];
+        for r in heavy {
+            assert_ne!(classify(r), TaskKind::Light, "should NOT be Light: {r}");
+        }
+    }
+
+    #[test]
+    fn bugfix_classification_for_broken_button() {
+        // The task's required bug-fix boundary sample.
+        assert_eq!(classify("修复登录按钮点击没反应"), TaskKind::Bugfix);
     }
 
     #[test]

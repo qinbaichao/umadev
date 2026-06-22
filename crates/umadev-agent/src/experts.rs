@@ -511,6 +511,28 @@ pub fn delivery_prompt(slug: &str, requirement: &str, arch_excerpt: &str) -> Pro
     Prompt { system, user }
 }
 
+/// The one-line priming for the LEAN fast-track (`TaskKind::Light` / `Bugfix` /
+/// `Refactor`) — the lightweight path that skips research + the three core docs +
+/// both confirm gates. It names the role + the small scope and re-states ONLY the
+/// hard visual moat rules (no emoji icons → use a declared icon library;
+/// design-token colors), so a Light frontend still respects the governance floor
+/// without paying for the full Research+docs ceremony. Lives here (not inlined in
+/// the runner) because prompts are agent policy and belong in one place; the
+/// continuous driver injects it as the first lean directive's preamble.
+///
+/// Kept deliberately SHORT: the whole point of the lean path is speed, so this is
+/// a few sentences, not the multi-paragraph [`SPEC_PREAMBLE`] + [`ANTI_SLOP_LAW`]
+/// that the heavyweight document phases carry.
+#[must_use]
+pub fn lean_priming() -> &'static str {
+    "You are a senior engineer on a UmaDev lean fast-track — a small, well-scoped \
+     task with NO research phase and NO PRD/architecture/UI-UX documents. Hard rules \
+     still apply: never use emoji as icons (import from a declared icon library — \
+     Lucide / Heroicons / Tabler), use design-token colors only (never hardcoded \
+     hex), and keep the implementation strictly proportional to this small scope — \
+     do NOT scaffold a large multi-module app for a small task."
+}
+
 /// Truncate `text` to at most `max_chars` characters, keeping head.
 /// Returns text with a trailing `…` marker when it had to cut.
 #[must_use]
@@ -708,6 +730,22 @@ mod tests {
         assert_eq!(req.messages.len(), 1);
         assert_eq!(req.messages[0].role, "user");
         assert!(req.system.is_some());
+    }
+
+    #[test]
+    fn lean_priming_keeps_the_moat_but_stays_short() {
+        let p = lean_priming();
+        // Names the lean fast-track + the small scope.
+        assert!(p.contains("lean fast-track"));
+        assert!(p.to_lowercase().contains("small"));
+        // Re-states the hard visual moat rules even on the lean path.
+        assert!(p.contains("emoji"));
+        assert!(p.contains("Lucide") || p.contains("icon library"));
+        assert!(p.to_lowercase().contains("design-token") || p.contains("token"));
+        // Promises NO research / docs (so the base doesn't go produce them).
+        assert!(p.contains("NO research") || p.to_lowercase().contains("no research"));
+        // Stays SHORT — the whole point is speed (a fraction of SPEC_PREAMBLE).
+        assert!(p.len() < SPEC_PREAMBLE.len(), "lean priming must be terse");
     }
 
     #[test]
