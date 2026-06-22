@@ -1538,13 +1538,13 @@ fn setup_terminal() -> Result<Term> {
     // IME commits, which most terminals deliver as a paste) arrive as one
     // atomic `Event::Paste` instead of a scrambled stream of `Char` events.
     stdout.execute(EnableBracketedPaste).map_err(fail)?;
-    // Capture the mouse so the scroll wheel pages the transcript. This DOES
-    // take over the terminal's native click-drag text selection; the user can
-    // turn it back off with `/mouse` (releasing the wheel binding), and most
-    // terminals still let Shift+drag select through the capture. Teardown +
-    // the panic hook both DisableMouseCapture so the terminal is never left in
-    // mouse-reporting mode.
-    stdout.execute(EnableMouseCapture).map_err(fail)?;
+    // Mouse capture is OFF by default: it would take over the terminal's native
+    // click-drag text selection, and being able to select + copy text is the more
+    // important default than wheel-scroll. The transcript still scrolls via the
+    // keyboard (PageUp/PageDown, Home/End, Ctrl+Alt+U/D). A user who wants the
+    // wheel to page the transcript turns it on with `/mouse` (which then issues
+    // EnableMouseCapture); teardown + the panic hook DisableMouseCapture so the
+    // terminal is never left in mouse-reporting mode either way.
     // Show the terminal cursor so the user sees a blinking caret in the
     // input box (positioned via frame.set_cursor_position in render_prompt).
     stdout.execute(crossterm::cursor::Show).map_err(fail)?;

@@ -491,6 +491,16 @@ pub struct App {
     /// stall — the base IS working — so the red signal is suppressed while this
     /// is set even past the 3s threshold.
     pub tool_in_progress: bool,
+
+    /// **Transient heartbeat status** — a single in-place line for the
+    /// long-phase heartbeat's periodic "still working (mm:ss)" beats. Set by
+    /// [`EngineEvent::TransientStatus`] (overwritten each beat, NOT appended to
+    /// the transcript) and cleared (`None`) when the slow op finishes or any
+    /// real progress arrives (phase boundary, host output, worker stream). This
+    /// is what stops the heartbeat from flooding the chat with a new row every
+    /// few seconds — the status bar shows ONE live-updating reassurance instead.
+    /// Never enters the scrollback history.
+    pub transient_status: Option<String>,
 }
 
 impl App {
@@ -543,7 +553,9 @@ impl App {
             transcript_scroll: 0,
             transcript_max_scroll: std::cell::Cell::new(0),
             transcript_viewport_rows: std::cell::Cell::new(0),
-            mouse_scroll: true,
+            // OFF by default so native click-drag text selection / copy keeps
+            // working; `/mouse` opts into wheel-scroll (and takes over selection).
+            mouse_scroll: false,
             conversation: Vec::new(),
             host_chat_session_active: false,
             chat_session_id: None,
@@ -583,6 +595,7 @@ impl App {
             stream_text_active: false,
             last_output_at: None,
             tool_in_progress: false,
+            transient_status: None,
         };
         app.load_history();
         if app.mode == AppMode::Chat {
@@ -814,6 +827,8 @@ impl App {
         self.thinking = false;
         self.tool_in_progress = false;
         self.last_output_at = None;
+        // No live phase → no heartbeat reassurance should remain.
+        self.transient_status = None;
         self.push(ChatRole::System, body);
         self.refresh_status();
     }
@@ -1275,6 +1290,9 @@ impl App {
                 // Fresh phase → fresh stall clock; nothing has stalled yet.
                 self.last_output_at = Some(std::time::Instant::now());
                 self.tool_in_progress = false;
+                // A new phase replaces any prior phase's lingering heartbeat
+                // line so a stale "still working" timer never bleeds across.
+                self.transient_status = None;
                 // Auto-snapshot the workspace BEFORE this phase's base work, so
                 // a whole phase can be rewound with /rewind. Offloaded to a
                 // blocking task so a slow `git add -A` on a big repo never
@@ -1312,11 +1330,26 @@ impl App {
             }
             EngineEvent::GateOpened { gate } => {
                 self.active_gate = Some(gate);
+                // A gate is a CHECKPOINT, not a work phase, so it never receives a
+                // PhaseCompleted — its dot would sit at ○ (indistinguishable from
+                // "skipped / not reached") while later phases run, which reads as
+                // "why is step 3 empty?". Reaching the gate means the preceding
+                // work phase finished and we're standing on the checkpoint, so
+                // fill its dot. (Clarify isn't part of the 9-dot chain.)
+                let gate_phase = match gate {
+                    umadev_agent::gates::Gate::DocsConfirm => Some(Phase::DocsConfirm),
+                    umadev_agent::gates::Gate::PreviewConfirm => Some(Phase::PreviewConfirm),
+                    umadev_agent::gates::Gate::ClarifyGate => None,
+                };
+                if let Some(p) = gate_phase {
+                    self.set_phase(p, PhaseStatus::Done);
+                }
                 // Block paused at a gate — stop the live elapsed counters
                 // so the status bar doesn't keep ticking while we wait on
-                // the user.
+                // the user. Also drop any heartbeat line: the wait is over.
                 self.run_started_at = None;
                 self.phase_started_at = None;
+                self.transient_status = None;
 
                 // If the user QUEUED a steering message while the pipeline ran,
                 // this gate is the gap to apply it: stash it for the event loop,
@@ -1581,6 +1614,17 @@ impl App {
                 // red cue only fires when the pipeline is TRULY silent.
                 self.mark_output();
                 self.push(ChatRole::System, note);
+            }
+            EngineEvent::TransientStatus(status) => {
+                // The long-phase heartbeat's periodic "still working (mm:ss)"
+                // beat. This NEVER touches the transcript — it overwrites a
+                // single in-place status field that the bottom status row
+                // renders, so a multi-minute wait shows ONE live-updating line
+                // instead of a fresh row every ~7s. A beat is still a sign of
+                // life (the base is working in the background) → reset the stall
+                // clock so the red cue doesn't fire mid-heartbeat.
+                self.mark_output();
+                self.transient_status = status;
             }
             EngineEvent::SubTaskStarted {
                 phase,
@@ -5235,6 +5279,12 @@ impl App {
     /// host output line / progress note so [`Self::is_stalled`] resets.
     fn mark_output(&mut self) {
         self.last_output_at = Some(std::time::Instant::now());
+        // Any real sign of life (host output, worker stream, a progress note)
+        // supersedes the heartbeat's in-place "still working" line — drop it so
+        // a stale timer doesn't linger next to fresh content. The heartbeat beat
+        // itself calls `mark_output` *before* re-setting `transient_status`, so
+        // an active slow phase still keeps its live line.
+        self.transient_status = None;
     }
 
     /// Seconds since the current "thinking" turn began — for the live elapsed
@@ -5822,6 +5872,75 @@ mod tests {
     }
 
     #[test]
+    fn transient_status_updates_field_without_growing_transcript() {
+        // The long-phase heartbeat's periodic beats arrive as TransientStatus
+        // and must update the in-place status field WITHOUT pushing a transcript
+        // row — this is the flood-bug fix. A repeated beat overwrites, never
+        // appends; a `None` clears the line.
+        let mut app = fresh_app(Some("offline"));
+        let before = app.history.len();
+
+        app.apply_engine(EngineEvent::TransientStatus(Some(
+            "做事 仍在进行(已 0:03)".to_string(),
+        )));
+        assert_eq!(
+            app.history.len(),
+            before,
+            "a transient beat must NOT add a transcript row"
+        );
+        assert_eq!(
+            app.transient_status.as_deref(),
+            Some("做事 仍在进行(已 0:03)"),
+            "the in-place status field must be set"
+        );
+
+        // A second beat OVERWRITES the field (still no new row).
+        app.apply_engine(EngineEvent::TransientStatus(Some(
+            "做事 仍在进行(已 0:10)".to_string(),
+        )));
+        assert_eq!(app.history.len(), before, "second beat must not add a row");
+        assert_eq!(
+            app.transient_status.as_deref(),
+            Some("做事 仍在进行(已 0:10)"),
+            "the field must be overwritten by the newer beat"
+        );
+
+        // Completion clears the line.
+        app.apply_engine(EngineEvent::TransientStatus(None));
+        assert_eq!(app.history.len(), before, "clearing must not add a row");
+        assert!(
+            app.transient_status.is_none(),
+            "TransientStatus(None) must clear the in-place line"
+        );
+    }
+
+    #[test]
+    fn real_output_and_phase_boundary_clear_a_stale_heartbeat_line() {
+        // A real sign of life (host output) or a new phase supersedes the
+        // heartbeat reassurance — the in-place line must not linger next to
+        // fresh content.
+        let mut app = fresh_app(Some("offline"));
+        app.transient_status = Some("阶段 仍在进行(已 1:51)".to_string());
+        app.apply_engine(EngineEvent::HostOutput {
+            phase: Phase::Frontend,
+            line: "real worker output".to_string(),
+        });
+        assert!(
+            app.transient_status.is_none(),
+            "real host output must clear a stale heartbeat line"
+        );
+
+        app.transient_status = Some("阶段 仍在进行(已 2:30)".to_string());
+        app.apply_engine(EngineEvent::PhaseStarted {
+            phase: Phase::Backend,
+        });
+        assert!(
+            app.transient_status.is_none(),
+            "a fresh phase must clear the prior phase's heartbeat line"
+        );
+    }
+
+    #[test]
     fn shift_up_scrolls_transcript_and_stops_auto_stick() {
         let mut app = fresh_app(Some("offline"));
         // Simulate a render having published a scroll bound + viewport.
@@ -5922,13 +6041,12 @@ mod tests {
     #[test]
     fn slash_mouse_emits_set_capture_action_and_uses_i18n() {
         let mut app = fresh_app(Some("offline"));
-        assert!(app.mouse_scroll, "wheel scroll defaults on");
-        // Turning OFF must emit SetMouseCapture(false) so the event loop issues
-        // the real DisableMouseCapture, not just flip a bool.
-        let action = app.slash_toggle_mouse();
-        assert_eq!(action, Action::SetMouseCapture(false));
-        assert!(!app.mouse_scroll);
-        // Toggling back ON emits SetMouseCapture(true).
+        assert!(
+            !app.mouse_scroll,
+            "wheel scroll defaults OFF (copy stays usable)"
+        );
+        // Turning ON must emit SetMouseCapture(true) so the event loop issues the
+        // real EnableMouseCapture, not just flip a bool.
         let action = app.slash_toggle_mouse();
         assert_eq!(action, Action::SetMouseCapture(true));
         assert!(app.mouse_scroll);
@@ -5939,6 +6057,10 @@ mod tests {
             umadev_i18n::t(app.lang, "slash.mouse_on"),
             "/mouse status text must come from the i18n catalog"
         );
+        // Toggling back OFF emits SetMouseCapture(false).
+        let action = app.slash_toggle_mouse();
+        assert_eq!(action, Action::SetMouseCapture(false));
+        assert!(!app.mouse_scroll);
     }
 
     #[test]
@@ -5959,12 +6081,12 @@ mod tests {
     #[test]
     fn slash_mouse_toggles_wheel_scroll_flag() {
         let mut app = fresh_app(Some("offline"));
-        assert!(app.mouse_scroll, "wheel scroll defaults on");
+        assert!(!app.mouse_scroll, "wheel scroll defaults off");
         for c in "/mouse".chars() {
             let _ = app.apply_key(crossterm::event::KeyCode::Char(c));
         }
         let _ = app.apply_key(crossterm::event::KeyCode::Enter);
-        assert!(!app.mouse_scroll, "/mouse turns the wheel binding off");
+        assert!(app.mouse_scroll, "/mouse turns the wheel binding on");
     }
 
     #[test]

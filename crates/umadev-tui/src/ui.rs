@@ -1414,7 +1414,19 @@ fn render_status_row(frame: &mut Frame, area: Rect, app: &App) {
             umadev_i18n::t(app.lang, "status.thinking")
         )
     } else if app.run_started {
-        app.status.clone()
+        // While a slow phase's heartbeat is live, show its in-place "still
+        // working (mm:ss)" reassurance HERE (overwritten each beat) instead of
+        // letting it pile up in the transcript. The spinner + phase timer in
+        // `app.status` still prove motion; this just makes the wait explicit and
+        // reminds the user the long phase is interruptible (ESC).
+        match &app.transient_status {
+            Some(beat) => format!(
+                "{} · {beat} · {}",
+                app.status,
+                umadev_i18n::t(app.lang, "status.esc_cancel")
+            ),
+            None => app.status.clone(),
+        }
     } else if app.finished {
         umadev_i18n::t(app.lang, "tui.status.complete").to_string()
     } else {
