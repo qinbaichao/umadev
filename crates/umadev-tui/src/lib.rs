@@ -200,45 +200,22 @@ fn build_brain(
     }
 }
 
-const ROUTE_SYSTEM_PROMPT: &str = "\
-You are the brain behind UmaDev. The user talks to a thin shell, but it is you they are talking to.
-You are given the conversation so far. Respond to the user's LATEST message, using the earlier turns for context and continuity.
-Classify that latest message into exactly one of THREE modes, then return exactly one JSON object and nothing else — no markdown, no code fence.
-
-1. Normal conversation (greetings, small talk, follow-up questions, explanations, discussion — anything answerable by just talking, without looking at the repository):
-{\"mode\":\"chat\",\"reply\":\"your direct reply, in the user's language, written as a natural continuation of the conversation\"}
-
-2. A task that needs you to actually READ, INSPECT, or make a SMALL CHANGE to the code in THIS repository — but is NOT building a whole new project. Examples: review/audit a snippet or file for bugs, diagnose a failure, explain how existing code works, answer \"will this code break / leak / regress?\", trace a call path, apply a small fix or tweak, OR report what was actually changed / done or the repo's CURRENT state — e.g. \"what did you just change?\", \"did you do X?\", \"does Y exist?\", \"did the tests pass?\" (these MUST be read back from the real files + git, never recalled from memory):
-{\"mode\":\"agentic\",\"task\":\"a cleaned, self-contained instruction in the user's language that folds in any relevant detail from earlier turns — what to look at and what to produce\"}
-
-3. Concrete product/code work that should enter UmaDev's full 9-phase delivery pipeline (build, implement, create, design, or ship a whole feature / product / codebase from a requirement):
-{\"mode\":\"run\",\"requirement\":\"a cleaned, self-contained requirement in the user's language that folds in any relevant detail from earlier turns\"}
-
-Guidance: a plain greeting or opinion question is `chat`, never `agentic` — do not spend tool calls on small talk. If the user references THIS repo's code and wants it looked at, checked, explained, or minimally edited, that is `agentic`. Only a from-a-requirement build is `run`.
-CRITICAL: any question about what was just changed or done, the repo's CURRENT state, or whether some code / file / result exists or passed → `agentic` (it gets verified against the real files + git), NEVER `chat`. Answering \"what did you change / did you do X\" from conversation memory fabricates changes that may not exist on disk — that failure mode is exactly what `agentic` exists to prevent.
-When genuinely unsure between chat and agentic, prefer chat and ask a brief clarifying question.
-In chat mode just reply conversationally — do NOT perform the task, edit files, run commands, call tools, or mutate the workspace. (In agentic mode the shell makes a SEPARATE call where you ARE free to use your tools; this classification call must still only return the JSON.)";
-
+/// Terminal signal from a brain-driven turn back to the event loop. UmaDev no
+/// longer classifies the user's intent (chat vs run) up front — every non-slash
+/// message goes straight to the tools-enabled base session, which decides for
+/// itself whether to reply or to act. So this only carries the two terminal
+/// outcomes the streaming turn can end with.
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum RouteDecision {
-    Chat(String),
-    Run(String),
-    /// The base classified the turn as needing real work in THIS repo (review,
-    /// diagnose, explain, small fix) but NOT a full pipeline build. Carries the
-    /// cleaned task to send back to the base in a SECOND, tools-enabled streaming
-    /// call (no tool-ban prompt, no `max_tokens` cap) so the base runs its own
-    /// agentic loop — reading files / running commands — with live streaming.
-    Agentic(String),
-    /// An agentic streaming turn finished. Carries the final assembled text so
+    /// A brain-driven streaming turn finished. Carries the final assembled text so
     /// the event loop records it as the assistant turn (chat memory continuity);
     /// the body was ALREADY streamed live via `WorkerStream`, so it is NOT
     /// re-rendered. A terminal outcome → clears the "thinking…" status.
     AgenticDone(String),
-    /// The route produced no usable reply (base init failed, an empty reply, or
-    /// a hard error). Carries the human-readable reason. Routed through the same
-    /// channel as `Chat` / `Run` — instead of a bare `EngineEvent::Note` — so
-    /// the event loop clears the "thinking…" status on EVERY terminal route
-    /// outcome, and a plain progress Note never has to (and no longer does).
+    /// The turn produced no usable reply (base init failed, an empty reply, or a
+    /// hard error). Carries the human-readable reason, routed through the same
+    /// channel so the event loop clears the "thinking…" status on EVERY terminal
+    /// outcome, and a plain progress Note never has to.
     Failed(String),
 }
 
@@ -667,144 +644,8 @@ fn block_abort_note(e: &std::io::Error, label: &str) -> String {
     }
 }
 
-/// Everything a single routed chat turn needs — bundled so `spawn_route`
-/// stays within a sane argument count.
-struct RouteTurn {
-    /// The user's new message.
-    text: String,
-    /// Conversation memory for a base that cannot resume its own session
-    /// (only the offline fallback today; `HostCli` bases resume natively).
-    history: Vec<Message>,
-    /// Which base to route to.
-    spec: BrainSpec,
-    /// Resume this base's prior session (host CLIs) on this turn.
-    continue_session: bool,
-    /// Explicit session id for bases that support it (claude).
-    session_id: Option<String>,
-    /// Fallback model id when the spec does not carry one.
-    fallback_model: String,
-    /// Project root — the cwd the base subprocess runs in.
-    project_root: std::path::PathBuf,
-}
-
-fn spawn_route(
-    turn: RouteTurn,
-    sink: Arc<ChannelSink>,
-    route_tx: tokio::sync::mpsc::UnboundedSender<RouteDecision>,
-) {
-    let RouteTurn {
-        text,
-        history,
-        spec,
-        continue_session,
-        session_id,
-        fallback_model,
-        project_root,
-    } = turn;
-    tokio::spawn(async move {
-        // Offline has no base to ask, so the shell falls back to a keyword
-        // heuristic. Both outcomes flow through `route_tx` so the event loop is
-        // the single place that records conversation memory.
-        if !spec.is_runtime() {
-            if App::looks_like_project_requirement(&text) {
-                let _ = route_tx.send(RouteDecision::Run(text));
-            } else {
-                let _ = route_tx.send(RouteDecision::Chat(App::chitchat_reply(&text)));
-            }
-            return;
-        }
-
-        let label = spec.label();
-        let request_model = route_model_for_spec(&spec, fallback_model);
-
-        // Memory comes from two different places depending on the base:
-        // - HostCli (claude/codex/opencode) persists its OWN session, so we
-        //   resume it (`--continue` / `exec resume --last`) and send ONLY the
-        //   new turn — the base already remembers the rest (incl. tool calls).
-        // - A stateless base (no own session) would need the shell to replay
-        //   the whole transcript each call; none of the three bases need this.
-        let host_cli = matches!(spec, BrainSpec::HostCli(_));
-        let brain = match build_brain(
-            &spec,
-            host_cli && continue_session,
-            if host_cli { session_id.clone() } else { None },
-            &project_root,
-        ) {
-            Ok(b) => b,
-            Err(e) => {
-                // Terminal route outcome → flow through `route_tx` so the event
-                // loop clears `thinking` (a bare Note no longer does).
-                let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
-                    "base.init_failed",
-                    &[&label, &e.to_string()],
-                )));
-                return;
-            }
-        };
-
-        // The base decides chat-vs-run itself; the shell only relays. `text` /
-        // `request_model` are cloned so they survive for a possible retry below.
-        let request = if host_cli {
-            route_request_single(text.clone(), request_model.clone())
-        } else {
-            route_request(history, text.clone(), request_model.clone())
-        };
-        let mut result = brain.complete(request).await;
-
-        // Resume-failure fallback: if a host-CLI session resume failed (the
-        // session was pruned/expired, or the very first turn errored before
-        // creating one), retry ONCE with a brand-new cold session so the user
-        // still gets a reply. Safe because routing only chats — the route
-        // prompt forbids tool use / file writes, so a retry has no side effect.
-        let attempted_resume = host_cli && (continue_session || session_id.is_some());
-        if result.is_err() && attempted_resume {
-            if let Ok(fresh) = build_brain(&spec, false, None, &project_root) {
-                sink.emit(EngineEvent::Note(
-                    umadev_i18n::tl("route.resume_retry").to_string(),
-                ));
-                result = fresh
-                    .complete(route_request_single(text, request_model))
-                    .await;
-            }
-        }
-
-        match result {
-            Ok(response) => {
-                // Chat and Run both go through the channel — the event loop
-                // owns `&mut App`, so it records the turn into conversation
-                // memory before reacting.
-                if let Some(decision) = parse_route_decision(&response.text) {
-                    let _ = route_tx.send(decision);
-                } else {
-                    let body = response.text.trim();
-                    if body.is_empty() {
-                        // Terminal route outcome → route channel (clears
-                        // `thinking`), not a bare Note.
-                        let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
-                            "base.empty_reply",
-                            &[&label],
-                        )));
-                    } else {
-                        // Non-JSON but non-empty → treat the raw text as a
-                        // conversational reply rather than dropping it.
-                        let _ = route_tx.send(RouteDecision::Chat(body.to_string()));
-                    }
-                }
-            }
-            Err(e) => {
-                // Terminal route outcome → route channel (clears `thinking`).
-                let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
-                    "route.failed",
-                    &[&label, &e.to_string()],
-                )));
-            }
-        }
-    });
-}
-
-/// Everything the tools-enabled agentic execution call needs. Mirrors a subset
-/// of [`RouteTurn`] but for the SECOND call — the one that actually lets the
-/// base run its tool loop.
+/// Everything the tools-enabled brain-driven turn needs — bundled so the spawn
+/// stays within a sane argument count. The base runs its own tool loop.
 struct AgenticTurn {
     /// The cleaned task the base classified as agentic.
     task: String,
@@ -1074,9 +915,18 @@ fn agentic_fact_line(changed: Option<&[String]>, claimed: bool) -> Option<String
 /// snapshots (either may be `None`).
 fn agentic_system_prompt(status: Option<&str>, diff_stat: Option<&str>) -> String {
     let mut p = String::from(
-        "You are running inside the project's working directory with FULL tool access. \
-         You MAY and SHOULD read files, edit files, and run commands to do the work — \
-         do not refuse to use your tools.\n\n\
+        "You are the brain behind UmaDev, talking to the user through a thin shell — it \
+         is you they are talking to. You are running inside the project's working \
+         directory with FULL tool access.\n\n\
+         DECIDE FOR YOURSELF how to handle the user's latest message — that judgement is \
+         yours, not the shell's:\n\
+         - If it is just conversation (a greeting, an opinion, a question you can answer \
+           by talking, a follow-up) — simply REPLY, naturally, in the user's language. Do \
+           NOT use tools or touch files for small talk.\n\
+         - If it asks you to look at, inspect, explain, debug, review, change, or BUILD \
+           something — actually DO it: read files, edit files, run commands. Do not refuse \
+           to use your tools, and do not just describe what you would do — do the work.\n\
+         You are one continuous session: keep the context of the whole conversation.\n\n\
          REALITY CONTRACT (mandatory): every statement you make about WHICH FILES YOU \
          CHANGED or WHAT EDITS YOU MADE must be grounded in the real files on disk and \
          the real git state. Before claiming any change, verify it with `git diff` / \
@@ -1216,57 +1066,6 @@ async fn drive_agentic_stream(
     }
 }
 
-/// Build a [`RouteTurn`] from the current app state and spawn it. The single
-/// place a chat turn is dispatched — used both by the `Action::Route` key path
-/// and by the queue-drain that fires the next parked turn once the current
-/// route result lands. Marks `thinking` so the status animates immediately, and
-/// flips `host_chat_session_active` so a host-CLI base resumes (not cold-starts)
-/// the NEXT turn. Routing same-session turns is kept strictly serial: the only
-/// callers fire one turn and wait for its `RouteDecision` before firing another.
-fn fire_route(
-    app: &mut App,
-    sink: &Arc<ChannelSink>,
-    route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
-    text: String,
-) {
-    let spec = app.brain_spec();
-    let host_cli = matches!(spec, BrainSpec::HostCli(_));
-    let continue_session = app.host_chat_session_active;
-    // Pin a stable id so a host CLI (claude) resumes OUR chat session by id,
-    // never "the most recent in this dir".
-    let session_id = if host_cli {
-        Some(app.ensure_chat_session_id())
-    } else {
-        None
-    };
-    // A re-fired queued turn starts a fresh in-flight route → animate again.
-    // (The renderer reads `thinking` directly each frame, so no explicit
-    // status refresh is needed here; the loop redraws on the next tick.)
-    app.thinking = true;
-    app.thinking_started = Some(std::time::Instant::now());
-    app.last_output_at = None;
-    app.tool_in_progress = false;
-    spawn_route(
-        RouteTurn {
-            text,
-            history: app.conversation_snapshot(),
-            spec: spec.clone(),
-            continue_session,
-            session_id,
-            fallback_model: app.effective_model(),
-            project_root: app.project_root.clone(),
-        },
-        sink.clone(),
-        route_tx.clone(),
-    );
-    // A host-CLI base persists its own session — mark it active so the NEXT
-    // turn resumes instead of starting cold. HTTP / offline bases keep their
-    // memory elsewhere and ignore this flag.
-    if host_cli {
-        app.host_chat_session_active = true;
-    }
-}
-
 /// Fire the tools-enabled agentic execution call from current app state, and
 /// return its `JoinHandle` so the event loop can park it in `run_task` (Ctrl-C
 /// aborts it). Keeps `thinking` set — the stream feeds `WorkerStream` events,
@@ -1315,73 +1114,18 @@ fn fire_agentic(
 /// After a TERMINAL chat route outcome (`Chat` / `Failed`), fire the next turn
 /// the user parked while the route was in flight, keeping same-session routing
 /// serial. Returns `true` if a parked turn was dispatched.
+/// After a terminal turn outcome, fire the next message the user parked while the
+/// turn was in flight, keeping the single base session serial. Brain-driven: the
+/// drained message goes straight to the tools-enabled agentic turn (the same path
+/// as a fresh message), so a parked turn is handled identically. Returns the
+/// in-flight handle so the caller can park it in `run_task` for Ctrl-C.
 fn drain_next_queued_chat(
     app: &mut App,
     sink: &Arc<ChannelSink>,
     route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
-) -> bool {
-    if let Some(text) = app.take_next_queued_chat() {
-        fire_route(app, sink, route_tx, text);
-        true
-    } else {
-        false
-    }
-}
-
-fn parse_route_decision(text: &str) -> Option<RouteDecision> {
-    let value = parse_json_object(text)?;
-    let mode = value.get("mode")?.as_str()?.trim().to_lowercase();
-    match mode.as_str() {
-        "run" => {
-            let requirement = value
-                .get("requirement")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .trim();
-            if requirement.is_empty() {
-                None
-            } else {
-                Some(RouteDecision::Run(requirement.to_string()))
-            }
-        }
-        "chat" => {
-            let reply = value
-                .get("reply")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .trim();
-            if reply.is_empty() {
-                None
-            } else {
-                Some(RouteDecision::Chat(reply.to_string()))
-            }
-        }
-        "agentic" => {
-            let task = value
-                .get("task")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .trim();
-            if task.is_empty() {
-                None
-            } else {
-                Some(RouteDecision::Agentic(task.to_string()))
-            }
-        }
-        _ => None,
-    }
-}
-
-fn parse_json_object(text: &str) -> Option<serde_json::Value> {
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) {
-        return Some(value);
-    }
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    if end < start {
-        return None;
-    }
-    serde_json::from_str(&text[start..=end]).ok()
+) -> Option<tokio::task::JoinHandle<()>> {
+    let text = app.take_next_queued_chat()?;
+    Some(fire_agentic(app, sink, route_tx, text))
 }
 
 fn route_model_for_spec(_spec: &BrainSpec, fallback_model: String) -> String {
@@ -1472,40 +1216,6 @@ fn toml_top_string(path: &std::path::Path, key: &str) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let v: toml::Value = toml::from_str(&text).ok()?;
     v.get(key)?.as_str().map(str::to_string)
-}
-
-/// Route request carrying ONLY the new user turn — for host CLIs, whose own
-/// session (resumed via `continue_session`) already holds the prior context.
-fn route_request_single(text: String, model: String) -> CompletionRequest {
-    CompletionRequest {
-        model,
-        messages: vec![Message {
-            role: "user".to_string(),
-            content: text,
-        }],
-        max_tokens: Some(1024),
-        temperature: Some(0.4),
-        system: Some(ROUTE_SYSTEM_PROMPT.to_string()),
-    }
-}
-
-fn route_request(mut history: Vec<Message>, text: String, model: String) -> CompletionRequest {
-    // `history` already ends with the user's current turn (recorded by
-    // `App::record_user_turn` before routing). The guard only covers the
-    // defensive case of an empty transcript so the request is never message-less.
-    if history.is_empty() {
-        history.push(Message {
-            role: "user".to_string(),
-            content: text,
-        });
-    }
-    CompletionRequest {
-        model,
-        messages: history,
-        max_tokens: Some(1024),
-        temperature: Some(0.4),
-        system: Some(ROUTE_SYSTEM_PROMPT.to_string()),
-    }
 }
 
 fn spawn_probe(sink: Arc<ChannelSink>) {
@@ -1756,86 +1466,23 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
         tokio::select! {
             maybe_route = route_rx.recv() => {
                 match maybe_route {
-                    // The base chose to talk: render the reply and remember it
-                    // as the assistant turn so the next message has continuity.
-                    // Then fire the next turn the user parked while this route
-                    // was in flight (serial — never two routes at once).
-                    Some(RouteDecision::Chat(reply)) => {
-                        app.record_chat_reply(reply);
-                        drain_next_queued_chat(app, &sink, &route_tx);
-                    }
-                    // The base chose agentic work: read/inspect/edit THIS repo
-                    // without entering the full pipeline. Fire the SECOND,
-                    // tools-enabled streaming call — its tool calls + text show
-                    // live, and it ends on the base's stream end (not the first
-                    // preamble). Parked in `run_task` so Ctrl-C aborts it.
-                    Some(RouteDecision::Agentic(task)) => {
-                        app.record_agentic_started(&task);
-                        run_task = Some(fire_agentic(app, &sink, &route_tx, task));
-                    }
-                    // An agentic turn finished cleanly: the body already streamed
-                    // live, so we only record it as the assistant turn (chat
-                    // memory), clear `thinking`, then drain the parked queue.
+                    // The brain-driven turn finished cleanly: the body already
+                    // streamed live, so we only record it as the assistant turn
+                    // (chat memory) + clear `thinking`, then fire the next message
+                    // the user parked while this turn was in flight (serial — one
+                    // base session, never two turns at once). The drained turn's
+                    // handle is parked in `run_task` so Ctrl-C can abort it.
                     Some(RouteDecision::AgenticDone(reply)) => {
-                        run_task = None;
                         app.record_agentic_done(reply);
-                        drain_next_queued_chat(app, &sink, &route_tx);
+                        run_task = drain_next_queued_chat(app, &sink, &route_tx);
                     }
-                    // The route produced no usable reply. `record_route_failed`
-                    // clears `thinking`; then drain the parked queue so a failed
-                    // turn doesn't strand the messages typed behind it.
+                    // The turn produced no usable reply (base init / stream error).
+                    // `record_route_failed` clears `thinking`; then fire the next
+                    // parked message so a failed turn doesn't strand the messages
+                    // typed behind it.
                     Some(RouteDecision::Failed(note)) => {
-                        run_task = None;
                         app.record_route_failed(note);
-                        drain_next_queued_chat(app, &sink, &route_tx);
-                    }
-                    // The base chose to build: note it in conversation memory,
-                    // then kick off the 9-phase pipeline.
-                    Some(RouteDecision::Run(requirement)) => {
-                        app.record_run_started(&requirement);
-                        app.prepare_worker_routed_run(&requirement);
-                        // Any chat turns the user parked while routing now belong
-                        // to this run — fold them into the pipeline steer queue so
-                        // they fire at the first gate (instead of being dropped by
-                        // the run reset). `prepare_worker_routed_run` already
-                        // cleared the prior steer, so this is a clean handoff.
-                        while let Some(parked) = app.take_next_queued_chat() {
-                            app.queued_steer.push_back(parked);
-                        }
-                        let run_opts = RunOptions {
-                            project_root: opts.project_root.clone(),
-                            requirement,
-                            slug: opts.slug.clone(),
-                            model: app.effective_model(),
-                            backend: app.backend.clone().unwrap_or_default(),
-                            design_system: app.config.design_system.clone().unwrap_or_default(),
-                            seed_template: app.config.seed_template.clone().unwrap_or_default(),
-                            mode: app.effective_trust_mode(),
-                            // Snapshot the strict-coverage opt-in once at the app
-                            // boundary; the runner reads this, not the live env.
-                            strict_coverage: umadev_agent::strict_coverage_from_env(),
-                        };
-                        // Continuous long-session path (opt-in): when enabled AND
-                        // the brain is a host CLI, the director's `run` intent
-                        // drives ONE persistent base session from research
-                        // (`spawn_continuous_block`) instead of a fresh per-phase
-                        // process. The gate cards / continue / completion all run
-                        // off the SAME events, so the rest of the loop is unchanged.
-                        // Offline / non-host brains stay on the single-shot path.
-                        let host_cli = matches!(app.brain_spec(), BrainSpec::HostCli(_));
-                        continuous_run_active = tui_continuous_enabled() && host_cli;
-                        run_task = Some(if continuous_run_active {
-                            let autonomous = continuous_autonomous(run_opts.mode);
-                            spawn_continuous_block(
-                                run_opts,
-                                sink.clone(),
-                                session_holder.clone(),
-                                umadev_spec::Phase::Research,
-                                autonomous,
-                            )
-                        } else {
-                            spawn_block(run_opts, app.brain_spec(), sink.clone(), Block::Clarify)
-                        });
+                        run_task = drain_next_queued_chat(app, &sink, &route_tx);
                     }
                     None => {}
                 }
@@ -2115,7 +1762,16 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                 ));
                             }
                             Action::Route(text) => {
-                                fire_route(app, &sink, &route_tx, text);
+                                // Brain-driven by default: hand the message straight
+                                // to the tools-enabled base session and let the brain
+                                // decide for itself whether to just reply or to do
+                                // the work — no UmaDev-side chat/run classification,
+                                // no forced 9-phase pipeline. `/run` stays the
+                                // explicit entry to the full commercial pipeline.
+                                // (`submit_text` already recorded the user turn; we do
+                                // NOT pre-announce "inspecting repo" since the brain
+                                // may simply be replying to small talk.)
+                                run_task = Some(fire_agentic(app, &sink, &route_tx, text));
                             }
                             Action::Revise(text) => {
                                 // Re-run the block that PRODUCED the current
@@ -2363,22 +2019,6 @@ mod tests {
     }
 
     #[test]
-    fn route_request_asks_base_to_classify_without_workspace_mutation() {
-        // Empty history → the guard seeds a single user message from `text`.
-        let request = route_request(Vec::new(), "你好".to_string(), "test-model".to_string());
-
-        assert_eq!(request.model, "test-model");
-        assert_eq!(request.messages.len(), 1);
-        assert_eq!(request.messages[0].role, "user");
-        assert_eq!(request.messages[0].content, "你好");
-        let system = request.system.unwrap();
-        assert!(system.contains("brain behind UmaDev"));
-        assert!(system.contains("conversation so far"));
-        assert!(system.contains("edit files"));
-        assert!(system.contains("\"mode\":\"run\""));
-    }
-
-    #[test]
     fn detect_base_model_reads_each_base_config() {
         // The base's OWN model is read from its own config, in the base's order.
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2438,37 +2078,6 @@ mod tests {
     }
 
     #[test]
-    fn route_request_preserves_conversation_history() {
-        // A real routed turn passes the full transcript (which already ends
-        // with the current user message); `text` is only a fallback and must
-        // NOT be appended on top of a non-empty history.
-        let history = vec![
-            Message {
-                role: "user".to_string(),
-                content: "你好".to_string(),
-            },
-            Message {
-                role: "assistant".to_string(),
-                content: "你好,我是底座".to_string(),
-            },
-            Message {
-                role: "user".to_string(),
-                content: "我刚才说了什么?".to_string(),
-            },
-        ];
-        let request = route_request(history, "ignored-fallback".to_string(), "m".to_string());
-
-        assert_eq!(request.messages.len(), 3);
-        assert_eq!(request.messages[0].content, "你好");
-        assert_eq!(request.messages[1].role, "assistant");
-        assert_eq!(request.messages[2].content, "我刚才说了什么?");
-        assert!(request
-            .messages
-            .iter()
-            .all(|m| m.content != "ignored-fallback"));
-    }
-
-    #[test]
     fn route_model_uses_launch_model_for_host_cli() {
         let spec = BrainSpec::HostCli("codex".to_string());
 
@@ -2476,118 +2085,6 @@ mod tests {
             route_model_for_spec(&spec, "fallback-model".to_string()),
             "fallback-model"
         );
-    }
-
-    #[tokio::test]
-    async fn spawn_route_offline_emits_local_fallback_for_chat() {
-        let (sink, mut rx) = ChannelSink::new();
-        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
-        spawn_route(
-            RouteTurn {
-                text: "你好".to_string(),
-                history: Vec::new(),
-                spec: BrainSpec::Offline,
-                continue_session: false,
-                session_id: None,
-                fallback_model: "fallback-model".to_string(),
-                project_root: std::path::PathBuf::from("."),
-            },
-            std::sync::Arc::new(sink),
-            route_tx,
-        );
-
-        // Offline chat now flows through the route channel as a Chat decision
-        // so the event loop records it into conversation memory uniformly.
-        let route = tokio::time::timeout(std::time::Duration::from_secs(2), route_rx.recv())
-            .await
-            .expect("offline chat task should route")
-            .expect("route channel should stay open until event");
-        match route {
-            RouteDecision::Chat(body) => assert!(body.contains("UmaDev")),
-            other @ (RouteDecision::Run(_)
-            | RouteDecision::Agentic(_)
-            | RouteDecision::AgenticDone(_)
-            | RouteDecision::Failed(_)) => {
-                panic!("expected local chat fallback, got {other:?}")
-            }
-        }
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn spawn_route_offline_routes_requirements_to_pipeline() {
-        let (sink, mut rx) = ChannelSink::new();
-        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
-        spawn_route(
-            RouteTurn {
-                text: "build a login app".to_string(),
-                history: Vec::new(),
-                spec: BrainSpec::Offline,
-                continue_session: false,
-                session_id: None,
-                fallback_model: "fallback-model".to_string(),
-                project_root: std::path::PathBuf::from("."),
-            },
-            std::sync::Arc::new(sink),
-            route_tx,
-        );
-
-        let route = tokio::time::timeout(std::time::Duration::from_secs(2), route_rx.recv())
-            .await
-            .expect("offline requirement should route")
-            .expect("route channel should stay open until event");
-        assert_eq!(route, RouteDecision::Run("build a login app".to_string()));
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn parse_route_decision_reads_chat_json() {
-        assert_eq!(
-            parse_route_decision(r#"{"mode":"chat","reply":"你好，有什么想聊的？"}"#),
-            Some(RouteDecision::Chat("你好，有什么想聊的？".to_string()))
-        );
-    }
-
-    #[test]
-    fn parse_route_decision_reads_run_json_inside_text() {
-        assert_eq!(
-            parse_route_decision(
-                "```json\n{\"mode\":\"run\",\"requirement\":\"做一个登录系统\"}\n```"
-            ),
-            Some(RouteDecision::Run("做一个登录系统".to_string()))
-        );
-    }
-
-    #[test]
-    fn parse_route_decision_reads_agentic_json() {
-        // The new third mode: "look at THIS repo's code" (review/diagnose/explain
-        // /small-fix) routes to Agentic, carrying the cleaned task.
-        assert_eq!(
-            parse_route_decision(r#"{"mode":"agentic","task":"审查 app.rs 看会不会出 bug"}"#),
-            Some(RouteDecision::Agentic(
-                "审查 app.rs 看会不会出 bug".to_string()
-            ))
-        );
-        // An agentic verdict with an empty task is not usable → None (falls back
-        // to a non-JSON / chat path upstream).
-        assert_eq!(
-            parse_route_decision(r#"{"mode":"agentic","task":""}"#),
-            None
-        );
-    }
-
-    #[test]
-    fn route_prompt_offers_all_three_modes() {
-        // The classifier prompt must teach the base the three-way split so it can
-        // ever emit `agentic` (the W3-b fix). Lock the mode tokens in the prompt.
-        assert!(ROUTE_SYSTEM_PROMPT.contains("\"mode\":\"chat\""));
-        assert!(ROUTE_SYSTEM_PROMPT.contains("\"mode\":\"agentic\""));
-        assert!(ROUTE_SYSTEM_PROMPT.contains("\"mode\":\"run\""));
-        // L2 anti-confabulation: "what did you change / did you do X / current
-        // state" questions must route to agentic (verified against git), never
-        // chat (which would answer from memory and fabricate changes).
-        assert!(ROUTE_SYSTEM_PROMPT.contains("what did you just change"));
-        assert!(ROUTE_SYSTEM_PROMPT.contains("fabricates changes that may not exist"));
     }
 
     /// A fake runtime that records which entry point the agentic path used.
@@ -2759,6 +2256,21 @@ mod tests {
         // The anti-recitation reality contract is present.
         assert!(p.contains("REALITY CONTRACT"));
         assert!(p.to_lowercase().contains("git diff"));
+    }
+
+    #[test]
+    fn agentic_prompt_lets_the_brain_decide_chat_vs_act() {
+        // The unified brain-driven path: instead of UmaDev classifying the message
+        // up front, the prompt hands that judgement to the base — reply to small
+        // talk without tools, do the work when it needs tools. This is what makes
+        // a greeting not waste tool calls and a real task actually get done.
+        let p = agentic_system_prompt(None, None);
+        let lower = p.to_lowercase();
+        assert!(lower.contains("decide for yourself"));
+        // It must cover BOTH arms: just reply to conversation, and do the work.
+        assert!(lower.contains("just talking") || lower.contains("simply reply"));
+        assert!(lower.contains("do not use tools") || lower.contains("small talk"));
+        assert!(lower.contains("actually do it") || lower.contains("do the work"));
     }
 
     #[test]

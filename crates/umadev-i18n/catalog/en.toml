@@ -156,6 +156,7 @@
 "gate.confirmed_generic" = "Approved, proceeding…"
 "gate.revision_received" = "Revision received: \"{}\". Re-running the current block…"
 "run.queued" = "[queued] Queued — it will be sent to the base as a revision at the next gap (gate / phase boundary). Press Esc to interrupt the current phase."
+"chat.queued" = "[queued] Queued — the base is still replying; this message will be sent the moment it finishes."
 "run.steer_applied" = "[steer] Applying your queued message — redoing the current phase with it…"
 "run.queued_unsent" = "[note] The pipeline finished before your queued message \"{}\" reached a gate, so it was not sent — just send it again."
 "run.classified_build" = "-> Classified as a build task · entering the 9-phase pipeline (/cancel to stop mid-way)"

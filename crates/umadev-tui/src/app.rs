@@ -2229,15 +2229,20 @@ impl App {
     /// the gate card so users don't have to type `/continue` every time.
     fn submit_text(&mut self, text: String) -> Action {
         self.push(ChatRole::You, text.clone());
-        // A routed turn is still in flight (`thinking`). Spawning a second
-        // `spawn_route` now would resume the SAME chat `session_id` in two base
-        // subprocesses at once → interleaved / out-of-order replies and a
-        // scrambled memory. Park this turn instead; the event loop fires it as
-        // the next route only after the current result lands. (A gate is never
-        // open while `thinking`, so this check sits ahead of gate handling.)
+        // A brain-driven turn is still in flight (`thinking`). Firing a second one
+        // now would drive the SAME base `session_id` in two subprocesses at once →
+        // interleaved / out-of-order replies and a scrambled memory. Park this
+        // turn instead; the event loop fires it the moment the current turn lands
+        // (a clean / failed terminal outcome both drain the queue). (A gate is
+        // never open while `thinking`, so this check sits ahead of gate handling.)
         if self.thinking {
+            // Record it in conversation memory now (so the parked turn isn't lost
+            // from the base's context when it finally fires) and tell the user it
+            // is queued — NOT the pipeline `run.queued` text (there is no gate
+            // here, this is a plain conversational turn).
+            self.record_user_turn(&text);
             self.queued_chat.push_back(text);
-            self.push(ChatRole::System, umadev_i18n::t(self.lang, "run.queued"));
+            self.push(ChatRole::System, umadev_i18n::t(self.lang, "chat.queued"));
             self.refresh_status();
             return Action::None;
         }
@@ -2329,206 +2334,6 @@ impl App {
         }
     }
 
-    /// Detect whether the user's input is casual chitchat / a greeting /
-    /// a question, rather than a real project requirement that should
-    /// launch the 9-phase pipeline.
-    fn looks_like_chitchat(text: &str) -> bool {
-        let t = text.trim();
-        let lower = t.to_lowercase();
-
-        // Greeting keywords (EN + ZH).
-        let greetings = [
-            "hi",
-            "hello",
-            "hey",
-            "yo",
-            "sup",
-            "howdy",
-            "你好",
-            "您好",
-            "在吗",
-            "在么",
-            "嗨",
-            "哈喽",
-            "thanks",
-            "thank you",
-            "thx",
-            "谢谢",
-            "感谢",
-            "bye",
-            "goodbye",
-            "再见",
-            "拜拜",
-            "ok",
-            "okay",
-            "好的",
-            "嗯",
-            "哦",
-        ];
-        if greetings
-            .iter()
-            .any(|g| lower == *g || lower.starts_with(g) && t.len() < 20)
-        {
-            return true;
-        }
-
-        // Short question with no action verbs = likely chitchat.
-        let has_action_verb = [
-            "做",
-            "建",
-            "开发",
-            "构建",
-            "写",
-            "创建",
-            "设计",
-            "实现",
-            "部署",
-            "build",
-            "create",
-            "make",
-            "design",
-            "develop",
-            "implement",
-            "deploy",
-            "write",
-            "generate",
-            "fix",
-            "refactor",
-            "add",
-        ]
-        .iter()
-        .any(|v| lower.contains(v));
-
-        if !has_action_verb && t.chars().count() < 15 {
-            return true;
-        }
-
-        // "how are you" / "你好吗" / "what can you do" style questions.
-        let questions = [
-            "how are you",
-            "what can you do",
-            "who are you",
-            "what is this",
-            "你好吗",
-            "你是谁",
-            "你能做什么",
-            "这是什么",
-            "怎么用",
-            "帮助",
-        ];
-        if questions.iter().any(|q| lower.contains(q)) {
-            return true;
-        }
-
-        false
-    }
-
-    /// Return true only for plain text that looks like a product/code task.
-    ///
-    /// This is intentionally conservative. UmaDev is allowed to chat in the
-    /// TUI; starting the full pipeline is expensive and should require an
-    /// obvious build/fix/design/deploy intent, or an explicit `/run`.
-    pub(crate) fn looks_like_project_requirement(text: &str) -> bool {
-        let t = text.trim();
-        if t.is_empty() || Self::looks_like_chitchat(t) {
-            return false;
-        }
-        let lower = t.to_lowercase();
-
-        let action_verbs = [
-            "做",
-            "建",
-            "开发",
-            "构建",
-            "写",
-            "创建",
-            "设计",
-            "实现",
-            "部署",
-            "修复",
-            "重构",
-            "添加",
-            "生成",
-            "改造",
-            "搭建",
-            "build",
-            "create",
-            "make",
-            "design",
-            "develop",
-            "implement",
-            "deploy",
-            "write",
-            "generate",
-            "fix",
-            "refactor",
-            "add",
-            "scaffold",
-        ];
-        if action_verbs.iter().any(|v| lower.contains(v)) {
-            return true;
-        }
-
-        let project_nouns = [
-            "系统",
-            "应用",
-            "网站",
-            "网页",
-            "页面",
-            "小程序",
-            "平台",
-            "后台",
-            "前端",
-            "后端",
-            "接口",
-            "api",
-            "app",
-            "website",
-            "page",
-            "dashboard",
-            "backend",
-            "frontend",
-            "service",
-            "cli",
-            "tui",
-            "saas",
-            "landing page",
-            "登录页",
-            "博客",
-            "商城",
-            "论坛",
-        ];
-        project_nouns.iter().any(|n| lower.contains(n))
-    }
-
-    /// Generate a conversational reply for chitchat input, guiding the
-    /// user toward entering a real requirement.
-    pub(crate) fn chitchat_reply(text: &str) -> String {
-        let lower = text.trim().to_lowercase();
-        if lower.starts_with("你好")
-            || lower.starts_with("您好")
-            || lower == "hi"
-            || lower == "hello"
-            || lower == "hey"
-            || lower.contains("你好吗")
-            || lower.contains("在吗")
-            || lower.contains("在么")
-        {
-            return umadev_i18n::tl("chitchat.greeting").to_string();
-        }
-        if lower.contains("谢谢") || lower.contains("感谢") || lower.starts_with("th") {
-            return umadev_i18n::tl("chitchat.thanks").to_string();
-        }
-        if lower.contains("你是谁")
-            || lower.contains("what can you do")
-            || lower.contains("你能做什么")
-        {
-            return umadev_i18n::tl("chitchat.who").to_string();
-        }
-        // Generic fallback for short non-requirement text.
-        umadev_i18n::tl("chitchat.fallback").to_string()
-    }
-
     /// Record a user turn into [`App::conversation`] (the memory handed to the
     /// base on the next routed turn). Trims to the most recent
     /// [`CONVERSATION_CAP`] messages so the prompt stays bounded.
@@ -2544,6 +2349,7 @@ impl App {
         self.trim_conversation();
     }
 
+    #[cfg(test)]
     /// Record the base's conversational reply: render it in the chat as a
     /// `Host` message AND append it to [`App::conversation`] as the assistant
     /// turn, so the next turn the base sees its own previous answer.
@@ -2575,31 +2381,6 @@ impl App {
         self.trim_conversation();
     }
 
-    /// Note, as an assistant turn, that the base routed the message into a
-    /// pipeline run. Keeps the conversation coherent for any chat that follows
-    /// a build (so "what did you just build?" has context).
-    pub(crate) fn record_run_started(&mut self, requirement: &str) {
-        self.thinking = false; // routed to a pipeline run; the run spinner takes over
-        self.thinking_started = None;
-        let requirement = requirement.trim();
-        if requirement.is_empty() {
-            return;
-        }
-        // Make the routing decision VISIBLE — the base just classified this as
-        // build-work (vs a chat reply), and a multi-minute pipeline is about to
-        // start. Without this marker the launch is a surprise the user can't
-        // predict turn to turn.
-        self.push(
-            ChatRole::System,
-            umadev_i18n::t(self.lang, "run.classified_build").to_string(),
-        );
-        self.conversation.push(umadev_runtime::Message {
-            role: "assistant".to_string(),
-            content: umadev_i18n::tf(self.lang, "run.classified_build_memo", &[requirement]),
-        });
-        self.trim_conversation();
-    }
-
     /// The route ended without a usable reply (base init failed, an empty
     /// reply, or a hard error). This is a TERMINAL route outcome, so — like
     /// [`record_chat_reply`] / [`record_run_started`] — it stops the
@@ -2613,28 +2394,6 @@ impl App {
         self.agentic_in_flight = false;
         self.refresh_status();
         self.push(ChatRole::System, note);
-    }
-
-    /// The base classified the turn as agentic (real work in THIS repo, short of
-    /// a full pipeline build) and the tools-enabled streaming call is about to
-    /// fire. Make the decision VISIBLE (the user is about to see live tool calls,
-    /// not a chat reply) and note it as an assistant turn so a follow-up like
-    /// "what did you find?" keeps context. `thinking` is left set by
-    /// `fire_agentic` — the stream keeps it alive until the turn ends.
-    pub(crate) fn record_agentic_started(&mut self, task: &str) {
-        let task = task.trim();
-        if task.is_empty() {
-            return;
-        }
-        self.push(
-            ChatRole::System,
-            umadev_i18n::t(self.lang, "agentic.inspecting").to_string(),
-        );
-        self.conversation.push(umadev_runtime::Message {
-            role: "assistant".to_string(),
-            content: umadev_i18n::tf(self.lang, "agentic.working_on", &[task]),
-        });
-        self.trim_conversation();
     }
 
     /// An agentic streaming turn finished cleanly. The body ALREADY streamed live
@@ -2685,6 +2444,7 @@ impl App {
         self.queued_chat.len() + self.queued_steer.len()
     }
 
+    #[cfg(test)]
     /// A bounded clone of the conversation memory to hand to a routed turn.
     #[must_use]
     pub(crate) fn conversation_snapshot(&self) -> Vec<umadev_runtime::Message> {
@@ -2776,6 +2536,7 @@ impl App {
         self.push(ChatRole::System, umadev_i18n::t(self.lang, "run.cancelled"));
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_worker_routed_run(&mut self, requirement: &str) {
         if self.run_started {
             self.reset_for_new_run();
@@ -8833,6 +8594,40 @@ mod tests {
             a.input.is_empty(),
             "the half-typed input is dropped on interrupt"
         );
+    }
+
+    #[test]
+    fn queued_turn_is_echoed_recorded_and_uses_chat_text() {
+        let mut a = fresh_app(Some("offline"));
+        // First turn starts a brain-driven turn (thinking).
+        let _ = a.submit_text("first".to_string());
+        assert!(a.thinking);
+        let convo_before = a.conversation.len();
+        let hist_before = a.history.len();
+        // Second turn WHILE thinking: queued — but it must STILL be echoed to the
+        // transcript (the user sees their message), recorded in conversation
+        // memory (so the parked turn isn't lost from the base's context), and the
+        // queue note must be the chat text, NOT the pipeline `run.queued` (no gate
+        // exists here). This is the "second message looks like it did nothing" fix.
+        let _ = a.submit_text("second".to_string());
+        // Echoed: the user's "second" message is in the transcript.
+        assert!(
+            a.history.iter().any(|m| m.body == "second"),
+            "the queued user message is still echoed to the transcript"
+        );
+        // Recorded in conversation memory (user turn appended).
+        assert!(
+            a.conversation.len() > convo_before,
+            "the queued turn is recorded in conversation memory, not lost"
+        );
+        // A chat.queued note was pushed (history grew by the You echo + the note).
+        assert!(a.history.len() >= hist_before + 2);
+        let note = umadev_i18n::t(a.lang, "chat.queued");
+        assert!(
+            a.history.iter().any(|m| m.body == note),
+            "the queue note uses chat.queued, not the gate-flavoured run.queued"
+        );
+        assert_eq!(a.queued_chat.len(), 1);
     }
 
     #[test]
