@@ -217,10 +217,18 @@ pub struct Overlay {
     /// Window title shown at the top of the overlay border.
     pub title: String,
     /// Pre-split lines for easy clipping (each may be longer than the
-    /// visible width; the renderer wraps).
+    /// visible width; the renderer pre-folds them to VISUAL rows).
     pub lines: Vec<String>,
-    /// Top-of-window cursor (0 = first line).
+    /// Top-of-window cursor — counted in **visual rows** (a long logical line
+    /// that wraps occupies several), so scrolling reaches every wrapped row and
+    /// the progress % is honest. `0` = first visual row.
     pub scroll: usize,
+    /// Greatest legal `scroll` (top-most reachable visual row), published every
+    /// frame by the renderer once it knows the wrapped row count and viewport
+    /// height. Key handlers clamp `scroll` against this so End / scroll_down land
+    /// on the last visual row rather than a logical-line guess. `0` until first
+    /// render (fail-open: an un-rendered overlay simply doesn't scroll).
+    pub max_scroll: std::cell::Cell<usize>,
 }
 
 impl Overlay {
@@ -232,18 +240,25 @@ impl Overlay {
             title: title.into(),
             lines,
             scroll: 0,
+            max_scroll: std::cell::Cell::new(0),
         }
     }
 
-    /// Scroll down by `n` lines, clamped at end.
+    /// Scroll down by `n` visual rows, clamped to the last reachable row
+    /// (published by the renderer in [`Self::max_scroll`]).
     pub fn scroll_down(&mut self, n: usize) {
-        let max = self.lines.len().saturating_sub(1);
+        let max = self.max_scroll.get();
         self.scroll = (self.scroll + n).min(max);
     }
 
-    /// Scroll up by `n` lines, clamped at 0.
+    /// Scroll up by `n` visual rows, clamped at 0.
     pub fn scroll_up(&mut self, n: usize) {
         self.scroll = self.scroll.saturating_sub(n);
+    }
+
+    /// Jump to the last reachable visual row (End / `G`).
+    pub fn scroll_to_end(&mut self) {
+        self.scroll = self.max_scroll.get();
     }
 }
 
@@ -1905,17 +1920,53 @@ impl App {
                     Action::None
                 }
             },
-            KeyCode::Up => {
+            // ↑ / k — move up, wrapping from the top row to the bottom (Claude
+            // Code / opencode list parity: a long base-CLI list is much faster to
+            // reach the last entry by pressing ↑ once than holding ↓).
+            KeyCode::Up | KeyCode::Char('k' | 'K') => {
                 self.picker_notice = None;
-                if self.picker_selected > 0 {
-                    self.picker_selected -= 1;
+                let len = self.picker_items.len();
+                if len > 0 {
+                    self.picker_selected = if self.picker_selected == 0 {
+                        len - 1
+                    } else {
+                        self.picker_selected - 1
+                    };
                 }
                 Action::None
             }
-            KeyCode::Down => {
+            // ↓ / j — move down, wrapping from the bottom row back to the top.
+            KeyCode::Down | KeyCode::Char('j' | 'J') => {
                 self.picker_notice = None;
-                if self.picker_selected + 1 < self.picker_items.len() {
-                    self.picker_selected += 1;
+                let len = self.picker_items.len();
+                if len > 0 {
+                    self.picker_selected = (self.picker_selected + 1) % len;
+                }
+                Action::None
+            }
+            // Home / PageUp — jump to the first row (picker lists are short enough
+            // that a page == the whole list, matching the overlay's PageUp reaching
+            // the top).
+            KeyCode::Home | KeyCode::PageUp => {
+                self.picker_notice = None;
+                self.picker_selected = 0;
+                Action::None
+            }
+            // End / PageDown — jump to the last row.
+            KeyCode::End | KeyCode::PageDown => {
+                self.picker_notice = None;
+                self.picker_selected = self.picker_items.len().saturating_sub(1);
+                Action::None
+            }
+            // Digit quick-select: `1`-`9` jump straight to that 1-based row (uses
+            // `PickerStep::number()`-style 1-based indexing). A digit past the end
+            // is ignored. Only fires when the typed digit maps to an existing row.
+            KeyCode::Char(c @ '1'..='9') => {
+                self.picker_notice = None;
+                // `c` is a guaranteed ASCII digit, so `to_digit` never returns None.
+                let n = c.to_digit(10).unwrap_or(0) as usize;
+                if n >= 1 && n <= self.picker_items.len() {
+                    self.picker_selected = n - 1;
                 }
                 Action::None
             }
@@ -2306,11 +2357,14 @@ impl App {
         // (a clean / failed terminal outcome both drain the queue). (A gate is
         // never open while `thinking`, so this check sits ahead of gate handling.)
         if self.thinking {
-            // Record it in conversation memory now (so the parked turn isn't lost
-            // from the base's context when it finally fires) and tell the user it
-            // is queued — NOT the pipeline `run.queued` text (there is no gate
-            // here, this is a plain conversational turn).
-            self.record_user_turn(&text);
+            // Park it WITHOUT recording into conversation memory yet. Recording at
+            // submit time left a dangling "user said X" with no assistant reply in
+            // memory whenever the user then interrupted (Ctrl-C clears `queued_chat`
+            // but the premature record stayed) — a scrambled turn order the base
+            // would later see. The turn is recorded only when it actually FIRES
+            // (see `take_next_queued_chat`), so an interrupted queue leaves memory
+            // clean. Tell the user it is queued — NOT the pipeline `run.queued`
+            // text (there is no gate here, this is a plain conversational turn).
             self.queued_chat.push_back(text);
             self.push(ChatRole::System, umadev_i18n::t(self.lang, "chat.queued"));
             self.refresh_status();
@@ -2498,11 +2552,16 @@ impl App {
     }
 
     /// Pop the oldest chat turn parked by [`submit_text`] while a route was in
-    /// flight, if any. The event loop fires it as the NEXT route only after the
-    /// current route result has landed, keeping same-session routing strictly
-    /// serial (never two base subprocesses resuming one `session_id` at once).
+    /// flight, if any, and record it into conversation memory AT THIS MOMENT — the
+    /// instant it actually fires — so the base sees user turns in true send order
+    /// with no dangling "user said X" left behind by an interrupted queue. The
+    /// event loop fires it as the NEXT route only after the current route result
+    /// has landed, keeping same-session routing strictly serial (never two base
+    /// subprocesses resuming one `session_id` at once).
     pub(crate) fn take_next_queued_chat(&mut self) -> Option<String> {
-        self.queued_chat.pop_front()
+        let text = self.queued_chat.pop_front()?;
+        self.record_user_turn(&text);
+        Some(text)
     }
 
     /// Number of turns currently waiting to be sent — the chat-routing queue
@@ -4016,9 +4075,7 @@ impl App {
             KeyCode::PageDown | KeyCode::Char(' ') => ov.scroll_down(10),
             KeyCode::PageUp => ov.scroll_up(10),
             KeyCode::Home | KeyCode::Char('g') => ov.scroll = 0,
-            KeyCode::End | KeyCode::Char('G') => {
-                ov.scroll = ov.lines.len().saturating_sub(1);
-            }
+            KeyCode::End | KeyCode::Char('G') => ov.scroll_to_end(),
             _ => {}
         }
         Action::None
@@ -7803,6 +7860,9 @@ mod tests {
             let _ = a.apply_key(KeyCode::Char(c));
         }
         let _ = a.apply_key(KeyCode::Enter);
+        // A real frame publishes `max_scroll` (the top-most reachable VISUAL row)
+        // before any key is handled; simulate that so scroll_down has room to move.
+        a.overlay.as_ref().unwrap().max_scroll.set(100);
         let initial = a.overlay.as_ref().unwrap().scroll;
         // Down + PageDown advance.
         let _ = a.apply_key(KeyCode::Down);
@@ -7815,6 +7875,9 @@ mod tests {
         // Home resets to 0.
         let _ = a.apply_key(KeyCode::Home);
         assert_eq!(a.overlay.as_ref().unwrap().scroll, 0);
+        // End jumps to the published last reachable row (not a logical-line guess).
+        let _ = a.apply_key(KeyCode::End);
+        assert_eq!(a.overlay.as_ref().unwrap().scroll, 100);
     }
 
     #[test]
@@ -8733,10 +8796,14 @@ mod tests {
             a.history.iter().any(|m| m.body == "second"),
             "the queued user message is still echoed to the transcript"
         );
-        // Recorded in conversation memory (user turn appended).
-        assert!(
-            a.conversation.len() > convo_before,
-            "the queued turn is recorded in conversation memory, not lost"
+        // NOT YET recorded in conversation memory: a queued turn is recorded only
+        // when it actually FIRES (in `take_next_queued_chat`), not when parked — so
+        // an interrupt that clears the queue can't leave a dangling "user said X"
+        // with no assistant reply in the base's context.
+        assert_eq!(
+            a.conversation.len(),
+            convo_before,
+            "a parked turn is recorded at drain time, not when queued"
         );
         // A chat.queued note was pushed (history grew by the You echo + the note).
         assert!(a.history.len() >= hist_before + 2);

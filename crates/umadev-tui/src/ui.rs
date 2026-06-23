@@ -219,15 +219,44 @@ fn render_scroll_overlay(frame: &mut Frame, ov: &crate::app::Overlay) {
     let area = centered_rect(frame.area(), 88, 88);
     frame.render_widget(Clear, area);
 
-    let inner_height = area.height.saturating_sub(3) as usize;
-    let total = ov.lines.len();
-    let from = ov.scroll;
-    let to = (from + inner_height).min(total);
-    let visible: Vec<Line<'static>> = ov
+    let inner_height = area.height.saturating_sub(2) as usize; // minus top+bottom border
+                                                               // Inner text width: total minus the two side borders (1 each) and a 1-col
+                                                               // breathing pad on each side — must match what we hand the wrapper so the
+                                                               // pre-fold row count equals exactly what paints (no `Paragraph::wrap` second
+                                                               // guess that desyncs scroll from the painted rows, the long-line bug).
+    let inner_width = area.width.saturating_sub(4).max(1);
+
+    // Pre-fold every logical line to the inner width into the exact VISUAL rows it
+    // occupies, then render WITHOUT `Paragraph::wrap`. This mirrors the transcript
+    // path: the folded row count IS the scroll universe, so End / scroll_down can
+    // reach a wrapped row hidden past the last logical line, and the progress %
+    // counts real rows instead of lying about logical lines. An empty logical line
+    // still occupies one visual row (keeps blank-line spacing intact).
+    let folded: Vec<String> = ov
         .lines
         .iter()
+        .flat_map(|l| {
+            if l.is_empty() {
+                vec![String::new()]
+            } else {
+                wrap_input_rows(l, inner_width)
+            }
+        })
+        .collect();
+    let total = folded.len();
+
+    // Publish the top-most reachable visual row so the key handlers clamp `scroll`
+    // against width-aware reality (End lands on the true last row, not a logical
+    // guess). Clamp the live `scroll` here too so a stale value (overlay opened
+    // wide, terminal then shrank) can't index past the end.
+    let max_scroll = total.saturating_sub(inner_height.max(1));
+    ov.max_scroll.set(max_scroll);
+    let from = ov.scroll.min(max_scroll);
+    let to = (from + inner_height).min(total);
+    let visible: Vec<Line<'static>> = folded
+        .iter()
         .skip(from)
-        .take(to - from)
+        .take(to.saturating_sub(from))
         .map(|l| Line::from(l.clone()))
         .collect();
 
@@ -238,7 +267,7 @@ fn render_scroll_overlay(frame: &mut Frame, ov: &crate::app::Overlay) {
         let pct = if total <= inner_height {
             100
         } else {
-            ((from + inner_height).min(total) * 100) / total
+            (to * 100) / total
         };
         umadev_i18n::tf(
             lang,
@@ -253,14 +282,14 @@ fn render_scroll_overlay(frame: &mut Frame, ov: &crate::app::Overlay) {
     };
     let title_full = format!("{}{progress}", ov.title);
 
-    let body = Paragraph::new(visible)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title_full)
-                .border_style(Style::default().fg(theme::BORDER_ACTIVE())),
-        )
-        .wrap(Wrap { trim: false });
+    // No `.wrap()` — the body is already folded to the inner width, so the painted
+    // rows and the scroll offset agree exactly.
+    let body = Paragraph::new(visible).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title_full)
+            .border_style(Style::default().fg(theme::BORDER_ACTIVE())),
+    );
     frame.render_widget(body, area);
 }
 
@@ -424,7 +453,17 @@ fn markdown_to_lines(text: &str, base_color: Color) -> Vec<Line<'static>> {
 // ---------- Picker (first launch) -----------------------------------------
 
 fn render_picker(frame: &mut Frame, app: &App) {
+    // Tiny-terminal guard (mirror of the chat screen's): below this the fixed
+    // logo / card / footer stack would overflow and shove the navigation hint —
+    // or the selected row — off-screen, so a user couldn't see what they're
+    // picking. Show the "make the window bigger" card and bail BEFORE laying out.
+    const MIN_PICKER_WIDTH: u16 = 40;
+    const MIN_PICKER_HEIGHT: u16 = 12;
     let total = frame.area();
+    if total.height < MIN_PICKER_HEIGHT || total.width < MIN_PICKER_WIDTH {
+        render_too_small(frame, total);
+        return;
+    }
 
     // ── Layout: vertically centered, opencode-home-style flex column ──
     // Growing spacers above and below push the content block to the optical
@@ -451,7 +490,14 @@ fn render_picker(frame: &mut Frame, app: &App) {
     let list_height =
         u16::try_from(1 + per_item * (win_end - win_start) + usize::from(windowed) * 2)
             .unwrap_or(8);
-    let card_height = list_height + 2; // +title +border
+    // Clamp the card so the fixed chrome (logo 4 + tagline 1 + 2 gaps + footer 2 =
+    // 9 rows) plus at least 1 spacer top & bottom always fit. Without this clamp a
+    // short terminal that cleared the guard by a hair would still let a tall card
+    // push the footer past the bottom edge. The card's inner List does its own
+    // windowing, so a clamped card just shows fewer rows + the `N more` hints.
+    let chrome_rows: u16 = 4 + 1 + 1 + 1 + 2 + 2; // logo+tagline+2 gaps+footer+2 min spacers
+    let max_card = total.height.saturating_sub(chrome_rows).max(3);
+    let card_height = (list_height + 2).min(max_card); // +title +border
     let center = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -856,7 +902,15 @@ fn assistant_bullet() -> String {
 }
 
 fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
-    const MAX_RENDER_LINES: usize = 500;
+    // Cap the retained scrollback so a marathon session can't grow the per-frame
+    // fold unbounded. Counted in **visual rows AFTER folding** (not logical lines
+    // before it) so `hidden_above` — and therefore `transcript_max_scroll` — always
+    // reflects the real, reachable history: PageUp / Home can scroll to the very
+    // top of what's kept. Raised far above the old 500-LOGICAL-line cap (which
+    // truncated long/CJK transcripts *before* the wrap, so the published
+    // `max_scroll` lied and the oldest content was unreachable). 8000 rows is
+    // hundreds of screens — generous for any human session, still bounded.
+    const MAX_RENDER_ROWS: usize = 8000;
     let inner_height = area.height as usize;
 
     // Each logical line carries a `hang` (its left-gutter width). When the line
@@ -963,10 +1017,6 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
             2,
         ));
     }
-    if rendered.len() > MAX_RENDER_LINES {
-        rendered = rendered.split_off(rendered.len() - MAX_RENDER_LINES);
-    }
-
     // Pre-fold every logical line to the CURRENT width into the exact visual
     // rows it occupies, then render WITHOUT `Paragraph::wrap`. This is the
     // de-scramble fix: previously we *estimated* the wrapped height with
@@ -978,10 +1028,18 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // Continuation rows are indented by each line's `hang` so wrapped paragraphs
     // stay aligned under their bullet/prefix.
     let w = usize::from(area.width).max(1);
-    let folded: Vec<Line<'static>> = rendered
+    let mut folded: Vec<Line<'static>> = rendered
         .into_iter()
         .flat_map(|(line, hang)| prefold_line(&line, w, hang))
         .collect();
+    // Bound the retained scrollback by VISUAL rows (post-fold), keeping the most
+    // recent `MAX_RENDER_ROWS`. Doing it here — not on logical lines up top —
+    // means `total` (and the `hidden_above` derived from it) equals exactly what
+    // is paintable + reachable, so Home/PageUp can always reach the top of the
+    // kept history instead of clamping short of truncated-but-uncounted rows.
+    if folded.len() > MAX_RENDER_ROWS {
+        folded = folded.split_off(folded.len() - MAX_RENDER_ROWS);
+    }
     let total = folded.len();
     let para = Paragraph::new(folded);
     let hidden_above = total.saturating_sub(inner_height);
@@ -1694,9 +1752,30 @@ fn render_status_row(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         umadev_i18n::t(app.lang, "status.ready").to_string()
     };
+    // Clamp the dir name to a display-width budget so a long workspace name can
+    // never push the `· backend · /help` chrome (or the right-aligned phase) off
+    // the row. The fixed chrome around the dir is `" " + " · " + " {backend} " +
+    // " · " + " /help "` = 1 + (1+2) + disp(backend)+2 + (1+2) + 7. We reserve at
+    // least 12 cols for the phase on the right, then give the dir whatever's left
+    // (floor 6 so it stays legible). Truncated names get a `…` so the cut is
+    // visible rather than silently swallowing characters.
+    let fixed_chrome = 1 + 1 + disp_width(backend_label) + 2 + 1 + 7;
+    let dir_budget = usize::from(area.width)
+        .saturating_sub(fixed_chrome)
+        .saturating_sub(12)
+        .max(6);
+    let dir_shown = if disp_width(dir_name) > dir_budget {
+        // Keep room for the ellipsis inside the budget.
+        format!(
+            "{}…",
+            truncate_to_width(dir_name, dir_budget.saturating_sub(1))
+        )
+    } else {
+        dir_name.to_string()
+    };
     let left = Line::from(vec![
         Span::styled(
-            format!(" {dir_name} "),
+            format!(" {dir_shown} "),
             Style::default().fg(theme::TEXT_MUTED()),
         ),
         Span::styled("·", Style::default().fg(theme::BORDER())),
@@ -1713,7 +1792,8 @@ fn render_status_row(frame: &mut Frame, area: Rect, app: &App) {
     // pad to 0 (status text glued to the left) under a Chinese locale. The left
     // chrome is `" {dir} " · " {backend} " · " /help "`: each padded label adds
     // its display width + 2 spaces, plus 1+1 for the two `·` and 7 for ` /help `.
-    let left_width = disp_width(dir_name) + 2 + 1 + disp_width(backend_label) + 2 + 1 + 7;
+    // Uses the (possibly clamped) `dir_shown`, so the pad math matches what's drawn.
+    let left_width = disp_width(&dir_shown) + 2 + 1 + disp_width(backend_label) + 2 + 1 + 7;
     // On a narrow terminal the phase string itself can be wider than the space
     // left after the chrome — clip it (by display width) so it never wraps or
     // overruns the row. Keep a trailing column for the ` ` we append below.
