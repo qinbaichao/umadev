@@ -1593,6 +1593,20 @@ async fn review_one(
     verdict
 }
 
+/// What one [`drive_rework_turn_capturing`] turn observed — its completion flag plus
+/// the accumulated assistant text and the failed-tool summaries (the pitfall feed).
+/// The plain [`drive_rework_turn`] discards everything but `done`; the director's
+/// step scheduler reads `text` (for the "claimed a build" gate) and `pitfalls` (to
+/// distil into the lessons KB on the DEFAULT loop — Wave 2 deliverable 4).
+pub(crate) struct ReworkTurn {
+    /// The turn finished (Completed / Truncated). `false` = failed / dead / hung.
+    pub done: bool,
+    /// The accumulated assistant text for this turn.
+    pub text: String,
+    /// Summaries of every FAILED tool result this turn produced (the pitfall feed).
+    pub pitfalls: Vec<String>,
+}
+
 /// Inject the rework directive into the MAIN session and pump its turn through
 /// the SAME governance + audit + approval path a normal phase turn uses. Returns
 /// `true` when the turn finished (clean or truncated-but-accepted), `false` on a
@@ -1603,9 +1617,21 @@ pub(crate) async fn drive_rework_turn(
     events: &Arc<dyn EventSink>,
     directive: String,
 ) -> bool {
-    // Read the idle window ONCE at the boundary (not per-wait), so a mid-turn env
-    // flip can't race; the deterministic core takes it as a param (the test drives
-    // it with a tiny window, no process-env mutation to race).
+    drive_rework_turn_capturing(session, options, events, directive)
+        .await
+        .done
+}
+
+/// [`drive_rework_turn`], but returning the full [`ReworkTurn`] (text + pitfalls).
+/// Reads the idle window ONCE at the boundary (not per-wait), so a mid-turn env flip
+/// can't race; the deterministic core takes it as a param (the test drives it with a
+/// tiny window, no process-env mutation to race).
+pub(crate) async fn drive_rework_turn_capturing(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    directive: String,
+) -> ReworkTurn {
     drive_rework_turn_with_idle(
         session,
         options,
@@ -1624,11 +1650,21 @@ async fn drive_rework_turn_with_idle(
     events: &Arc<dyn EventSink>,
     directive: String,
     idle: std::time::Duration,
-) -> bool {
+) -> ReworkTurn {
+    // Estimate this turn's token cost up front (the session stream carries no usage
+    // on TurnDone) so the summon-driven step path records usage on the DEFAULT loop,
+    // for every base — recorded once at TurnDone. Mirrors `drive_one_turn`.
+    let mut est_tokens: u64 = crate::director_loop::approx_tokens(&directive);
     if session.send_turn(directive).await.is_err() {
-        return false;
+        return ReworkTurn {
+            done: false,
+            text: String::new(),
+            pitfalls: Vec::new(),
+        };
     }
     let policy = umadev_governance::Policy::load(&options.project_root);
+    let mut text = String::new();
+    let mut pitfalls: Vec<String> = Vec::new();
     // Idle watchdog (P1-11): this rework pump (reused by `governance_catchup` /
     // `review_and_rework` / the director's `summon`) was a naked
     // `next_event().await` — a base that hangs mid-rework would freeze every
@@ -1642,12 +1678,20 @@ async fn drive_rework_turn_with_idle(
             // A rework turn is advisory, so a settle here simply leaves the
             // findings for the next gate rather than wedging the run.
             crate::director_loop::IdleEvent::SessionEnded
-            | crate::director_loop::IdleEvent::IdleTimedOut => return false,
+            | crate::director_loop::IdleEvent::IdleTimedOut => {
+                return ReworkTurn {
+                    done: false,
+                    text,
+                    pitfalls,
+                };
+            }
         };
         match ev {
-            SessionEvent::TextDelta(text) => {
+            SessionEvent::TextDelta(delta) => {
+                est_tokens = est_tokens.saturating_add(crate::director_loop::approx_tokens(&delta));
+                text.push_str(&delta);
                 events.emit(EngineEvent::WorkerStream {
-                    event: StreamEvent::Text { delta: text },
+                    event: StreamEvent::Text { delta },
                 });
             }
             SessionEvent::ToolCall { name, input } => {
@@ -1656,6 +1700,12 @@ async fn drive_rework_turn_with_idle(
                 govern_tool_call(options, events, &policy, Phase::Quality, &name, &input);
             }
             SessionEvent::ToolResult { ok, summary } => {
+                if !ok {
+                    // A failed tool call is a development pitfall — feed it to the
+                    // lessons KB (the caller distils it). Mirrors `runner.rs`'s
+                    // `ok: false` capture, now on the DEFAULT loop too.
+                    pitfalls.push(summary.clone());
+                }
                 events.emit(EngineEvent::WorkerStream {
                     event: StreamEvent::ToolResult { ok, summary },
                 });
@@ -1667,13 +1717,23 @@ async fn drive_rework_turn_with_idle(
             } => {
                 let decision = approval_decision(options.mode, &action, &target);
                 if session.respond(&req_id, decision).await.is_err() {
-                    return false;
+                    return ReworkTurn {
+                        done: false,
+                        text,
+                        pitfalls,
+                    };
                 }
             }
             SessionEvent::TurnDone { status } => {
+                // Record this turn's estimated usage on the DEFAULT loop (fail-open).
+                crate::director_loop::record_estimated_usage(&options.backend, est_tokens);
                 // Completed / Truncated → accept and re-review; Interrupted /
                 // Failed → stop reworking (fail-open, advisory).
-                return matches!(status, TurnStatus::Completed | TurnStatus::Truncated);
+                return ReworkTurn {
+                    done: matches!(status, TurnStatus::Completed | TurnStatus::Truncated),
+                    text,
+                    pitfalls,
+                };
             }
         }
     }
@@ -3552,7 +3612,8 @@ mod tests {
             "fix these".to_string(),
             std::time::Duration::from_millis(80),
         )
-        .await;
+        .await
+        .done;
 
         assert!(
             !ok,

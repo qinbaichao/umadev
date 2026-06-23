@@ -118,6 +118,13 @@ pub struct SummonResult {
     /// For a Parallel summon: the seat's structured verdict over the artifacts
     /// (None for a Serial doer, which mutates files rather than judging).
     pub verdict: Option<RoleVerdict>,
+    /// For a Serial summon: the doer's accumulated assistant text (empty for a
+    /// Parallel reviewer). The director reads it for the "claimed a build" gate.
+    pub text: String,
+    /// For a Serial summon: the failed-tool summaries this doer turn produced —
+    /// the pitfall feed the director distils into the lessons KB on the default
+    /// loop (Wave 2). Empty for a Parallel reviewer (it writes nothing).
+    pub pitfalls: Vec<String>,
 }
 
 /// What a [`review`] produced — the deduped, seat-tagged union of every reviewing
@@ -234,13 +241,20 @@ pub async fn summon(
         SummonMode::Serial => {
             // Build the role directive: persona/identity + the team's relevant
             // knowledge + the concrete instruction. Then drive it on the MAIN
-            // session through the governed rework-turn pump (single-writer).
+            // session through the governed rework-turn pump (single-writer). The
+            // capturing variant threads the doer's text + failed-tool pitfalls back
+            // so the director can run the "claimed a build" gate and feed the
+            // lessons KB on the default loop — every tool call is still governed +
+            // audited inside the pump (UD-EVID-002), exactly as a phase turn.
             let directive = summon_directive(options, role, instruction);
-            let done = continuous::drive_rework_turn(session, options, events, directive).await;
+            let turn =
+                continuous::drive_rework_turn_capturing(session, options, events, directive).await;
             SummonResult {
                 role: role.to_string(),
-                done,
+                done: turn.done,
                 verdict: None,
+                text: turn.text,
+                pitfalls: turn.pitfalls,
             }
         }
         SummonMode::Parallel => {
@@ -257,6 +271,8 @@ pub async fn summon(
                 role: role.to_string(),
                 done,
                 verdict: Some(verdict),
+                text: String::new(),
+                pitfalls: Vec::new(),
             }
         }
     }
@@ -379,6 +395,36 @@ pub async fn review(
     kind: ReviewKind,
 ) -> ReviewResult {
     let team = continuous::team_for(kind, &options.requirement);
+    review_with_team(session, options, events, kind, team).await
+}
+
+/// **Convene a cross-review team sized from the ROUTE** — the team-by-route entry
+/// (Wave 2 deliverable 3). Instead of re-deriving the team from the requirement
+/// text, this seats the QUALITY-stage critics the router already chose for this turn
+/// (`RoutePlan.team`), so team sizing is uniform on EVERY path, not just `/run`. An
+/// empty route team (a lean/fast route) → no cross-review here (the floor stands).
+///
+/// Fail-open identically to [`review`]: a base that can't fork / an offline brain /
+/// a parse failure yields accepting empty verdicts → no blocking → proceed.
+pub async fn review_with_seats(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    seats: &[crate::critics::Seat],
+) -> ReviewResult {
+    let team = crate::critics::quality_team_for_seats(seats);
+    review_with_team(session, options, events, ReviewKind::Quality, team).await
+}
+
+/// Shared body for [`review`] / [`review_with_seats`]: run ONE cross-review pass
+/// over the given (already-sized) team and return its seat-tagged blocking union.
+async fn review_with_team(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    kind: ReviewKind,
+    team: Vec<Box<dyn crate::critics::RoleCritic>>,
+) -> ReviewResult {
     let seats = team.len();
     if team.is_empty() {
         // Lean / no-UI / docs-only path: no cross-review here; the floor stands.
@@ -789,6 +835,53 @@ mod tests {
             r.blocking.iter().any(|b| b.contains("登录失败路径无测试")),
             "the finding is carried (seat-tagged)"
         );
+    }
+
+    #[tokio::test]
+    async fn review_with_seats_sizes_the_team_from_the_route() {
+        // Wave 2 deliverable 3: the cross-review team is built from the ROUTE's seats
+        // (here a frontend + QA pair), not a re-derived requirement classification.
+        // Both seats raise the scripted blocking finding → it comes back seat-tagged.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let reply = r#"{"accepts": false, "blocking": ["按钮缺 loading 态"]}"#;
+        let mut sess = FakeSession::new(TurnStatus::Completed, true, reply);
+        let o = opts(tmp.path());
+        let ev = sink();
+        let r = director_review_with_seats(
+            &mut sess,
+            &o,
+            &ev,
+            &[
+                crate::critics::Seat::FrontendEngineer,
+                crate::critics::Seat::QaEngineer,
+            ],
+        )
+        .await;
+        assert_eq!(r.seats, 2, "exactly the two route seats reviewed");
+        assert!(r.has_blocking());
+        assert!(r.blocking.iter().any(|b| b.contains("按钮缺 loading 态")));
+    }
+
+    #[tokio::test]
+    async fn review_with_seats_empty_team_is_no_review() {
+        // An empty route team (a lean/fast route) → no cross-review, no blocking.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut sess = FakeSession::new(TurnStatus::Completed, true, "{}");
+        let o = opts(tmp.path());
+        let ev = sink();
+        let r = director_review_with_seats(&mut sess, &o, &ev, &[]).await;
+        assert_eq!(r.seats, 0);
+        assert!(!r.has_blocking());
+    }
+
+    /// Local alias so the test reads naturally (the public fn lives at module root).
+    async fn director_review_with_seats(
+        session: &mut dyn BaseSession,
+        options: &RunOptions,
+        events: &Arc<dyn EventSink>,
+        seats: &[crate::critics::Seat],
+    ) -> ReviewResult {
+        super::review_with_seats(session, options, events, seats).await
     }
 
     #[tokio::test]

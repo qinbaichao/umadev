@@ -768,6 +768,53 @@ pub fn quality_team_for_kind(kind: crate::planner::TaskKind) -> Vec<Box<dyn Role
     }
 }
 
+/// Resolve the single [`RoleCritic`] for a [`Seat`] (a seat maps 1:1 to its
+/// reviewing critic). Used to build a review team from a [`crate::router::RoutePlan`]'s
+/// `team` (Wave 2 deliverable 3 — team sizing comes from the ROUTE on every path,
+/// not just the `/run` planner). Every seat has a critic, so this is total.
+#[must_use]
+pub fn critic_for_seat(seat: Seat) -> Box<dyn RoleCritic> {
+    match seat {
+        Seat::ProductManager => Box::new(PmCritic),
+        Seat::Architect => Box::new(ArchitectureCritic),
+        Seat::UiuxDesigner => Box::new(UiuxCritic),
+        Seat::FrontendEngineer => Box::new(FrontendCritic),
+        Seat::BackendEngineer => Box::new(BackendCritic),
+        Seat::QaEngineer => Box::new(QaCritic),
+        Seat::SecurityEngineer => Box::new(SecurityCritic),
+        Seat::DevopsEngineer => Box::new(DevOpsCritic),
+    }
+}
+
+/// Build the QUALITY-stage cross-review team from a route's seats — the seats the
+/// router already sized for THIS turn (`RoutePlan.team`). Only the seats relevant to
+/// a delivered-code quality review are seated (QA / security / backend / DevOps /
+/// frontend), so a route that convened, say, a PM + architect for planning does not
+/// drag a doc-stage seat into a code review. An empty result means "no quality team
+/// for this route" (a lean/fast route convened none) — the deterministic floor then
+/// stands alone. This lifts team sizing onto EVERY path (deliverable 3), keeping the
+/// task-tiered defaults ([`quality_team_for_kind`]) as the floor.
+#[must_use]
+pub fn quality_team_for_seats(seats: &[Seat]) -> Vec<Box<dyn RoleCritic>> {
+    let mut out: Vec<Box<dyn RoleCritic>> = Vec::new();
+    for &seat in seats {
+        // Quality-stage seats only — the seats whose review reads DELIVERED code.
+        // (PM / architect / UIUX are doc-stage reviewers; they don't re-review code
+        // at the quality node, mirroring `quality_team_for_kind`'s roster.)
+        if matches!(
+            seat,
+            Seat::QaEngineer
+                | Seat::SecurityEngineer
+                | Seat::BackendEngineer
+                | Seat::DevopsEngineer
+                | Seat::FrontendEngineer
+        ) {
+            out.push(critic_for_seat(seat));
+        }
+    }
+    out
+}
+
 /// Append one critic verdict to `.umadev/team-ledger.jsonl` — the team's audit
 /// trail, mirroring the existing audit / phase-timing / runs JSONL streams.
 /// Records role / accepts / blocking-count / round so a run's cross-review
@@ -929,6 +976,57 @@ mod tests {
         assert_eq!(v.role, "product-manager");
         assert!(!v.accepts);
         assert_eq!(v.blocking, vec!["缺验收标准".to_string()]);
+    }
+
+    #[test]
+    fn quality_team_for_seats_sizes_from_the_route() {
+        // Wave 2 deliverable 3: the quality review team is built from the ROUTE's
+        // seats, not a re-derived requirement kind. Only code-stage seats are seated.
+        // A route that convened a full build team → QA + security + backend + frontend
+        // + DevOps review the delivered code; the doc-stage seats (PM / architect /
+        // designer) are NOT re-seated at the quality node.
+        let full = quality_team_for_seats(&[
+            Seat::ProductManager,
+            Seat::Architect,
+            Seat::UiuxDesigner,
+            Seat::FrontendEngineer,
+            Seat::BackendEngineer,
+            Seat::QaEngineer,
+            Seat::SecurityEngineer,
+            Seat::DevopsEngineer,
+        ]);
+        let roles: Vec<&str> = full.iter().map(|c| c.role()).collect();
+        assert!(roles.contains(&"qa-engineer"));
+        assert!(roles.contains(&"security-engineer"));
+        assert!(roles.contains(&"backend-engineer"));
+        assert!(roles.contains(&"frontend-engineer"));
+        assert!(roles.contains(&"devops-engineer"));
+        // Doc-stage seats are not re-seated for a code review.
+        assert!(!roles.contains(&"product-manager"));
+        assert!(!roles.contains(&"architect"));
+        assert!(!roles.contains(&"uiux-designer"));
+        // An empty route team (a lean/fast route) → no quality team (floor stands).
+        assert!(quality_team_for_seats(&[]).is_empty());
+        // A frontend-only route → just the frontend + QA code reviewers it convened.
+        let fe = quality_team_for_seats(&[Seat::FrontendEngineer, Seat::QaEngineer]);
+        assert_eq!(fe.len(), 2);
+    }
+
+    #[test]
+    fn critic_for_seat_is_total_and_id_matches() {
+        // Every seat resolves to a critic whose role id matches the seat's role id.
+        for seat in [
+            Seat::ProductManager,
+            Seat::Architect,
+            Seat::UiuxDesigner,
+            Seat::FrontendEngineer,
+            Seat::BackendEngineer,
+            Seat::QaEngineer,
+            Seat::SecurityEngineer,
+            Seat::DevopsEngineer,
+        ] {
+            assert_eq!(critic_for_seat(seat).role(), seat.role_id());
+        }
     }
 
     #[test]

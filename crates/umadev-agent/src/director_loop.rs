@@ -295,6 +295,7 @@ pub async fn drive_director_loop_routed(
         events,
         first_directive,
         plan,
+        route,
         idle_timeout(),
     )
     .await
@@ -328,14 +329,47 @@ async fn synthesize_and_post_plan(
 /// [`drive_director_loop`] with an explicit idle window — the env read is hoisted
 /// to the public wrapper so this core is deterministic (the test drives it with a
 /// tiny window, no process-env mutation / race).
+///
+/// **Wave 2 — depth-tiered scheduling (the "drive the plan" change):**
+///
+/// - **Deliberate build (`Standard` / `Deep`) WITH an owned plan** → drive the plan
+///   STEP-BY-STEP via [`director::summon`] ([`drive_plan_steps`]): each ready Build
+///   step gets a focused directive on the MAIN session (single-writer), is verified
+///   against its own `acceptance` on the deterministic floor, and only then ticks
+///   `Done`; Review steps fork the cross-review team. This is the real "schedule a
+///   team" path. Fail-open: if step-driving can't even start its first step, it
+///   degrades to the single-turn loop below (so a wedged base never loses the build).
+/// - **Lean / Fast build, or no plan** → the EXISTING single-turn loop (one
+///   end-to-end base turn + bounded auto-QC). Unchanged — a simple page stays ONE
+///   fast turn; we never pay the per-step round-trips for a lean goal (Wave 1 speed
+///   invariant).
 async fn drive_director_loop_with_idle(
     session: &mut dyn BaseSession,
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
     first_directive: String,
     mut plan: Option<Plan>,
+    route: Option<&RoutePlan>,
     idle: Duration,
 ) -> DirectorLoopOutcome {
+    // Wave 2: a DELIBERATE build with an owned plan is driven step-by-step (summon
+    // per step + per-step acceptance + real checklist ticking). A lean/Fast build —
+    // or any path with no plan — keeps the single-turn fast loop below, untouched.
+    // Fail-open: `drive_plan_steps` returns `None` if it couldn't drive even the
+    // first step (the caller then runs the single-turn loop, never losing the build).
+    if let (Some(r), Some(p)) = (route, plan.as_mut()) {
+        if r.depth.is_deliberate() {
+            if let Some(outcome) = drive_plan_steps(session, options, events, r, p, idle).await {
+                return outcome;
+            }
+            // Step-driving could not start — fall through to the single-turn loop.
+            events.emit(EngineEvent::Note(
+                "team · step scheduling unavailable — falling back to a single end-to-end turn"
+                    .to_string(),
+            ));
+        }
+    }
+
     let mut next_directive = first_directive;
     let mut last_reply = String::new();
 
@@ -374,8 +408,10 @@ async fn drive_director_loop_with_idle(
 
         // 3. UmaDev runs its OWN objective QC pass — hard floor + verify + optional
         //    fork review. NOTHING here is the base summoning a team; it is UmaDev
-        //    inspecting reality over the borrowed brain.
-        let qc = run_auto_qc(session, options, events).await;
+        //    inspecting reality over the borrowed brain. When a route is in hand, the
+        //    review team is sized from the ROUTE's seats (deliverable 3 on the
+        //    single-turn path too); else the kind-derived team (the legacy entry).
+        let qc = run_auto_qc(session, options, events, route.map(|r| r.team.as_slice())).await;
 
         // 4. Clean QC → the build is genuinely done. Settle and report honestly.
         if qc.is_clean() {
@@ -408,6 +444,442 @@ async fn drive_director_loop_with_idle(
     // state for resume; reality is the caller's hard-gate.
     persist_plan(&plan, options);
     DirectorLoopOutcome::Done { reply: last_reply }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Wave 2 — DRIVE the plan step-by-step (the "schedule a team" path).
+//
+// For a DELIBERATE build with an owned plan, the director no longer fires ONE
+// mega-turn — it walks the DAG: each ready Build step is `summon`ed serially on
+// the main session (single-writer) with a FOCUSED directive, verified against
+// THAT step's `acceptance` on the deterministic floor, and only ticks `Done` when
+// the floor passes; a failing step folds its blocking findings into a bounded fix
+// loop (reusing MAX_QC_ROUNDS + a stall guard, mirroring `review_and_rework`).
+// Review steps fork the cross-review team. The lean/Fast path never reaches here.
+//
+// INVARIANTS (identical to the single-turn loop): single-writer (only `summon`'s
+// Serial main turn writes; reviews run on read-only forks), idle watchdog (each
+// summon's turn pump is `drive_rework_turn`, idle-guarded), hard floor (the SAME
+// content-governance scan + source-present floor run as the final QC gate), bounded
+// (a per-step fix budget + an overall step ceiling), fail-open (any summon / verify
+// that can't run degrades to "advance the step" — never a wedge, never a false
+// failure — and a first-step failure degrades the WHOLE path to the single turn).
+// ───────────────────────────────────────────────────────────────────────────
+
+/// The hard ceiling on per-step fix rounds while driving one plan step — the same
+/// small, decisive bound as [`MAX_QC_ROUNDS`], applied at the step level. A step
+/// that builds correctly the first time spends ZERO fix rounds; only a step that
+/// keeps failing its acceptance pays the (bounded) re-drive cost.
+const MAX_STEP_FIX_ROUNDS: usize = 2;
+
+/// A safety ceiling on total step transitions so a pathological plan (e.g. a brain
+/// that emitted a huge DAG, or a flapping readiness set) can never spin — generous
+/// (real plans are 3-8 steps) but finite. Mirrors the bounded-loop discipline.
+const MAX_STEP_TRANSITIONS: usize = 32;
+
+/// Drive a DELIBERATE plan step-by-step via [`director::summon`] + per-step
+/// acceptance. Returns `Some(outcome)` when the schedule ran (clean or settled at a
+/// bound), or `None` when it could not drive even its FIRST step — the signal for
+/// the caller to fail open to the single end-to-end turn (so a wedged base never
+/// loses the whole build to a scheduling failure).
+async fn drive_plan_steps(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    route: &RoutePlan,
+    plan: &mut Plan,
+    idle: Duration,
+) -> Option<DirectorLoopOutcome> {
+    let _ = idle; // each summon turn reads the idle window itself (drive_rework_turn)
+    events.emit(EngineEvent::Note(format!(
+        "team · scheduling {} step(s) over the team ({} build · {} review)",
+        plan.steps.len(),
+        plan.steps
+            .iter()
+            .filter(|s| s.kind == plan_state::StepKind::Build)
+            .count(),
+        plan.steps
+            .iter()
+            .filter(|s| s.kind == plan_state::StepKind::Review)
+            .count(),
+    )));
+
+    let mut last_reply = String::new();
+    let mut transitions = 0usize;
+
+    // Walk the DAG by readiness: drive each ready step, mark it, repeat. A step that
+    // can't be accepted (after its bounded fix budget) is marked Blocked so it stops
+    // gating its dependents — readiness then drains the remaining independent steps
+    // rather than deadlocking. The transition ceiling is the final hard stop.
+    while transitions < MAX_STEP_TRANSITIONS {
+        // Snapshot the next ready step's id (ready_steps borrows the plan immutably;
+        // we drop the borrow before mutating). Drive ONE step per outer iteration so
+        // dependents become ready only after their prerequisite actually accepted.
+        let Some(step_id) = plan.ready_steps().first().map(|s| s.id.clone()) else {
+            break; // nothing ready (all Done / Blocked, or a satisfied DAG) → finish
+        };
+        transitions += 1;
+
+        // Mark the step Active + surface it on the checklist BEFORE driving it.
+        let step = plan
+            .steps
+            .iter()
+            .find(|s| s.id == step_id)
+            .cloned()
+            .expect("ready id resolves");
+        plan.mark(&step_id, StepStatus::Active);
+        events.emit(EngineEvent::plan_step_status(
+            step_id.clone(),
+            step.title.clone(),
+            StepStatus::Active,
+        ));
+        persist_plan_ref(plan, options);
+
+        let (accepted, reply, drove) = match step.kind {
+            plan_state::StepKind::Build => {
+                drive_build_step(session, options, events, route, &step).await
+            }
+            plan_state::StepKind::Review => {
+                drive_review_step(session, options, events, route, &step).await
+            }
+        };
+        if !reply.is_empty() {
+            last_reply = reply;
+        }
+
+        // Fail-open bail: if the FIRST step is a Build that could not drive a single
+        // turn (a dead session on the very first doer turn), the base can't be
+        // scheduled — return None so the caller runs the single end-to-end turn
+        // rather than silently marking a plan "done" over an empty build. A first
+        // Review step that no-ops (an empty team) does NOT bail: there's simply
+        // nothing to review yet, and the next (Build) step still gets its chance.
+        if transitions == 1 && step.kind == plan_state::StepKind::Build && !drove {
+            return None;
+        }
+
+        let status = if accepted {
+            StepStatus::Done
+        } else {
+            // Bounded: a step that exhausted its fix budget is Blocked (honest), so
+            // it no longer gates dependents but the plan records the gap. The final
+            // QC gate + the caller's hard-gate still decide overall reality.
+            StepStatus::Blocked
+        };
+        plan.mark(&step_id, status);
+        events.emit(EngineEvent::plan_step_status(step_id, step.title, status));
+        persist_plan_ref(plan, options);
+    }
+
+    // Final whole-build QC gate — the SAME objective pass the single-turn loop runs
+    // as its last word (source-present hard floor + content governance + optional
+    // review), so a step-driven build is held to the identical floor. Advisory: it
+    // does not re-drive here (each step was already verified); it folds any residual
+    // finding into ONE last fix turn, bounded, then settles. This guarantees a
+    // step-driven build is never held to a WEAKER bar than the single-turn build.
+    let final_reply = run_final_gate(session, options, events, route).await;
+    if !final_reply.is_empty() {
+        last_reply = final_reply;
+    }
+
+    // Persist the plan's terminal state for resume.
+    persist_plan_ref(plan, options);
+    Some(DirectorLoopOutcome::Done { reply: last_reply })
+}
+
+/// Drive ONE Build step: `summon` the step's seat serially on the main session with
+/// a focused directive (recalled pitfalls injected), then verify against the step's
+/// `acceptance` on the deterministic floor. A failing acceptance folds its evidence
+/// into a bounded fix re-drive ([`MAX_STEP_FIX_ROUNDS`]). Returns
+/// `(accepted, last_reply, drove_at_least_one_turn)`.
+async fn drive_build_step(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    route: &RoutePlan,
+    step: &plan_state::PlanStep,
+) -> (bool, String, bool) {
+    let seat_id = step.seat.role_id();
+    // The step's focused instruction + (fail-open) recalled stack pitfalls so the
+    // doer pre-empts a known trap. relevant_lessons_for_prompt is empty on first
+    // runs / a miss, so the directive is unchanged then.
+    let pitfalls =
+        crate::lessons::relevant_lessons_for_prompt(&options.project_root, &options.requirement);
+    let mut instruction = format!("{} — {}", step.title, route_focus_line(route));
+    if !pitfalls.trim().is_empty() {
+        instruction.push_str("\n\n## Known pitfalls to avoid (from past runs)\n");
+        instruction.push_str(pitfalls.trim());
+    }
+
+    let mut drove = false;
+    let mut last_reply = String::new();
+    for round in 0..=MAX_STEP_FIX_ROUNDS {
+        // `instruction` carries the focused task on round 0 and is rewritten with
+        // the failing acceptance evidence on each re-drive (see the loop tail).
+        let summoned = director::summon(
+            session,
+            options,
+            events,
+            seat_id,
+            &instruction,
+            director::SummonMode::Serial,
+        )
+        .await;
+        if summoned.done {
+            drove = true;
+        }
+        if !summoned.text.trim().is_empty() {
+            last_reply = summoned.text.clone();
+        }
+        // Wave 2 deliverable 4: distil this turn's failed-tool pitfalls into the
+        // lessons KB on the DEFAULT loop (audit recording already happened inside
+        // summon's governed pump). Fail-open: capture never affects the schedule.
+        capture_turn_pitfalls(options, events, &summoned.pitfalls);
+        // Verify against THIS step's acceptance on the deterministic floor.
+        let verdict = verify_step_acceptance(session, options, events, route, step).await;
+        if verdict.accepted {
+            return (true, last_reply, drove);
+        }
+        // Out of fix budget → leave the step unaccepted (the caller marks it Blocked
+        // and the final gate still has the last word). Bounded — never an open grind.
+        if round >= MAX_STEP_FIX_ROUNDS {
+            break;
+        }
+        // Fold this step's failing acceptance into the NEXT re-drive's directive so
+        // the same seat fixes the cause with raw evidence, in the same session.
+        instruction = format!(
+            "{} — {}\n\n## This step did not pass its acceptance check yet — fix the cause\n{}\n\
+             Edit the real files, run any build/test you need, and make this step's \
+             acceptance ({}) actually pass.",
+            step.title,
+            route_focus_line(route),
+            verdict.evidence_line(),
+            acceptance_label(&step.acceptance),
+        );
+    }
+    (false, last_reply, drove)
+}
+
+/// Drive ONE Review step: fork the cross-review team (read-only) over the current
+/// blackboard. A review step is "accepted" when no seat raises a blocking finding;
+/// blocking findings fold into ONE bounded fix turn on the MAIN session (the doer
+/// repairs), then we re-read. Returns `(accepted, last_reply, drove)`.
+async fn drive_review_step(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    route: &RoutePlan,
+    step: &plan_state::PlanStep,
+) -> (bool, String, bool) {
+    let _ = step;
+    // Wave 2 deliverable 3: size the review team from the ROUTE's seats (the seats
+    // the router already chose for this turn), not from a re-derived requirement
+    // classification. An empty route team → no cross-review (the floor stands).
+    let review = director::review_with_seats(session, options, events, &route.team).await;
+    if !review.has_blocking() {
+        return (true, String::new(), review.seats > 0);
+    }
+    // The team found blocking issues — fold them into ONE bounded fix turn on the
+    // main session (the doer repairs), then accept (advisory: the deterministic
+    // floor in the final gate is the real stop, never a critic verdict — invariant).
+    let mut body = String::new();
+    for b in &review.blocking {
+        body.push_str("- ");
+        body.push_str(b);
+        body.push('\n');
+    }
+    let directive = format!(
+        "The review team flagged MUST-FIX issues in what was built so far. Fix EVERY one \
+         now by editing the files directly — do not narrate, just apply the fixes and \
+         re-run any build/test you already ran. Issues:\n{body}\nWhen all are fixed, end \
+         your turn."
+    );
+    let drove = crate::continuous::drive_rework_turn(session, options, events, directive).await;
+    // A review step is advisory: after one bounded repair we accept it (the final
+    // QC gate + hard-gate still own reality). This keeps the schedule moving while
+    // never letting an LLM verdict drive termination.
+    (true, String::new(), drove)
+}
+
+/// The outcome of verifying one step against its declared acceptance.
+struct StepVerdict {
+    /// Whether the step's deterministic acceptance check passed (or was a neutral
+    /// skip — an unavailable check is NOT a failure, fail-open).
+    accepted: bool,
+    /// Concrete evidence lines from the check (failed-step names / drift / count).
+    evidence: Vec<String>,
+}
+
+impl StepVerdict {
+    /// A one-line evidence string for the fix directive / the reply.
+    fn evidence_line(&self) -> String {
+        if self.evidence.is_empty() {
+            String::new()
+        } else {
+            self.evidence.join("; ")
+        }
+    }
+}
+
+/// Verify one step against its `acceptance` on the DETERMINISTIC floor — the SAME
+/// objective checkers the single-turn QC uses, selected by the step's
+/// [`plan_state::AcceptanceSpec`]. Never an opinion: a `ReviewClean` step forks the
+/// read-only review team; everything else reads disk / runs the real build. An
+/// unavailable check (no manifest / no contract) is a NEUTRAL skip (accepted), never
+/// a false failure (fail-open invariant). A `Build` step ALSO always honours the
+/// source-present honesty floor so a step that "claimed done" but wrote nothing is
+/// caught even when its declared acceptance is weaker.
+async fn verify_step_acceptance(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    route: &RoutePlan,
+    step: &plan_state::PlanStep,
+) -> StepVerdict {
+    use plan_state::AcceptanceSpec as A;
+    match &step.acceptance {
+        A::SourcePresent => acceptance_from_verify(
+            director::verify(options, events, VerifyKind::SourcePresent).await,
+        ),
+        A::BuildTest => {
+            // Honesty floor first: no source ⇒ fail regardless of a skipped build.
+            let src = director::verify(options, events, VerifyKind::SourcePresent).await;
+            if src.available && !src.passed {
+                return acceptance_from_verify(src);
+            }
+            acceptance_from_verify(director::verify(options, events, VerifyKind::BuildTest).await)
+        }
+        A::Contract => {
+            let src = director::verify(options, events, VerifyKind::SourcePresent).await;
+            if src.available && !src.passed {
+                return acceptance_from_verify(src);
+            }
+            acceptance_from_verify(director::verify(options, events, VerifyKind::Contract).await)
+        }
+        A::ReviewClean => {
+            // Route-team-aware (deliverable 3): the review seats come from the route.
+            let review = director::review_with_seats(session, options, events, &route.team).await;
+            StepVerdict {
+                // Advisory: a review-clean step is accepted unless a seat blocks —
+                // and even then the final deterministic gate, not this verdict, owns
+                // overall termination. No team convened ⇒ accept (nothing to review).
+                accepted: !review.has_blocking(),
+                evidence: review.blocking.clone(),
+            }
+        }
+        A::TurnSettled => {
+            // The weakest criterion: the work turn settled. Still honour the
+            // source-present honesty floor for a Build step so "claimed done, wrote
+            // nothing" never slips through.
+            if step.kind == plan_state::StepKind::Build {
+                return acceptance_from_verify(
+                    director::verify(options, events, VerifyKind::SourcePresent).await,
+                );
+            }
+            StepVerdict {
+                accepted: true,
+                evidence: Vec::new(),
+            }
+        }
+    }
+}
+
+/// Fold a [`VerifyResult`] into a [`StepVerdict`]: an unavailable (skipped) check is
+/// a NEUTRAL accept (fail-open — never a false failure); a passed check accepts; a
+/// real failure rejects, carrying the evidence for the fix directive.
+fn acceptance_from_verify(r: VerifyResult) -> StepVerdict {
+    StepVerdict {
+        accepted: !r.available || r.passed,
+        evidence: if r.available && !r.passed {
+            r.evidence
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+/// The final whole-build QC gate run once a step-driven plan has walked its DAG —
+/// the SAME [`run_auto_qc`] pass the single-turn loop ends on, folded into ONE
+/// bounded fix turn so a step-driven build is held to the identical objective floor.
+/// Returns the fix turn's reply (empty when QC was already clean). Bounded by
+/// [`MAX_QC_ROUNDS`]; fail-open throughout.
+async fn run_final_gate(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    route: &RoutePlan,
+) -> String {
+    let mut last_reply = String::new();
+    for round in 0..MAX_QC_ROUNDS {
+        // The final gate sizes its review team from the ROUTE (deliverable 3).
+        let qc = run_auto_qc(session, options, events, Some(&route.team)).await;
+        if qc.is_clean() {
+            return last_reply;
+        }
+        if round + 1 >= MAX_QC_ROUNDS {
+            events.emit(EngineEvent::Note(
+                "team · final QC reached its fix-round budget — settling (objective hard-gate decides reality)"
+                    .to_string(),
+            ));
+            return last_reply;
+        }
+        // Fold the residual findings into ONE fix turn on the main session.
+        match drive_one_turn(session, options, events, qc.fix_directive(), idle_timeout()).await {
+            Ok(t) => last_reply = t.text,
+            Err(_) => return last_reply, // a dead/hung session → settle (fail-open)
+        }
+    }
+    last_reply
+}
+
+/// Distil a turn's failed-tool summaries into the lessons KB on the DEFAULT loop —
+/// Wave 2 deliverable 4 (`/lessons` now learns from the director path, not just the
+/// legacy runner). Emits a `[learned]` note so the user sees the agent remembering.
+/// Fail-open: an empty feed is a no-op; capture never affects the schedule.
+fn capture_turn_pitfalls(options: &RunOptions, events: &Arc<dyn EventSink>, pitfalls: &[String]) {
+    if pitfalls.is_empty() {
+        return;
+    }
+    let n = crate::lessons::capture_dev_errors(
+        &options.project_root,
+        pitfalls,
+        &options.effective_slug(),
+        &options.requirement,
+    );
+    if n > 0 {
+        events.emit(EngineEvent::Note(format!(
+            "[learned] 识别并记录了 {n} 条开发踩坑,已写入知识库 — 下次遇到同类问题会提前规避。"
+        )));
+    }
+}
+
+/// A human label for a step's acceptance criterion, used in the fix directive so
+/// the doer knows exactly what mechanical bar this step must clear.
+fn acceptance_label(spec: &plan_state::AcceptanceSpec) -> &'static str {
+    use plan_state::AcceptanceSpec as A;
+    match spec {
+        A::SourcePresent => "real source files exist on disk",
+        A::BuildTest => "the project's build/test passes",
+        A::Contract => "the frontend↔backend API contract holds",
+        A::ReviewClean => "the review team raises no blocking issue",
+        A::TurnSettled => "the work turn completes",
+    }
+}
+
+/// A short focus line appended to each step directive so the doer knows the overall
+/// goal + the build's depth (proportional craft) without re-priming the whole
+/// requirement every step (the base already holds it in the continuous session).
+fn route_focus_line(route: &RoutePlan) -> String {
+    format!(
+        "this is one step of the overall build (depth: {}). Do THIS step's slice now \
+         with real files on disk; the rest of the plan is handled separately.",
+        route.depth.as_str()
+    )
+}
+
+/// Persist a `&Plan` (the step-driver holds `&mut Plan`, not `Option<Plan>`).
+/// Best-effort + fail-open: a write error is ignored, never blocks the schedule.
+fn persist_plan_ref(plan: &Plan, options: &RunOptions) {
+    let _ = plan_state::save(plan, &options.project_root);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -483,10 +955,15 @@ async fn drive_one_turn(
     directive: String,
     idle: Duration,
 ) -> Result<TurnResult, String> {
+    // Estimate the directive's token cost up front (the session stream carries no
+    // usage on `TurnDone`, unlike the single-shot path), so `/usage` is real on the
+    // default loop for ALL three bases — not just claude in the legacy runner.
+    let mut est_tokens: u64 = approx_tokens(&directive);
     if let Err(e) = session.send_turn(directive).await {
         return Err(format!("session send: {e}"));
     }
     let mut text = String::new();
+    let mut pitfalls: Vec<String> = Vec::new();
     loop {
         // Idle watchdog (P0-3 / P1-11): a base that HANGS (stops emitting stdout
         // but never exits) would leave `next_event()` blocked forever — no
@@ -512,6 +989,7 @@ async fn drive_one_turn(
         };
         match ev {
             SessionEvent::TextDelta(delta) => {
+                est_tokens = est_tokens.saturating_add(approx_tokens(&delta));
                 text.push_str(&delta);
                 events.emit(EngineEvent::WorkerStream {
                     event: StreamEvent::Text { delta },
@@ -519,14 +997,24 @@ async fn drive_one_turn(
             }
             SessionEvent::ToolCall { name, input } => {
                 // Surface what the base actually DID (the source of truth). The
-                // governance hook governs the write itself in real time; here we
-                // render the tool row for live progress.
+                // governance hook governs the write itself in real time (claude); the
+                // content-governance QC scan is the craft floor for ALL bases. Here we
+                // (a) render the tool row, and (b) record the call to the audit trail
+                // (UD-EVID-002) so the audit is honest on the DEFAULT loop for every
+                // base — not just claude in the legacy runner. Fail-open: a recording
+                // error is swallowed and never blocks the turn.
                 let detail = tool_call_target(&input);
+                record_tool_call_audit(options, &name, &detail);
                 events.emit(EngineEvent::WorkerStream {
                     event: StreamEvent::ToolUse { name, detail },
                 });
             }
             SessionEvent::ToolResult { ok, summary } => {
+                if !ok {
+                    // A failed tool call is a development pitfall — feed it to the
+                    // lessons KB at turn end (Wave 2 deliverable 4 on the default loop).
+                    pitfalls.push(summary.clone());
+                }
                 events.emit(EngineEvent::WorkerStream {
                     event: StreamEvent::ToolResult { ok, summary },
                 });
@@ -557,6 +1045,10 @@ async fn drive_one_turn(
                 // downstream is the real stop signal; forcing a fail here would
                 // hard-stop a build that may have produced usable output).
                 TurnStatus::Completed | TurnStatus::Truncated => {
+                    // Wave 2 deliverable 4: record usage + distil pitfalls on the
+                    // DEFAULT loop, for every base. Both fail-open.
+                    record_turn_usage(options, est_tokens);
+                    capture_turn_pitfalls(options, events, &pitfalls);
                     return Ok(TurnResult { text });
                 }
                 TurnStatus::Interrupted => return Err("director turn interrupted".to_string()),
@@ -564,6 +1056,54 @@ async fn drive_one_turn(
             },
         }
     }
+}
+
+/// A cheap, deterministic token estimate for a piece of text — `~chars/4`, the
+/// standard rough heuristic (the continuous-session stream surfaces no real usage on
+/// `TurnDone`, so this is the honest fallback that keeps `/usage` non-empty on the
+/// default loop). Never panics; an empty string is 0. `pub(crate)` so the shared
+/// rework pump (`continuous::drive_rework_turn_with_idle`) estimates identically.
+pub(crate) fn approx_tokens(s: &str) -> u64 {
+    (s.chars().count() as u64).div_ceil(4)
+}
+
+/// Record an estimated-token usage row for the default loop, attributed to the
+/// canonical "build" phase. `pub(crate)` so the shared rework pump records usage the
+/// same way the single-turn loop does. Fail-open: a zero estimate is a no-op.
+pub(crate) fn record_estimated_usage(backend: &str, est_tokens: u64) {
+    if est_tokens == 0 {
+        return;
+    }
+    crate::runner::record_usage(
+        backend,
+        umadev_spec::Phase::Frontend,
+        u32::try_from(est_tokens).unwrap_or(u32::MAX),
+    );
+}
+
+/// Record one director turn's estimated token usage to `~/.umadev/usage.jsonl` so
+/// `/usage` is real on the default loop for all three bases. Fail-open: a zero
+/// estimate / a write error is a no-op. Mirrors [`crate::runner::record_usage`].
+fn record_turn_usage(options: &RunOptions, est_tokens: u64) {
+    record_estimated_usage(&options.backend, est_tokens);
+}
+
+/// Record one base tool call to the audit trail (UD-EVID-002) on the default loop.
+/// Records the call + target with an `allow` verdict (the real-time governance is the
+/// claude hook + the QC content scan; this is the AUDIT record, present for every
+/// base so the trail isn't empty on a codex/opencode run). Fail-open: any error is
+/// swallowed. Mirrors `continuous::govern_tool_call`'s audit write.
+fn record_tool_call_audit(options: &RunOptions, name: &str, target: &str) {
+    let _ = umadev_governance::record_tool_call(
+        &options.project_root,
+        name,
+        target,
+        "allow",
+        "",
+        "",
+        &options.effective_slug(),
+        None,
+    );
 }
 
 /// Best-effort human-readable target of a base tool call (a file path / command)
@@ -645,6 +1185,7 @@ async fn run_auto_qc(
     session: &mut dyn BaseSession,
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
+    route_team: Option<&[crate::critics::Seat]>,
 ) -> QcReport {
     events.emit(EngineEvent::Note("team · honesty + QC read".to_string()));
     let mut blocking: Vec<String> = Vec::new();
@@ -731,14 +1272,22 @@ async fn run_auto_qc(
 
     // 3. Optional fork review (UmaDev's read-only QC over read-only forks). The team
     //    scales to the task, so a lean goal convenes no team and this contributes
-    //    nothing. Advisory — the base's body acts on whatever it surfaces.
-    let review = director::review(
-        session,
-        options,
-        events,
-        crate::continuous::ReviewKind::Quality,
-    )
-    .await;
+    //    nothing. Advisory — the base's body acts on whatever it surfaces. When a
+    //    route is in hand (the deliberate step path's final gate), size the team
+    //    from the ROUTE's seats (deliverable 3); otherwise (the single-turn loop)
+    //    fall back to the kind-derived team — same roster, sized from the same kind.
+    let review = match route_team {
+        Some(seats) => director::review_with_seats(session, options, events, seats).await,
+        None => {
+            director::review(
+                session,
+                options,
+                events,
+                crate::continuous::ReviewKind::Quality,
+            )
+            .await
+        }
+    };
     for finding in review_blocking(&review) {
         blocking.push(finding);
     }
@@ -1133,6 +1682,7 @@ mod tests {
             &events,
             "GO".to_string(),
             None,
+            None,
             Duration::from_millis(100),
         )
         .await;
@@ -1186,7 +1736,7 @@ mod tests {
         let (events, _rec) = sink();
         let mut sess = FakeSession::new(vec![], false, "");
         let o = opts(tmp.path());
-        let qc = run_auto_qc(&mut sess, &o, &events).await;
+        let qc = run_auto_qc(&mut sess, &o, &events, None).await;
         assert!(qc.is_clean(), "source present + nothing to fail → clean QC");
     }
 
@@ -1215,7 +1765,7 @@ mod tests {
         let (events, _rec) = sink();
         let mut sess = FakeSession::new(vec![], false, "");
         let o = codex_opts(tmp.path());
-        let qc = run_auto_qc(&mut sess, &o, &events).await;
+        let qc = run_auto_qc(&mut sess, &o, &events, None).await;
         assert!(
             !qc.is_clean(),
             "an emoji-as-icon write by codex must be governed: {:?}",
@@ -1246,7 +1796,7 @@ mod tests {
         let mut sess = FakeSession::new(vec![], false, "");
         let mut o = opts(tmp.path());
         o.backend = "claude-code".to_string();
-        let qc = run_auto_qc(&mut sess, &o, &events).await;
+        let qc = run_auto_qc(&mut sess, &o, &events, None).await;
         assert!(
             !qc.is_clean(),
             "an emoji-as-icon write must be governed by QC even on claude: {:?}",
@@ -1274,7 +1824,7 @@ mod tests {
         let mut sess = FakeSession::new(vec![], false, "");
         let mut o = codex_opts(tmp.path());
         o.requirement = "做一个简单的静态介绍页,纯前端".to_string();
-        let qc = run_auto_qc(&mut sess, &o, &events).await;
+        let qc = run_auto_qc(&mut sess, &o, &events, None).await;
         assert!(
             qc.is_clean(),
             "a clean static page must not be falsely flagged: {:?}",
@@ -1290,7 +1840,7 @@ mod tests {
         let (events, _rec) = sink();
         let mut sess = FakeSession::new(vec![], false, "");
         let o = opts(tmp.path());
-        let qc = run_auto_qc(&mut sess, &o, &events).await;
+        let qc = run_auto_qc(&mut sess, &o, &events, None).await;
         assert!(!qc.is_clean(), "no source → blocking");
         assert!(
             qc.blocking.iter().any(|b| b.contains("source-present")),
@@ -1320,7 +1870,7 @@ mod tests {
         let reply = r#"{"accepts": false, "blocking": ["a review nit that must NOT surface"]}"#;
         let mut sess = FakeSession::new(vec![], true, reply);
         let o = lean_opts(tmp.path());
-        let qc = run_auto_qc(&mut sess, &o, &events).await;
+        let qc = run_auto_qc(&mut sess, &o, &events, None).await;
         assert!(
             qc.is_clean(),
             "a lean goal with source present is clean — the fork review is skipped: {:?}",
@@ -1337,7 +1887,7 @@ mod tests {
         let (events, _rec) = sink();
         let mut sess = FakeSession::new(vec![], false, "");
         let o = lean_opts(tmp.path());
-        let qc = run_auto_qc(&mut sess, &o, &events).await;
+        let qc = run_auto_qc(&mut sess, &o, &events, None).await;
         assert!(!qc.is_clean(), "a lean goal with no source still blocks");
         assert!(
             qc.blocking.iter().any(|b| b.contains("source-present")),
@@ -1433,8 +1983,10 @@ mod tests {
     async fn routed_loop_synthesizes_and_posts_a_plan_when_the_brain_replies() {
         // The planning turn runs on the MAIN session (its first turn) and replies
         // with a valid plan JSON → the loop synthesises the plan, persists
-        // `.umadev/plan.json`, posts it, and ticks a step active. The build reply
-        // follows as the second turn.
+        // `.umadev/plan.json`, posts it, and ticks a step active. Because the route
+        // is DELIBERATE (Standard), Wave 2 then DRIVES the plan step-by-step via
+        // `summon` (the second scripted turn is the first step's doer turn), so the
+        // doer's reply text threads back through `SummonResult.text`.
         let tmp = tempfile::TempDir::new().unwrap();
         seed_source(tmp.path());
         let (events, rec) = sink();
@@ -1474,7 +2026,7 @@ mod tests {
         // It was persisted to disk and is loadable.
         let loaded = crate::plan_state::load(tmp.path()).expect("plan persisted");
         assert_eq!(loaded.steps.len(), 2);
-        // The plan-driven loop still drove the base build (single main turn here).
+        // The step-driven loop drove the doer turn and threaded its reply back.
         match outcome {
             DirectorLoopOutcome::Done { reply } => assert!(reply.contains("Built the whole app")),
             other @ DirectorLoopOutcome::Failed(_) => panic!("expected Done, got {other:?}"),
@@ -1529,6 +2081,263 @@ mod tests {
         assert_eq!(
             rec.count(|e| matches!(e, EngineEvent::PlanPosted { .. })),
             0
+        );
+    }
+
+    // ── Wave 2: drive the plan step-by-step (deliberate) vs single-turn (lean) ──
+
+    /// A FAST (lean) Build route — proportional, convenes no team, NOT deliberate.
+    fn fast_build_route() -> crate::router::RoutePlan {
+        crate::router::RoutePlan {
+            class: crate::router::RouteClass::Build,
+            kind: crate::planner::TaskKind::Light,
+            depth: crate::router::Depth::Fast,
+            team: vec![],
+            scope: vec![],
+            needs_clarify: None,
+            est_budget: crate::router::Budget::for_route(
+                crate::router::RouteClass::Build,
+                crate::router::Depth::Fast,
+            ),
+            confidence: 0.6,
+        }
+    }
+
+    #[tokio::test]
+    async fn deliberate_build_drives_each_step_via_summon_and_ticks_done() {
+        // The headline Wave 2 behaviour: a DELIBERATE build with a 2-step plan drives
+        // EACH step on its own summon turn (so the main session receives the plan
+        // turn + one doer directive PER step), verifies each against source-present,
+        // and ticks each step Done on the checklist.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path()); // source present → each step's acceptance passes
+        let (events, rec) = sink();
+        let plan_json = r#"{"steps":[
+            {"id":"scaffold","title":"Scaffold","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"},
+            {"id":"ui","title":"Build the UI","seat":"frontend-engineer","kind":"build","depends_on":["scaffold"],"acceptance":"source-present"}
+        ],"risks":[],"open_questions":[]}"#;
+        // Turn 1 = plan JSON; turn 2 = scaffold doer; turn 3 = ui doer. The
+        // FakeSession default-completes any further turns (the final QC gate).
+        let turns = vec![
+            text_turn(plan_json),
+            text_turn("Scaffolded the app skeleton. Done."),
+            text_turn("Built the UI. Done."),
+        ];
+        let mut sess = FakeSession::new(turns, false, "");
+        let sent = sess.sent_handle();
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的任务管理产品".to_string();
+        let route = build_route();
+
+        let outcome =
+            drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
+        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
+
+        // BOTH steps ticked Done (the real "checklist ticks off" outcome).
+        let done = rec
+            .count(|e| matches!(e, EngineEvent::PlanStepStatus { status, .. } if status == "done"));
+        assert!(done >= 2, "both build steps ticked done: {done}");
+
+        // The main session received the plan turn AND a separate focused directive
+        // per step — proof the plan was DRIVEN step-by-step, not in one mega-turn.
+        let sent = sent.lock().unwrap();
+        assert!(
+            sent.iter().any(|d| d.contains("Scaffold")),
+            "the scaffold step got its own focused directive: {sent:?}"
+        );
+        assert!(
+            sent.iter().any(|d| d.contains("Build the UI")),
+            "the ui step got its own focused directive: {sent:?}"
+        );
+        // Persisted terminal plan is all-Done.
+        let loaded = crate::plan_state::load(tmp.path()).expect("plan persisted");
+        assert!(loaded
+            .steps
+            .iter()
+            .all(|s| s.status == crate::plan_state::StepStatus::Done));
+    }
+
+    #[tokio::test]
+    async fn lean_fast_build_stays_single_turn_no_step_scheduling() {
+        // A LEAN/Fast Build route must NOT take the step-driven path — it stays ONE
+        // end-to-end build turn (the Wave 1 speed invariant). A Fast Build still gets
+        // a short VISIBLE plan (the planning turn), but the step-driver only fires on
+        // DELIBERATE depth, so the build itself is a single fast turn: the planning
+        // turn + exactly ONE build directive, never decomposed into per-step summons.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, _rec) = sink();
+        let plan_json = r#"{"steps":[
+            {"id":"a","title":"Page","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"}
+        ],"risks":[],"open_questions":[]}"#;
+        // Turn 1 = the (short) plan; turn 2 = the single end-to-end build.
+        let turns = vec![
+            text_turn(plan_json),
+            text_turn("Built the single page end to end. Done."),
+        ];
+        let mut sess = FakeSession::new(turns, true, plan_json);
+        let sent = sess.sent_handle();
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个简单的待办清单单页应用,纯前端".to_string();
+        let route = fast_build_route();
+
+        let outcome =
+            drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
+        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
+        // The planning turn + EXACTLY ONE build directive — the lean build is a single
+        // fast turn, never decomposed into per-step summon turns (the speed invariant).
+        let sent = sent.lock().unwrap();
+        assert_eq!(
+            sent.len(),
+            2,
+            "a lean/Fast build is the plan turn + ONE build turn (no step scheduling): {sent:?}"
+        );
+        // The single build directive is the caller's "GO" framing, NOT a per-step
+        // focused directive (which would carry a step title + "one step of the
+        // overall build").
+        assert!(
+            sent.iter().any(|d| d.contains("GO")),
+            "the build ran the caller's single directive: {sent:?}"
+        );
+        assert!(
+            !sent
+                .iter()
+                .any(|d| d.contains("one step of the overall build")),
+            "no per-step summon directive on a lean/Fast build: {sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_scheduling_fails_open_to_single_turn_when_first_step_cannot_drive() {
+        // Fail-open: if the FIRST step can't drive at all (a dead session on the very
+        // first doer turn), the step path returns None and the loop falls back to the
+        // single end-to-end turn — the build is never lost to a scheduling failure.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, rec) = sink();
+        let plan_json = r#"{"steps":[
+            {"id":"a","title":"Step A","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"}
+        ],"risks":[],"open_questions":[]}"#;
+        // Turn 1 = plan JSON. Turn 2 (the first step's doer) has NO TurnDone → the
+        // session drains to None mid-turn → summon's pump returns done=false with no
+        // text, so the first step "didn't drive" → fall back to the single turn.
+        let turns = vec![
+            text_turn(plan_json),
+            vec![SessionEvent::TextDelta("partial, no TurnDone".into())],
+            text_turn("Fallback single-turn build. Done."),
+        ];
+        let mut sess = FakeSession::new(turns, false, "");
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的产品".to_string();
+        let route = build_route();
+
+        let outcome =
+            drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
+        // The build still completes (via the single-turn fallback), never a panic.
+        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
+        // The fallback note was emitted.
+        assert!(
+            rec.events().iter().any(|e| matches!(
+                e,
+                EngineEvent::Note(n) if n.contains("step scheduling unavailable")
+            )),
+            "a first-step drive failure falls back to the single turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_step_acceptance_is_bounded_and_marks_blocked() {
+        // A step whose acceptance NEVER passes (claims a build but the tree stays
+        // empty so source-present fails every round) must be BOUNDED by the per-step
+        // fix budget, then marked Blocked (honest) — never an infinite re-drive.
+        let tmp = tempfile::TempDir::new().unwrap();
+        // NO source seeded → the source-present acceptance fails every round.
+        let (events, rec) = sink();
+        let plan_json = r#"{"steps":[
+            {"id":"a","title":"Step A","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"}
+        ],"risks":[],"open_questions":[]}"#;
+        // Every doer turn claims done but writes nothing → acceptance fails; the
+        // FakeSession default-completes once the scripted turns run out.
+        let turns = vec![
+            text_turn(plan_json),
+            text_turn("Worked on it. Done."),
+            text_turn("Tried again. Done."),
+            text_turn("Once more. Done."),
+        ];
+        let mut sess = FakeSession::new(turns, false, "");
+        let sent = sess.sent_handle();
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的产品".to_string();
+        let route = build_route();
+
+        let outcome =
+            drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
+        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
+        // The step was driven a BOUNDED number of times (1 plan turn + at most
+        // MAX_STEP_FIX_ROUNDS+1 doer turns + the final-gate fix turns) — never a spin.
+        let n = sent.lock().unwrap().len();
+        assert!(
+            n <= 1 + (MAX_STEP_FIX_ROUNDS + 1) + MAX_QC_ROUNDS,
+            "the failing step is bounded, not an infinite re-drive: {n} turns"
+        );
+        // The step ended Blocked (its acceptance never passed) — honest, not Done.
+        assert!(
+            rec.count(
+                |e| matches!(e, EngineEvent::PlanStepStatus { status, .. } if status == "blocked")
+            ) >= 1,
+            "an unacceptable step is marked Blocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_loop_records_usage_and_audit_and_lessons() {
+        // Wave 2 deliverable 4: the DEFAULT single-turn loop records token usage,
+        // the tool-call audit trail, and distils pitfalls — for every base, not just
+        // claude in the legacy runner.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, rec) = sink();
+        // A turn that calls a tool (audited), a FAILED tool (a pitfall), and ends.
+        let turns = vec![vec![
+            SessionEvent::TextDelta("Implemented the feature. Done.".into()),
+            SessionEvent::ToolCall {
+                name: "Write".into(),
+                input: serde_json::json!({"file_path": "src/app.ts"}),
+            },
+            SessionEvent::ToolResult {
+                ok: false,
+                summary: "npm run build failed: TS2304 cannot find name 'Foo'".into(),
+            },
+            SessionEvent::TurnDone {
+                status: TurnStatus::Completed,
+            },
+        ]];
+        let mut sess = FakeSession::new(turns, false, "");
+        let mut o = opts(tmp.path());
+        o.backend = "codex".to_string(); // a non-claude base: audit must still record
+                                         // Usage is written to ~/.umadev (HOME), so just assert the audit + lessons
+                                         // side effects that land under the project root (deterministic, isolated).
+        let outcome = drive_director_loop(&mut sess, &o, &events, "GO".into()).await;
+        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
+
+        // Audit trail recorded the tool call (UD-EVID-002) under the project root.
+        let audit = tmp
+            .path()
+            .join(".umadev")
+            .join("audit")
+            .join("tool-calls.jsonl");
+        let trail = std::fs::read_to_string(&audit).unwrap_or_default();
+        assert!(
+            trail.contains("Write") && trail.contains("src/app.ts"),
+            "the tool call was recorded to the audit trail: {trail:?}"
+        );
+
+        // A `[learned]` note fired — the failed tool call was distilled into lessons.
+        assert!(
+            rec.events()
+                .iter()
+                .any(|e| matches!(e, EngineEvent::Note(n) if n.contains("[learned]"))),
+            "the failed tool call was captured as a development pitfall"
         );
     }
 }
