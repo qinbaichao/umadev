@@ -2719,9 +2719,9 @@ mod tests {
             TrustMode::Auto,
         );
         let (events, rec) = sink();
-        // spec, frontend, backend, quality — four lean turns, all clean.
-        let mut session =
-            FakeBaseSession::new(vec![vec![done()], vec![done()], vec![done()], vec![done()]]);
+        // spec, frontend, quality — three lean turns (a PURE frontend Light build
+        // drops the do-nothing Backend phase), all clean.
+        let mut session = FakeBaseSession::new(vec![vec![done()], vec![done()], vec![done()]]);
         let sent = session.sent_handle();
 
         // A Light plan is GATELESS → it drives the WHOLE lean list in one block
@@ -2730,11 +2730,11 @@ mod tests {
         assert_eq!(outcome, RunOutcome::Completed);
 
         let sent = sent.lock().unwrap();
-        // spec + frontend + backend + quality (no research, no docs).
+        // spec + frontend + quality (no research, no docs, no empty backend).
         assert_eq!(
             sent.len(),
-            4,
-            "lean plan: spec/frontend/backend/quality only"
+            3,
+            "lean pure-frontend plan: spec/frontend/quality only (Backend trimmed)"
         );
         // The FIRST directive (spec) must NOT reference research / the three docs,
         // and must carry the requirement + the lean priming + a small-scope cue.

@@ -161,11 +161,81 @@ impl PhasePlan {
 #[must_use]
 pub fn plan(requirement: &str) -> PhasePlan {
     let kind = classify(requirement);
+    let mut phases = kind.phases();
+    // A simple (Light) build rarely needs BOTH a frontend and a backend. Trim the
+    // surface the requirement never mentions so a pure static page doesn't pay for
+    // an empty backend phase (~25% of a lean run was a do-nothing Backend turn),
+    // and a small script doesn't pay for an empty frontend phase. Only trims when
+    // the requirement is clearly one-sided; an ambiguous Light build keeps both.
+    // Never touches a gated plan (Greenfield/FrontendOnly/BackendOnly already pick
+    // their phases) — only the otherwise-fixed lean Light list.
+    if kind == TaskKind::Light {
+        let q = requirement.to_lowercase();
+        let fe = mentions_frontend(&q);
+        let be = mentions_backend(&q);
+        if fe && !be {
+            phases.retain(|p| *p != Phase::Backend);
+        } else if be && !fe {
+            phases.retain(|p| *p != Phase::Frontend);
+        }
+    }
     PhasePlan {
         kind,
-        phases: kind.phases(),
+        phases,
         rationale: rationale_for(kind),
     }
+}
+
+/// `true` when the requirement names a frontend / UI surface (used to trim a lean
+/// plan's surplus phase). Distinctive tokens only — shared with [`classify`].
+fn mentions_frontend(q: &str) -> bool {
+    const FE: &[&str] = &[
+        "前端",
+        "界面",
+        "页面",
+        "单页",
+        "样式",
+        "组件",
+        "布局",
+        "静态页",
+        "落地页",
+        "frontend",
+        "tailwind",
+        "react",
+        "vue",
+        "html",
+        "css",
+        " ui",
+        "single page",
+        "static page",
+        "landing page",
+    ];
+    FE.iter().any(|n| q.contains(n))
+}
+
+/// `true` when the requirement names a backend / server / data surface — shared
+/// with [`classify`].
+fn mentions_backend(q: &str) -> bool {
+    const BE: &[&str] = &[
+        "后端",
+        "接口",
+        "数据库",
+        "服务端",
+        "数据表",
+        "鉴权",
+        "脚本",
+        "命令行",
+        "backend",
+        "graphql",
+        "fastapi",
+        "express",
+        "微服务",
+        "script",
+        "cli",
+        "api",
+        "server",
+    ];
+    BE.iter().any(|n| q.contains(n))
 }
 
 /// Deterministic intent classification. Order matters: the narrowest intents
@@ -1037,5 +1107,39 @@ mod tests {
         assert!(!doc_declares_server_surface(
             "just a color palette and a few buttons"
         ));
+    }
+
+    #[test]
+    fn lean_frontend_build_skips_the_empty_backend_phase() {
+        // A simple pure-frontend page is Light, but should not pay for a
+        // do-nothing Backend phase (~25% of the run was an empty backend turn).
+        let p = plan("做一个简单的番茄钟计时器单页应用,纯前端,开始/暂停/重置");
+        assert_eq!(p.kind, TaskKind::Light);
+        assert!(
+            p.includes(Phase::Frontend),
+            "a frontend page keeps Frontend"
+        );
+        assert!(
+            !p.includes(Phase::Backend),
+            "a pure frontend page drops Backend"
+        );
+        assert!(p.includes(Phase::Spec) && p.includes(Phase::Quality));
+    }
+
+    #[test]
+    fn lean_script_build_skips_the_empty_frontend_phase() {
+        // The mirror: a small backend/script build drops the empty Frontend phase.
+        let p = plan("写一个简单的脚本,读取 csv 文件统计行数");
+        assert_eq!(p.kind, TaskKind::Light);
+        assert!(!p.includes(Phase::Frontend), "a script drops Frontend");
+        assert!(p.includes(Phase::Backend), "a script keeps Backend");
+    }
+
+    #[test]
+    fn lean_ambiguous_build_keeps_both_surfaces() {
+        // No clear one-sidedness → keep both (conservative, never strands work).
+        let p = plan("做一个简单的小工具");
+        assert_eq!(p.kind, TaskKind::Light);
+        assert!(p.includes(Phase::Frontend) && p.includes(Phase::Backend));
     }
 }
