@@ -662,8 +662,23 @@ pub fn finalize(
 
     let mut result = FinalizeResult::default();
 
-    // ALWAYS (every Build depth): guarantee the core docs exist. Idempotent +
-    // never clobbers a doc the base already wrote. Fail-open inside.
+    // PROPORTIONALITY (audit #7): a lean/Fast build's deliverable IS the code. A
+    // counter / single page does NOT need a retrospective PRD + architecture + UIUX
+    // + execution-plan set — that is pure ceremony that also slows the fast path
+    // (the owned `.umadev/plan.json` already records what was built). The full
+    // shareable docs + proof-pack are reserved for a DELIBERATE (Standard/Deep)
+    // build, where a real product genuinely warrants them.
+    if !route.depth.is_deliberate() {
+        events.emit(EngineEvent::Note(
+            "team · delivery — lean build: the code is the deliverable (no doc ceremony; \
+             see .umadev/plan.json for the plan)"
+                .to_string(),
+        ));
+        return result;
+    }
+
+    // DELIBERATE: guarantee the core docs exist (idempotent + never clobbers a doc
+    // the base already wrote, fail-open inside) …
     let scaffolded = crate::phases::scaffold_core_docs(options);
     if !scaffolded.is_empty() {
         events.emit(EngineEvent::Note(format!(
@@ -674,9 +689,8 @@ pub fn finalize(
     }
     result.artifacts.extend(scaffolded);
 
-    // DELIBERATE only: the full, shareable proof-pack. A lean/Fast build stops at
-    // the core docs above — no zip/scorecard ceremony for a todo page.
-    if route.depth.is_deliberate() {
+    // … plus the full, shareable proof-pack + scorecard.
+    {
         match crate::phases::run_delivery(options) {
             Ok(out) => {
                 let rels: Vec<String> = out
@@ -1124,9 +1138,10 @@ mod tests {
     }
 
     #[test]
-    fn finalize_lean_build_writes_core_docs_but_no_proof_pack() {
-        // A LEAN/Fast Build leaves the three core docs (PRD/architecture/uiux) +
-        // execution plan — but NO zipped proof-pack (no over-delivery for a page).
+    fn finalize_lean_build_ships_code_only_no_doc_ceremony() {
+        // PROPORTIONALITY (audit #7): a LEAN/Fast Build's deliverable IS the code —
+        // NO retrospective PRD/architecture/uiux/execution-plan set, NO proof-pack.
+        // A counter / single page should not produce 4 enterprise docs.
         let tmp = tempfile::TempDir::new().unwrap();
         seed_source(tmp.path());
         let ev = sink();
@@ -1134,15 +1149,14 @@ mod tests {
         let route = build_route(crate::router::Depth::Fast);
         let r = finalize(&o, &ev, Some(&route));
         assert!(!r.proof_pack, "a lean build earns no proof-pack");
-        assert!(r.produced_anything(), "the core docs were written");
-        // The three core docs exist on disk.
+        // NO scaffolded core docs — the code is the deliverable.
         for name in ["demo-prd.md", "demo-architecture.md", "demo-uiux.md"] {
             assert!(
-                tmp.path().join("output").join(name).is_file(),
-                "{name} was scaffolded"
+                !tmp.path().join("output").join(name).is_file(),
+                "{name} must NOT be scaffolded for a lean build"
             );
         }
-        // No proof-pack zip in release/.
+        // And no proof-pack zip in release/.
         let release = tmp.path().join("release");
         assert!(
             !release.exists()
