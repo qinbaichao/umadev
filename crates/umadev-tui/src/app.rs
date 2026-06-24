@@ -1096,10 +1096,18 @@ impl App {
                 PhaseStatus::Pending => '○',
             })
             .collect();
-        let dots = if total > 0 {
-            format!("{bar} {done}/{total}")
+        // The 9-phase dot bar is the LEGACY pipeline's progress view. The
+        // brain-routing / chat / plan path never advances these phases (its progress
+        // is the live plan checklist), so an all-Pending `0/N` bar is a frozen
+        // vestige in the header. Show the dots ONLY once the legacy pipeline actually
+        // moves a phase (done > 0 or one is running); otherwise omit them entirely so
+        // a chat / brain-routed turn shows a clean header, not a stuck `0/9`. The
+        // separator travels WITH the dots so an empty bar leaves no dangling " · ".
+        let any_running = self.phases.iter().any(|r| r.status == PhaseStatus::Running);
+        let dots = if total > 0 && (done > 0 || any_running) {
+            format!(" · {bar} {done}/{total}")
         } else {
-            bar
+            String::new()
         };
         let running = self
             .phases
@@ -1144,7 +1152,7 @@ impl App {
             .map(|t| format!(" · [time] {}", fmt_elapsed(t.elapsed().as_secs())))
             .unwrap_or_default();
         self.status = format!(
-            "● {} · {}{}{}{}{}{}",
+            "● {}{}{}{}{}{}{}",
             self.backend_label, dots, running, gate_label, done_label, ds_short, total_elapsed
         );
     }
