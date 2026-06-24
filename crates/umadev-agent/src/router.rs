@@ -295,6 +295,23 @@ pub async fn route(
 /// to a class + depth, and size a team. Always complete, always safe — this is what
 /// the router returns when there's no brain or the brain consult fails.
 fn tier0(requirement: &str) -> RoutePlan {
+    // Greeting / self-inquiry / capability question → Chat, BEFORE the work-verb
+    // floor can over-promote it. "你能帮我做什么?" contains 帮我/做 (work verbs) but
+    // is small talk with no deliverable — without this guard it became a full
+    // Build, convening a 7-seat team for a "hello". A real build phrased as a
+    // question ("帮我做一个待办应用") carries a deliverable and is NOT caught.
+    if looks_like_smalltalk(requirement) {
+        return RoutePlan {
+            class: RouteClass::Chat,
+            kind: TaskKind::Light,
+            depth: Depth::Fast,
+            team: Vec::new(),
+            scope: Vec::new(),
+            needs_clarify: None,
+            est_budget: Budget::for_route(RouteClass::Chat, Depth::Fast),
+            confidence: 0.9,
+        };
+    }
     let kind = classify(requirement);
     let is_work = looks_like_work_request(requirement);
 
@@ -548,6 +565,104 @@ pub fn looks_like_work_request(text: &str) -> bool {
         return true;
     }
     ZH.iter().any(|k| text.contains(k))
+}
+
+/// Whether the turn is a greeting / self-inquiry / capability question — small
+/// talk that must route to [`RouteClass::Chat`] even though it may contain a work
+/// verb in the interrogative ("你能**帮我做**什么?" = *what can you help me do*,
+/// NOT "帮我做 X"). The guard fires ONLY when there is **no concrete deliverable
+/// noun** — "帮我做一个待办**应用**" carries a deliverable and stays a real build.
+/// Deterministic; the brain (Tier-1) refines an ambiguous middle.
+fn looks_like_smalltalk(text: &str) -> bool {
+    let t = text.trim().to_lowercase();
+    // A concrete deliverable noun ⇒ it's a real request, never small talk.
+    const DELIVERABLE: &[&str] = &[
+        "应用",
+        "程序",
+        "页面",
+        "系统",
+        "网站",
+        "仪表盘",
+        "面板",
+        "落地页",
+        "博客",
+        "商城",
+        "后台",
+        "组件",
+        "接口",
+        "表单",
+        "网页",
+        "小程序",
+        "插件",
+        "工具",
+        "脚本",
+        "游戏",
+        "app",
+        "dashboard",
+        "page",
+        "site",
+        "website",
+        "landing",
+        "login",
+        "api",
+        "feature",
+        "component",
+        "form",
+        "tool",
+        "script",
+        "game",
+        "blog",
+        "store",
+    ];
+    if DELIVERABLE.iter().any(|n| t.contains(n)) {
+        return false;
+    }
+    // Greeting / self-inquiry / capability question with no deliverable.
+    const SMALL: &[&str] = &[
+        "你好",
+        "您好",
+        "嗨",
+        "哈喽",
+        "在吗",
+        "在不在",
+        "你是谁",
+        "你叫什么",
+        "你能做什么",
+        "你能帮我做什么",
+        "你能帮我做点什么",
+        "你能帮我干什么",
+        "你会做什么",
+        "你会什么",
+        "能做些什么",
+        "能做什么",
+        "能干什么",
+        "能干嘛",
+        "做什么呢",
+        "怎么用你",
+        "你怎么用",
+        "如何使用",
+        "怎么开始",
+        "你是什么",
+        "介绍一下你",
+        "自我介绍",
+        "你能干嘛",
+        "你好呀",
+        "who are you",
+        "what can you do",
+        "what do you do",
+        "how do you work",
+        "what are you",
+        "introduce yourself",
+        "how does this work",
+        "how to use you",
+    ];
+    if SMALL.iter().any(|k| t.contains(k)) {
+        return true;
+    }
+    // A bare greeting token at the very start of a short turn (e.g. "hi", "hello").
+    const HELLO: &[&str] = &["hello", "hi ", "hey ", "yo ", "早上好", "晚上好"];
+    let short = t.chars().count() <= 24;
+    short && (t == "hi" || t == "hey" || t == "yo" || HELLO.iter().any(|k| t.starts_with(k)))
 }
 
 /// Cheap deterministic path hints — pull obvious file-ish tokens out of the
@@ -874,6 +989,32 @@ mod tests {
     async fn tier0_bugfix_is_debug() {
         let p = route(None, &opts(), "登录一直报错,帮我修一下").await;
         assert_eq!(p.class, RouteClass::Debug);
+    }
+
+    #[tokio::test]
+    async fn greeting_and_self_inquiry_stay_chat_not_build() {
+        // The real-machine walkthrough caught "你好,你是谁?能帮我做什么?" (a greeting +
+        // capability question) convening a 7-seat BUILD team. Small talk with a work
+        // verb in the interrogative must route to Chat.
+        for q in [
+            "你好,你是谁?能帮我做什么?",
+            "你好呀",
+            "你能做什么",
+            "hi there",
+            "what can you do for me?",
+            "介绍一下你自己",
+        ] {
+            let p = route(None, &opts(), q).await;
+            assert_eq!(p.class, RouteClass::Chat, "{q} must be Chat");
+            assert!(p.team.is_empty(), "{q} convenes no team");
+        }
+        // …but a deliverable phrased as a question is STILL a build.
+        let p = route(None, &opts(), "你能帮我做一个待办应用吗?").await;
+        assert_eq!(
+            p.class,
+            RouteClass::Build,
+            "a deliverable question is a build"
+        );
     }
 
     #[tokio::test]
