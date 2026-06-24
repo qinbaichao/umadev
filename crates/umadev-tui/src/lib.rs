@@ -1749,8 +1749,9 @@ struct ChatRoute {
     /// carried so a chat-originated build drives the director loop with the SAME
     /// route the intent card showed, never a re-forced one.
     route: RoutePlan,
-    /// `true` when the turn is a Build-class, deliberate-depth turn → the director
-    /// build path (plan + step scheduling + finalize), not the light streaming turn.
+    /// `true` for ANY Build-class turn → the director-build path (visible plan +
+    /// finalize; step scheduling when deliberate), matching the CLI `umadev run`.
+    /// A QuickEdit / Debug / Chat stays on the light streaming turn.
     director_build: bool,
 }
 
@@ -1780,10 +1781,15 @@ async fn route_turn(app: &mut App, project_root: &std::path::Path, task: &str) -
     };
     // Tier-0 (session = None): deterministic, zero-latency, never errors.
     let route = umadev_agent::router::route(None, &options, task).await;
-    // A Build-class, deliberate-depth turn is the director-build path: a chat
-    // that says "build me X" now auto-promotes here instead of the old
-    // hardcoded `director_build:false`.
-    let director_build = route.class.mutates_workspace() && route.depth.is_deliberate();
+    // ANY Build-class turn is the director-build path — consistent with the CLI
+    // `umadev run` (which `for_run`-forces Build and shows a plan for every build,
+    // Fast or deliberate). A small/Fast build still shows its visible plan (the
+    // flagship surface), then builds in a single proportional turn; a deliberate
+    // build additionally schedules the team step-by-step. A QuickEdit / Debug /
+    // Chat stays on the fast light streaming path (no plan, no run-lock). Without
+    // this, a "做一个待办单页" typed in chat silently lost the plan the same request
+    // shows under `umadev run` — the exact CLI/TUI inconsistency the audit flagged.
+    let director_build = matches!(route.class, umadev_agent::RouteClass::Build);
     ChatRoute {
         route,
         director_build,
