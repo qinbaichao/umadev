@@ -469,6 +469,7 @@ mod tests {
             "tui.tool.matches",
             "tui.fold.collapsed",
             "tui.fold.expand_hint",
+            "tui.diff.collapsed",
             "tui.help.edit.expand",
         ];
         let cats = catalogs();

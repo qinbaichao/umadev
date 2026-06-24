@@ -1329,8 +1329,13 @@ async fn drive_one_turn(
                 // error is swallowed and never blocks the turn.
                 let detail = tool_call_target(&input);
                 record_tool_call_audit(options, &name, &detail);
+                // P1: forward the structured before/after for a Write/Edit so the
+                // TUI can draw a live diff card on the DEFAULT loop (the user hit
+                // "no real-time feedback when writing code"). Fail-open: a
+                // non-edit tool / unreadable input → None → the plain tool row.
+                let edit = umadev_runtime::ToolEdit::from_claude_tool_input(&name, &input);
                 events.emit(EngineEvent::WorkerStream {
-                    event: StreamEvent::ToolUse { name, detail },
+                    event: StreamEvent::ToolUse { name, detail, edit },
                 });
             }
             SessionEvent::ToolResult { ok, summary } => {

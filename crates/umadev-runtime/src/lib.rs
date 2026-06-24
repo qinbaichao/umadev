@@ -194,6 +194,81 @@ pub trait Runtime: Send + Sync {
     }
 }
 
+/// A structured file edit pulled off a write/edit tool call, so the TUI can
+/// render a real diff card (the Claude-Code "code added / code changed" feel)
+/// instead of a one-line `Write src/app.tsx` row.
+///
+/// `before`/`after` are the **full** file regions the base reported:
+/// - Claude `Edit` → `before = old_string`, `after = new_string` (a patch hunk).
+/// - Claude `Write` → `before = ""`, `after = content` (a brand-new / replaced
+///   file, all additions).
+///
+/// **Fail-open:** populated ONLY when the base hands us the actual content. A
+/// tool that carries just a path (codex `file_change`, opencode's scraped
+/// gutter) leaves [`StreamEvent::ToolUse::edit`] = `None`, and the TUI degrades
+/// to the ordinary tool row — never a wrong or empty diff.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ToolEdit {
+    /// Target file path as the base reported it.
+    pub path: String,
+    /// File region BEFORE the edit (empty for a fresh `Write`).
+    pub before: String,
+    /// File region AFTER the edit.
+    pub after: String,
+}
+
+impl ToolEdit {
+    /// Pull a structured edit off a Claude-shaped tool-call input (the JSON the
+    /// base reports for `Edit` / `MultiEdit` / `Write`), so the TUI can render a
+    /// diff card. Shared by every driver/loop that sees that input shape (the
+    /// `umadev-host` claude driver AND the continuous-session director loop,
+    /// whose `SessionEvent::ToolCall.input` is the same JSON).
+    ///
+    /// - `Edit` → `before = old_string`, `after = new_string`.
+    /// - `MultiEdit` → the first edit of the batch (a representative card).
+    /// - `Write` → `before = ""`, `after = content` (all additions).
+    /// - any other tool / unreadable fields → `None`.
+    ///
+    /// **Fail-open by construction:** every field is fetched with `?`, so a
+    /// missing/malformed input yields `None` — never a panic, never a
+    /// fabricated diff.
+    #[must_use]
+    pub fn from_claude_tool_input(name: &str, input: &serde_json::Value) -> Option<Self> {
+        let str_field = |k: &str| input.get(k).and_then(|s| s.as_str());
+        match name {
+            "Edit" => Some(Self {
+                path: str_field("file_path")?.to_string(),
+                before: str_field("old_string")?.to_string(),
+                after: str_field("new_string")?.to_string(),
+            }),
+            "MultiEdit" => {
+                let path = str_field("file_path")?.to_string();
+                let first = input
+                    .get("edits")
+                    .and_then(|e| e.as_array())
+                    .and_then(|arr| arr.first())?;
+                Some(Self {
+                    path,
+                    before: first
+                        .get("old_string")
+                        .and_then(|s| s.as_str())?
+                        .to_string(),
+                    after: first
+                        .get("new_string")
+                        .and_then(|s| s.as_str())?
+                        .to_string(),
+                })
+            }
+            "Write" => Some(Self {
+                path: str_field("file_path")?.to_string(),
+                before: String::new(),
+                after: str_field("content")?.to_string(),
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// A single real-time event from a streaming worker.
 ///
 /// Host CLI drivers (Claude Code `--output-format stream-json`, Codex
@@ -209,12 +284,18 @@ pub enum StreamEvent {
     },
     /// The worker invoked a tool (read file, write file, run bash, search).
     /// `name` is the tool id ("Read", "Write", "Bash", "Grep", …);
-    /// `detail` is a human-readable summary (file path, command, query).
+    /// `detail` is a human-readable summary (file path, command, query);
+    /// `edit` carries the structured before/after for a `Write`/`Edit` whose
+    /// content the base actually exposed (so the TUI can draw a diff card),
+    /// and is `None` for every other tool / when the content wasn't available.
     ToolUse {
         /// Tool name (e.g. "Read", "Write", "Bash").
         name: String,
         /// Human-readable description (file path, command).
         detail: String,
+        /// Structured edit for a `Write`/`Edit` with content; `None` otherwise.
+        /// **Fail-open:** `None` simply degrades to the plain tool row.
+        edit: Option<ToolEdit>,
     },
     /// The worker received a result from a tool call.
     /// `ok` = success/failure; `summary` is a truncated result preview.
@@ -234,6 +315,21 @@ pub enum StreamEvent {
     /// `[thinking] thinking...` indicator. No text payload — the thinking content is
     /// private and not displayed.
     Thinking,
+}
+
+impl StreamEvent {
+    /// Build a [`StreamEvent::ToolUse`] with no structured edit (`edit: None`) —
+    /// the common case (Read / Bash / Grep / a path-only write). Keeps the many
+    /// call sites that don't have before/after content from repeating
+    /// `edit: None`.
+    #[must_use]
+    pub fn tool_use(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::ToolUse {
+            name: name.into(),
+            detail: detail.into(),
+            edit: None,
+        }
+    }
 }
 
 /// Lets a boxed runtime be used wherever a concrete `Runtime` is
@@ -615,6 +711,41 @@ mod tests {
         let r = offline_chat_reply(&req(vec![("user", &long)]));
         assert!(!r.is_empty());
         assert!(r.contains('\u{2026}'), "long ask should be elided: {r}");
+    }
+
+    #[test]
+    fn tool_use_helper_defaults_edit_to_none() {
+        // The convenience constructor is the common (no-content) path: a Read /
+        // Bash row carries no diff payload.
+        let ev = StreamEvent::tool_use("Read", "src/app.rs");
+        assert_eq!(
+            ev,
+            StreamEvent::ToolUse {
+                name: "Read".into(),
+                detail: "src/app.rs".into(),
+                edit: None,
+            }
+        );
+    }
+
+    #[test]
+    fn tool_edit_carries_before_and_after() {
+        // A structured edit round-trips its before/after so the TUI can diff it.
+        let ev = StreamEvent::ToolUse {
+            name: "Edit".into(),
+            detail: "src/lib.rs".into(),
+            edit: Some(ToolEdit {
+                path: "src/lib.rs".into(),
+                before: "let x = 1;".into(),
+                after: "let x = 2;".into(),
+            }),
+        };
+        let StreamEvent::ToolUse { edit: Some(e), .. } = ev else {
+            panic!("expected an edit-bearing ToolUse");
+        };
+        assert_eq!(e.path, "src/lib.rs");
+        assert_eq!(e.before, "let x = 1;");
+        assert_eq!(e.after, "let x = 2;");
     }
 
     #[tokio::test]

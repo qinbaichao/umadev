@@ -528,6 +528,8 @@
 # Long-output folding: collapsed-summary line + the per-message expand hint
 "tui.fold.collapsed" = "… {} more lines · {} to expand"
 "tui.fold.expand_hint" = "Ctrl+R expand"
+# Folded diff-card header: file (+added −removed) · expand hint
+"tui.diff.collapsed" = "{} (+{} −{}) · {} to expand"
 # Prompt meta-row hints
 "tui.hint.palette" = "↑↓ choose · Tab autocomplete · Enter run"
 "tui.hint.gate_tag" = "[gate] gate `{}`"

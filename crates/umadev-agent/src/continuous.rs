@@ -555,11 +555,14 @@ fn govern_tool_call(
     let (target, decision) = evaluate_tool_call(policy, ctx, name, input);
 
     // TUI tool row — "正在写 src/App.tsx…". This is the SOURCE OF TRUTH for what
-    // the base actually did.
+    // the base actually did. P1: a Write/Edit also forwards its structured
+    // before/after so the TUI renders a diff card (fail-open: non-edit → None).
+    let edit = umadev_runtime::ToolEdit::from_claude_tool_input(name, input);
     events.emit(EngineEvent::WorkerStream {
         event: StreamEvent::ToolUse {
             name: name.to_string(),
             detail: target.clone(),
+            edit,
         },
     });
 

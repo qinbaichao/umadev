@@ -385,7 +385,7 @@ fn parse_codex_stream_line(line: &str) -> Option<umadev_runtime::StreamEvent> {
                 .and_then(|t| t.as_str())
                 .unwrap_or("")
                 .to_string();
-            Some(umadev_runtime::StreamEvent::ToolUse { name, detail })
+            Some(umadev_runtime::StreamEvent::tool_use(name, detail))
         }
         "file_change" | "file_edit" => {
             // Codex file_change has a `changes` array: [{"path":"…","kind":"update"}].
@@ -416,13 +416,59 @@ fn parse_codex_stream_line(line: &str) -> Option<umadev_runtime::StreamEvent> {
             } else {
                 "Edit"
             };
+            // codex's `file_change` normally carries only the path + kind — no
+            // before/after content — so we degrade to a plain tool row (`edit:
+            // None`). If a future codex build DOES expose the new content (an
+            // `add` with `content`, or a `diff`/`unified_diff`), fill a ToolEdit
+            // for the diff card; otherwise stay `None`. Fail-open: any missing
+            // field just keeps `edit = None`.
+            let edit = codex_file_change_edit(item, kind, &path);
             Some(umadev_runtime::StreamEvent::ToolUse {
                 name: tool_name.to_string(),
                 detail: path,
+                edit,
             })
         }
         _ => None,
     }
+}
+
+/// Best-effort structured edit for a codex `file_change` item.
+///
+/// codex's stream usually reports a file change as just `{path, kind}` with no
+/// content, so there's nothing to diff and this returns `None` (the caller
+/// falls back to a plain `Write`/`Edit` row). It only produces a
+/// [`umadev_runtime::ToolEdit`] when codex actually hands over the new file
+/// content (an `add`/`create` carrying `content`/`new_content`) — a full-add
+/// card. A unified-`diff`-only payload is intentionally left as `None` here:
+/// we don't reconstruct before/after from a patch, so we never risk a wrong
+/// card. **Fail-open:** any absent field yields `None`.
+fn codex_file_change_edit(
+    item: &serde_json::Value,
+    kind: &str,
+    path: &str,
+) -> Option<umadev_runtime::ToolEdit> {
+    if kind != "add" && kind != "create" {
+        // An update without before/after content can't be diffed safely.
+        return None;
+    }
+    let first = item
+        .get("changes")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first());
+    // Look for the new file content on either the change entry or the item.
+    let content = first
+        .and_then(|ch| ch.get("content").or_else(|| ch.get("new_content")))
+        .or_else(|| item.get("content").or_else(|| item.get("new_content")))
+        .and_then(|c| c.as_str())?;
+    if content.is_empty() {
+        return None;
+    }
+    Some(umadev_runtime::ToolEdit {
+        path: path.to_string(),
+        before: String::new(),
+        after: content.to_string(),
+    })
 }
 
 /// `--model` args for codex, but ONLY when the model is one codex can actually
@@ -662,7 +708,7 @@ mod tests {
         let line = r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc \"sed -n '1,120p' Cargo.toml\"","exit_code":0,"status":"completed"}}"#;
         let ev = parse_codex_stream_line(line).expect("should parse");
         match ev {
-            StreamEvent::ToolUse { name, detail } => {
+            StreamEvent::ToolUse { name, detail, .. } => {
                 assert_eq!(name, "Bash", "command_execution should map to Bash");
                 assert!(detail.contains("sed"), "detail should contain the command");
             }
@@ -676,9 +722,14 @@ mod tests {
         let line = r#"{"type":"item.completed","item":{"id":"item_3","type":"file_change","changes":[{"path":"/tmp/test.txt","kind":"update"}],"status":"completed"}}"#;
         let ev = parse_codex_stream_line(line).expect("should parse");
         match ev {
-            StreamEvent::ToolUse { name, detail } => {
+            StreamEvent::ToolUse { name, detail, edit } => {
                 assert_eq!(name, "Edit", "kind=update should map to Edit");
                 assert_eq!(detail, "/tmp/test.txt");
+                // codex's file_change is path-only → no diff card, degrade to row.
+                assert!(
+                    edit.is_none(),
+                    "a path-only codex file_change must NOT fabricate a diff"
+                );
             }
             _ => panic!("expected ToolUse"),
         }
@@ -690,9 +741,11 @@ mod tests {
         let line = r#"{"type":"item.completed","item":{"type":"file_change","changes":[{"path":"src/new.ts","kind":"add"}]}}"#;
         let ev = parse_codex_stream_line(line).expect("should parse");
         match ev {
-            StreamEvent::ToolUse { name, detail } => {
+            StreamEvent::ToolUse { name, detail, edit } => {
                 assert_eq!(name, "Write", "kind=add should map to Write");
                 assert_eq!(detail, "src/new.ts");
+                // A path-only `add` (no content) still degrades to a plain row.
+                assert!(edit.is_none(), "no content → no diff card");
             }
             _ => panic!("expected ToolUse"),
         }
@@ -702,6 +755,22 @@ mod tests {
             StreamEvent::ToolUse { name, .. } => assert_eq!(name, "Edit"),
             _ => panic!("expected ToolUse"),
         }
+    }
+
+    #[test]
+    fn parse_file_change_add_with_content_fills_edit() {
+        // Forward-compat: IF codex ever exposes the new file content on an `add`,
+        // we fill an all-additions ToolEdit for the diff card.
+        let line = r#"{"type":"item.completed","item":{"type":"file_change","changes":[{"path":"src/new.ts","kind":"add","content":"export const x = 1;\n"}]}}"#;
+        let ev = parse_codex_stream_line(line).expect("parse");
+        let StreamEvent::ToolUse { name, edit, .. } = ev else {
+            panic!("expected ToolUse");
+        };
+        assert_eq!(name, "Write");
+        let edit = edit.expect("an add carrying content should fill a ToolEdit");
+        assert_eq!(edit.path, "src/new.ts");
+        assert!(edit.before.is_empty());
+        assert_eq!(edit.after, "export const x = 1;\n");
     }
 
     #[test]

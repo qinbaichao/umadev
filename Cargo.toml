@@ -65,6 +65,13 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 # spec / governance / contract crates, not the TUI.
 unicode-width = "0.2"
 
+# Pure-Rust, dependency-light text-diffing (Myers / Patience) used by the TUI to
+# turn a Write/Edit before→after into a line-level diff card. Already in the
+# tree transitively; pinned here so the TUI can depend on it directly. The
+# dependency-light constraint only binds the spec / governance / contract crates,
+# not the TUI.
+similar = "2.7"
+
 # --- governance / parsing ---
 regex = "1.10"
 sha2 = "0.10"

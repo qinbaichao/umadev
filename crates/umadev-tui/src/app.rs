@@ -353,12 +353,196 @@ pub struct ToolCall {
     pub collapsed: bool,
 }
 
-/// The payload of one chat row — either free text (rendered via the shared
-/// `markdown_to_lines` compiler) or a structured tool call (rendered as a
-/// single status line + folded result). Keeping these as a typed enum is the
-/// P0 data-model foundation the tool-row beautification (P4) and the long-output
-/// folding (P6) build on; everything else stays plain `Text`, so the upgrade is
-/// backward-compatible by construction.
+/// One rendered line of a diff card. The `tag` is the gutter marker; `line_no`
+/// is the (1-based) line number in the AFTER file for an add/context line, or in
+/// the BEFORE file for a deletion — whichever the row belongs to (so the number
+/// column tracks the file you can actually open). `text` is the raw content
+/// WITHOUT the +/-/space prefix (the gutter carries that), syntax-highlighted by
+/// the renderer per the file extension.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DiffLine {
+    /// Gutter marker: `'+'` add, `'-'` delete, `' '` unchanged context.
+    pub tag: char,
+    /// 1-based line number in the relevant side of the file (`None` is never
+    /// used today but reserved for a marker row).
+    pub line_no: Option<u32>,
+    /// Raw line content (no leading +/-/space).
+    pub text: String,
+}
+
+/// A contiguous block of changed + surrounding-context lines (one `@@` hunk),
+/// already trimmed to ±N context lines.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DiffHunk {
+    /// The lines of this hunk in display order.
+    pub lines: Vec<DiffLine>,
+}
+
+/// A structured file diff rendered as a Claude-Code-style diff card: a header
+/// (`path (+N −M)`), a dashed top/bottom frame, and per-line gutter (marker +
+/// right-aligned line number) with syntax-highlighted content. Built from a
+/// [`umadev_runtime::ToolEdit`] (a `Write`/`Edit` the base actually performed),
+/// so the user sees code being added / changed in real time instead of a bare
+/// `Write src/app.tsx` row.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FileDiff {
+    /// The edited file's path (rendered in the header + used for the language
+    /// hint that drives syntax highlighting).
+    pub path: String,
+    /// Count of added (`+`) lines, for the header metric.
+    pub added: u32,
+    /// Count of removed (`-`) lines, for the header metric.
+    pub removed: u32,
+    /// The change hunks (each already ±context-trimmed).
+    pub hunks: Vec<DiffHunk>,
+    /// Whether the card is folded to its one-line header (a big diff defaults to
+    /// collapsed; toggled by Ctrl+R, reusing the P6 fold lever).
+    pub collapsed: bool,
+}
+
+/// Context lines kept on each side of a change run inside a hunk (Claude-Code's
+/// diff card shows a few lines of surrounding code, not the whole file).
+pub(crate) const DIFF_CONTEXT: usize = 3;
+
+/// A diff whose total rendered line count exceeds this defaults to collapsed (it
+/// shows just the `path (+N −M) · Ctrl+R 展开` header until expanded). Reuses the
+/// P6 fold lever so a big rewrite doesn't bury the conversation.
+pub(crate) const DIFF_FOLD_THRESHOLD: usize = 24;
+
+impl FileDiff {
+    /// Build a diff card from a structured [`umadev_runtime::ToolEdit`].
+    ///
+    /// Runs a line-level diff (`similar`, pure-Rust Myers) over `before → after`,
+    /// groups the changes into hunks with ±[`DIFF_CONTEXT`] lines of surrounding
+    /// context, counts the +/- lines for the header, and pre-folds a big diff to
+    /// its header (`collapsed`). The line numbers track the AFTER file for
+    /// add/context rows and the BEFORE file for deletions, so each number points
+    /// at the side you can actually open.
+    ///
+    /// **Fail-open by construction:** this is pure data assembly over two
+    /// strings — it never errors, never panics, and an empty/no-op edit simply
+    /// yields a card with zero hunks (the caller can choose to skip it).
+    #[must_use]
+    pub fn from_tool_edit(edit: &umadev_runtime::ToolEdit) -> Self {
+        use similar::{ChangeTag, TextDiff};
+
+        let diff = TextDiff::from_lines(&edit.before, &edit.after);
+
+        // First pass: a flat tagged stream with running line numbers per side
+        // (reusing `DiffLine` directly — its shape already matches).
+        let mut flat: Vec<DiffLine> = Vec::new();
+        let (mut old_no, mut new_no) = (0u32, 0u32);
+        let mut added = 0u32;
+        let mut removed = 0u32;
+        for change in diff.iter_all_changes() {
+            // `similar` yields each line WITH its trailing '\n'; strip it so the
+            // gutter/number columns line up and the renderer owns line breaks.
+            let text = change
+                .value()
+                .strip_suffix('\n')
+                .unwrap_or(change.value())
+                .to_string();
+            match change.tag() {
+                ChangeTag::Equal => {
+                    old_no += 1;
+                    new_no += 1;
+                    flat.push(DiffLine {
+                        tag: ' ',
+                        line_no: Some(new_no),
+                        text,
+                    });
+                }
+                ChangeTag::Delete => {
+                    old_no += 1;
+                    removed += 1;
+                    flat.push(DiffLine {
+                        tag: '-',
+                        line_no: Some(old_no),
+                        text,
+                    });
+                }
+                ChangeTag::Insert => {
+                    new_no += 1;
+                    added += 1;
+                    flat.push(DiffLine {
+                        tag: '+',
+                        line_no: Some(new_no),
+                        text,
+                    });
+                }
+            }
+        }
+
+        // Second pass: keep only changed lines + ±DIFF_CONTEXT around them, and
+        // split into hunks wherever the gap between kept regions is larger than
+        // 2×context (so distant edits don't merge into one giant block).
+        let n = flat.len();
+        let mut keep = vec![false; n];
+        for (i, t) in flat.iter().enumerate() {
+            if t.tag != ' ' {
+                let lo = i.saturating_sub(DIFF_CONTEXT);
+                let hi = (i + DIFF_CONTEXT + 1).min(n);
+                for k in keep.iter_mut().take(hi).skip(lo) {
+                    *k = true;
+                }
+            }
+        }
+
+        let mut hunks: Vec<DiffHunk> = Vec::new();
+        let mut cur: Vec<DiffLine> = Vec::new();
+        for (i, t) in flat.iter().enumerate() {
+            if keep[i] {
+                cur.push(t.clone());
+            } else if !cur.is_empty() {
+                hunks.push(DiffHunk {
+                    lines: std::mem::take(&mut cur),
+                });
+            }
+        }
+        if !cur.is_empty() {
+            hunks.push(DiffHunk { lines: cur });
+        }
+
+        // Default-collapse a big diff (total rendered rows over the threshold).
+        let total_rows: usize = hunks.iter().map(|h| h.lines.len()).sum();
+        let collapsed = total_rows > DIFF_FOLD_THRESHOLD;
+
+        Self {
+            path: edit.path.clone(),
+            added,
+            removed,
+            hunks,
+            collapsed,
+        }
+    }
+
+    /// The greatest absolute line number appearing in the diff — used to size the
+    /// fixed-width gutter number column (so all rows align). `0` for an empty
+    /// diff (the renderer then uses a minimal column).
+    #[must_use]
+    pub fn max_line_no(&self) -> u32 {
+        self.hunks
+            .iter()
+            .flat_map(|h| h.lines.iter())
+            .filter_map(|l| l.line_no)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Total rendered content rows (across all hunks), for the fold decision.
+    #[must_use]
+    pub fn total_rows(&self) -> usize {
+        self.hunks.iter().map(|h| h.lines.len()).sum()
+    }
+}
+
+/// The payload of one chat row — free text (rendered via the shared
+/// `markdown_to_lines` compiler), a structured tool call (a status line +
+/// folded result), or a structured file diff (a diff card). Keeping these as a
+/// typed enum is the P0 data-model foundation the tool-row beautification (P4),
+/// the long-output folding (P6), and the diff card (P1) build on; everything
+/// else stays plain `Text`, so the upgrade is backward-compatible by
+/// construction.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum MessageBody {
     /// A free-text body (already cleaned of ANSI etc.). Goes through the shared
@@ -366,6 +550,8 @@ pub enum MessageBody {
     Text(String),
     /// A structured tool call — its own status line + foldable result.
     Tool(ToolCall),
+    /// A structured file diff — a Write/Edit rendered as a diff card.
+    Diff(FileDiff),
 }
 
 impl MessageBody {
@@ -404,6 +590,12 @@ impl MessageBody {
                     .unwrap_or_default();
                 std::borrow::Cow::Owned(format!("{mark} {}{count}{arg}{result}", t.name))
             }
+            MessageBody::Diff(d) => {
+                // Flat text (export / brain transcript / history preview): a
+                // compact one-liner so the diff card never leaks raw +/- noise
+                // into the brain transcript or the resume preview.
+                std::borrow::Cow::Owned(format!("[edit] {} (+{} -{})", d.path, d.added, d.removed))
+            }
         }
     }
 }
@@ -438,7 +630,8 @@ impl ChatMessage {
     pub fn text_mut(&mut self) -> Option<&mut String> {
         match &mut self.kind {
             MessageBody::Text(s) => Some(s),
-            MessageBody::Tool(_) => None,
+            // Tool / Diff rows are updated structurally, not by string append.
+            MessageBody::Tool(_) | MessageBody::Diff(_) => None,
         }
     }
 }
@@ -1301,6 +1494,37 @@ impl App {
         }
     }
 
+    /// Push a structured diff card for a `Write`/`Edit` (P1). Breaks any
+    /// in-flight low-signal merged batch (a write is a hard boundary) and appends
+    /// a `MessageBody::Diff` row — rendered as a Claude-Code-style diff card the
+    /// moment the tool call arrives, so the user sees code being written live.
+    ///
+    /// Fail-open: a no-op edit (identical before/after → zero hunks) degrades to
+    /// the plain tool row instead of an empty card.
+    fn push_diff(&mut self, edit: &umadev_runtime::ToolEdit) {
+        let diff = FileDiff::from_tool_edit(edit);
+        if diff.hunks.is_empty() {
+            // Nothing actually changed (or unreadable) — keep the plain row so the
+            // activity is still visible, never an empty card.
+            let name = if edit.before.is_empty() {
+                "Write"
+            } else {
+                "Edit"
+            };
+            self.push_tool_use(name, &edit.path);
+            return;
+        }
+        self.stream_tool_batch = None;
+        self.history.push_back(ChatMessage {
+            role: ChatRole::Host,
+            kind: MessageBody::Diff(diff),
+            collapsed: false,
+        });
+        while self.history.len() > HISTORY_CAP {
+            self.history.pop_front();
+        }
+    }
+
     /// Fold a `ToolResult` into the trailing tool row: flip its status to
     /// Ok/Fail, attach the result summary, and auto-collapse a finished OK call
     /// (a failed call stays expanded so the error is never hidden). A low-signal
@@ -1342,6 +1566,17 @@ impl App {
             self.stream_tool_batch = batch;
             return;
         }
+        // A diff card was just pushed for this Write/Edit — its result ("File
+        // written") is implied by the card itself, so absorb a SUCCESS silently
+        // (no redundant `[ok]` line). A FAILURE still surfaces below so a failed
+        // write is never hidden.
+        if ok {
+            if let Some(last) = self.history.back() {
+                if matches!(last.kind, MessageBody::Diff(_)) {
+                    return;
+                }
+            }
+        }
         // No trailing tool row — fail-open to a plain status line (old look).
         let mark = if ok { "[ok]" } else { "[fail]" };
         let preview: String = summary.chars().take(100).collect();
@@ -1365,6 +1600,8 @@ impl App {
             match &mut msg.kind {
                 // A long tool result lives on the ToolCall's own `collapsed`.
                 MessageBody::Tool(t) => t.collapsed = !t.collapsed,
+                // A big diff card folds on its own `collapsed` flag.
+                MessageBody::Diff(d) => d.collapsed = !d.collapsed,
                 // A long text body uses the message-level `collapsed`.
                 MessageBody::Text(_) => msg.collapsed = !msg.collapsed,
             }
@@ -2647,7 +2884,7 @@ impl App {
                             }
                         }
                     }
-                    umadev_runtime::StreamEvent::ToolUse { name, detail } => {
+                    umadev_runtime::StreamEvent::ToolUse { name, detail, edit } => {
                         self.stream_text_active = false; // text stream interrupted
                                                          // A tool call is now in flight — a long one (npm install)
                                                          // is WORK, not a stall, so suppress the red signal until
@@ -2659,7 +2896,17 @@ impl App {
                         // `Bash`/`run` tool can be one). Cleared on its result.
                         self.long_op_in_progress =
                             matches!(name.as_str(), "Bash") && is_long_running_command(&detail);
-                        self.push_tool_use(&name, &detail);
+                        // P1: a Write/Edit that carries structured content renders
+                        // as a live diff card the moment the tool_use arrives (we
+                        // do NOT wait for the result). Any other tool — or an edit
+                        // with no recoverable content — falls back to the plain
+                        // tool row. Fully fail-open.
+                        match edit {
+                            Some(e) if matches!(name.as_str(), "Write" | "Edit" | "MultiEdit") => {
+                                self.push_diff(&e);
+                            }
+                            _ => self.push_tool_use(&name, &detail),
+                        }
                     }
                     umadev_runtime::StreamEvent::ToolResult { ok, summary } => {
                         self.stream_text_active = false;
@@ -5961,10 +6208,7 @@ impl App {
         }
 
         // Key entry point — the first recognizable app entry that exists on disk.
-        if let Some(entry) = ENTRIES
-            .iter()
-            .find(|p| self.project_root.join(p).is_file())
-        {
+        if let Some(entry) = ENTRIES.iter().find(|p| self.project_root.join(p).is_file()) {
             lines.push(umadev_i18n::tf(lang, "build.complete.entry", &[entry]));
         }
 
@@ -6706,6 +6950,9 @@ pub(crate) fn message_is_collapsible(m: &ChatMessage) -> bool {
             .result
             .as_deref()
             .is_some_and(|r| r.lines().count() > FOLD_THRESHOLD),
+        // A diff card is collapsible once it's large enough to be worth folding
+        // (the same threshold that drives its default-collapsed state).
+        MessageBody::Diff(d) => d.total_rows() > DIFF_FOLD_THRESHOLD,
     }
 }
 
@@ -8010,7 +8257,10 @@ mod tests {
         // No output dir / notes file → guidance message, no StartPreview.
         let action = app.slash_preview();
         assert!(matches!(action, Action::None));
-        assert!(app.history.iter().any(|m| m.body().contains("还没有可预览")));
+        assert!(app
+            .history
+            .iter()
+            .any(|m| m.body().contains("还没有可预览")));
     }
 
     #[test]
@@ -8061,7 +8311,10 @@ mod tests {
 
         // A web project resolves a dev-server target (Vite) → preview is pending.
         let target = app.auto_preview_target();
-        assert!(target.is_some(), "vite project must resolve a preview target");
+        assert!(
+            target.is_some(),
+            "vite project must resolve a preview target"
+        );
         let card = app.build_completion_card(target.is_some());
         // Headline + the three substantive sections.
         assert!(card.contains("构建完成"), "card carries the done headline");
@@ -8096,7 +8349,10 @@ mod tests {
             "a non-web project resolves no preview target"
         );
         let card = app.build_completion_card(false);
-        assert!(card.contains("构建完成"), "card still shows the done headline");
+        assert!(
+            card.contains("构建完成"),
+            "card still shows the done headline"
+        );
         assert!(card.contains("main.rs"), "card names the rust entry");
         assert!(
             !card.contains(umadev_i18n::t(app.lang, "build.complete.preview_starting")),
@@ -8964,7 +9220,8 @@ mod tests {
             .find(|m| m.role == ChatRole::Host)
             .unwrap();
         assert_eq!(
-            last.body(), "a finished reply",
+            last.body(),
+            "a finished reply",
             "no marker when nothing streamed"
         );
     }
@@ -10315,6 +10572,7 @@ mod tests {
             event: umadev_runtime::StreamEvent::ToolUse {
                 name: "Bash".into(),
                 detail: "npm install".into(),
+                edit: None,
             },
         });
         assert!(a.tool_in_progress, "ToolUse marks a tool in flight");
@@ -10622,6 +10880,7 @@ mod tests {
             event: umadev_runtime::StreamEvent::ToolUse {
                 name: "Read".into(),
                 detail: "Cargo.toml".into(),
+                edit: None,
             },
         });
         // Text after tool should be a NEW message, not appended to tool line
@@ -10640,18 +10899,21 @@ mod tests {
             event: umadev_runtime::StreamEvent::ToolUse {
                 name: "Read".into(),
                 detail: "file1".into(),
+                edit: None,
             },
         });
         a.apply_engine(EngineEvent::WorkerStream {
             event: umadev_runtime::StreamEvent::ToolUse {
                 name: "Read".into(),
                 detail: "file2".into(),
+                edit: None,
             },
         });
         a.apply_engine(EngineEvent::WorkerStream {
             event: umadev_runtime::StreamEvent::ToolUse {
                 name: "Read".into(),
                 detail: "file3".into(),
+                edit: None,
             },
         });
         let host_msgs: Vec<_> = a
@@ -10686,12 +10948,14 @@ mod tests {
             event: umadev_runtime::StreamEvent::ToolUse {
                 name: "Read".into(),
                 detail: "file1".into(),
+                edit: None,
             },
         });
         a.apply_engine(EngineEvent::WorkerStream {
             event: umadev_runtime::StreamEvent::ToolUse {
                 name: "Bash".into(),
                 detail: "npm test".into(),
+                edit: None,
             },
         });
         let host_msgs: Vec<_> = a
@@ -10724,6 +10988,7 @@ mod tests {
             event: umadev_runtime::StreamEvent::ToolUse {
                 name: "Edit".into(),
                 detail: "src/main.rs".into(),
+                edit: None,
             },
         });
         let last = a.history.back().unwrap();
@@ -10737,6 +11002,217 @@ mod tests {
     }
 
     #[test]
+    fn edit_with_content_pushes_a_diff_card_in_real_time() {
+        // P1: a Write/Edit carrying structured content renders a diff card the
+        // moment the tool_use arrives — we don't wait for the result.
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ToolUse {
+                name: "Edit".into(),
+                detail: "src/lib.rs".into(),
+                edit: Some(umadev_runtime::ToolEdit {
+                    path: "src/lib.rs".into(),
+                    before: "let x = 1;\nlet y = 2;\n".into(),
+                    after: "let x = 1;\nlet y = 3;\n".into(),
+                }),
+            },
+        });
+        let MessageBody::Diff(d) = &a.history.back().unwrap().kind else {
+            panic!("an edit with content must produce a Diff card, not a Tool row");
+        };
+        assert_eq!(d.path, "src/lib.rs");
+        assert_eq!(d.added, 1, "one line changed → one added");
+        assert_eq!(d.removed, 1, "…and one removed");
+        // The unchanged `let x = 1;` is kept as ±context around the change.
+        let all: Vec<(char, &str)> = d
+            .hunks
+            .iter()
+            .flat_map(|h| h.lines.iter())
+            .map(|l| (l.tag, l.text.as_str()))
+            .collect();
+        assert!(
+            all.contains(&(' ', "let x = 1;")),
+            "context line kept: {all:?}"
+        );
+        assert!(all.contains(&('-', "let y = 2;")), "deletion kept: {all:?}");
+        assert!(all.contains(&('+', "let y = 3;")), "addition kept: {all:?}");
+    }
+
+    #[test]
+    fn write_renders_as_all_additions_diff() {
+        // A Write is a fresh file: every line is an addition, none removed.
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ToolUse {
+                name: "Write".into(),
+                detail: "src/new.rs".into(),
+                edit: Some(umadev_runtime::ToolEdit {
+                    path: "src/new.rs".into(),
+                    before: String::new(),
+                    after: "fn a() {}\nfn b() {}\n".into(),
+                }),
+            },
+        });
+        let MessageBody::Diff(d) = &a.history.back().unwrap().kind else {
+            panic!("a Write with content must produce a Diff card");
+        };
+        assert_eq!(d.added, 2);
+        assert_eq!(d.removed, 0);
+        assert!(
+            d.hunks
+                .iter()
+                .flat_map(|h| h.lines.iter())
+                .all(|l| l.tag == '+'),
+            "every line of a fresh Write is an addition"
+        );
+    }
+
+    #[test]
+    fn diff_card_keeps_only_three_context_lines() {
+        // ±DIFF_CONTEXT: a far-away unchanged line is NOT kept in the hunk.
+        use std::fmt::Write as _;
+        let mut before = String::new();
+        let mut after = String::new();
+        for i in 0..20 {
+            let _ = writeln!(before, "line{i}");
+            if i == 10 {
+                after.push_str("line10-CHANGED\n");
+            } else {
+                let _ = writeln!(after, "line{i}");
+            }
+        }
+        let d = FileDiff::from_tool_edit(&umadev_runtime::ToolEdit {
+            path: "x.txt".into(),
+            before,
+            after,
+        });
+        let texts: Vec<&str> = d
+            .hunks
+            .iter()
+            .flat_map(|h| h.lines.iter())
+            .map(|l| l.text.as_str())
+            .collect();
+        // line7 is within 3 of the change (line10) → kept; line0 is far → dropped.
+        assert!(texts.contains(&"line7"), "±3 context kept: {texts:?}");
+        assert!(!texts.contains(&"line0"), "far line dropped");
+        assert_eq!(DIFF_CONTEXT, 3);
+    }
+
+    #[test]
+    fn noop_edit_falls_open_to_a_plain_tool_row() {
+        // Fail-open: an edit whose before==after (no real change → zero hunks)
+        // degrades to a plain tool row, never an empty diff card.
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ToolUse {
+                name: "Edit".into(),
+                detail: "same.rs".into(),
+                edit: Some(umadev_runtime::ToolEdit {
+                    path: "same.rs".into(),
+                    before: "unchanged\n".into(),
+                    after: "unchanged\n".into(),
+                }),
+            },
+        });
+        assert!(
+            matches!(a.history.back().unwrap().kind, MessageBody::Tool(_)),
+            "a no-op edit degrades to a plain tool row"
+        );
+    }
+
+    #[test]
+    fn diff_card_handles_cjk_content_without_panic() {
+        // CJK lines must not panic the diff builder (char-boundary safe) and must
+        // round-trip their content.
+        let d = FileDiff::from_tool_edit(&umadev_runtime::ToolEdit {
+            path: "说明.md".into(),
+            before: "第一行\n第二行\n".into(),
+            after: "第一行\n第二行改\n".into(),
+        });
+        assert_eq!(d.added, 1);
+        assert_eq!(d.removed, 1);
+        assert!(d
+            .hunks
+            .iter()
+            .flat_map(|h| h.lines.iter())
+            .any(|l| l.text == "第二行改"));
+    }
+
+    #[test]
+    fn diff_card_absorbs_a_success_result_silently() {
+        // After a diff card, a SUCCESS ToolResult is implied by the card itself —
+        // no redundant `[ok]` line is appended.
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ToolUse {
+                name: "Write".into(),
+                detail: "f.rs".into(),
+                edit: Some(umadev_runtime::ToolEdit {
+                    path: "f.rs".into(),
+                    before: String::new(),
+                    after: "fn x() {}\n".into(),
+                }),
+            },
+        });
+        let before = a.history.len();
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ToolResult {
+                ok: true,
+                summary: "File created successfully".into(),
+            },
+        });
+        assert_eq!(
+            a.history.len(),
+            before,
+            "a success after a diff card adds no extra line"
+        );
+        assert!(matches!(
+            a.history.back().unwrap().kind,
+            MessageBody::Diff(_)
+        ));
+    }
+
+    #[test]
+    fn big_diff_defaults_collapsed_and_ctrl_r_toggles() {
+        // A diff over the fold threshold defaults collapsed; Ctrl+R expands it
+        // (reusing the P6 fold lever).
+        use std::fmt::Write as _;
+        let before = String::new();
+        let mut after = String::new();
+        for i in 0..40 {
+            let _ = writeln!(after, "row{i}");
+        }
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ToolUse {
+                name: "Write".into(),
+                detail: "big.rs".into(),
+                edit: Some(umadev_runtime::ToolEdit {
+                    path: "big.rs".into(),
+                    before,
+                    after,
+                }),
+            },
+        });
+        {
+            let MessageBody::Diff(d) = &a.history.back().unwrap().kind else {
+                panic!("Diff card");
+            };
+            assert!(d.collapsed, "a big diff defaults collapsed");
+            assert!(d.total_rows() > DIFF_FOLD_THRESHOLD);
+        }
+        // Ctrl+R toggles the most-recent collapsible row → expanded.
+        let _ = a.apply_key_with_mods(
+            crossterm::event::KeyCode::Char('r'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        let MessageBody::Diff(d) = &a.history.back().unwrap().kind else {
+            panic!("Diff card");
+        };
+        assert!(!d.collapsed, "Ctrl+R expands the folded diff");
+    }
+
+    #[test]
     fn tool_result_attaches_to_the_running_row_and_auto_collapses_on_ok() {
         // A successful result flips the SAME row to Ok (not a new line) and
         // auto-collapses it; a row height stays stable pending→done.
@@ -10745,6 +11221,7 @@ mod tests {
             event: umadev_runtime::StreamEvent::ToolUse {
                 name: "Write".into(),
                 detail: "README.md".into(),
+                edit: None,
             },
         });
         let before = a.history.len();
@@ -10754,7 +11231,11 @@ mod tests {
                 summary: "wrote 12 lines".into(),
             },
         });
-        assert_eq!(a.history.len(), before, "result updates in place, no new row");
+        assert_eq!(
+            a.history.len(),
+            before,
+            "result updates in place, no new row"
+        );
         let MessageBody::Tool(t) = &a.history.back().unwrap().kind else {
             panic!("still a Tool row");
         };
@@ -10770,6 +11251,7 @@ mod tests {
             event: umadev_runtime::StreamEvent::ToolUse {
                 name: "Bash".into(),
                 detail: "cargo build".into(),
+                edit: None,
             },
         });
         a.apply_engine(EngineEvent::WorkerStream {
@@ -10794,6 +11276,7 @@ mod tests {
             event: umadev_runtime::StreamEvent::ToolUse {
                 name: "Grep".into(),
                 detail: "TODO".into(),
+                edit: None,
             },
         });
         a.apply_engine(EngineEvent::WorkerStream {
@@ -10825,6 +11308,7 @@ mod tests {
                 event: umadev_runtime::StreamEvent::ToolUse {
                     name: "Read".into(),
                     detail: format!("file{i}"),
+                    edit: None,
                 },
             });
         }
@@ -10854,6 +11338,7 @@ mod tests {
                 event: umadev_runtime::StreamEvent::ToolUse {
                     name: ev.0.into(),
                     detail: ev.1.into(),
+                    edit: None,
                 },
             });
         }
@@ -10884,16 +11369,10 @@ mod tests {
         );
         assert!(!a.history[idx].collapsed, "starts expanded");
         // Ctrl+R folds the most recent collapsible row.
-        let _ = a.apply_key_with_mods(
-            KeyCode::Char('r'),
-            crossterm::event::KeyModifiers::CONTROL,
-        );
+        let _ = a.apply_key_with_mods(KeyCode::Char('r'), crossterm::event::KeyModifiers::CONTROL);
         assert!(a.history[idx].collapsed, "Ctrl+R collapsed the wall");
         // Ctrl+R again expands it.
-        let _ = a.apply_key_with_mods(
-            KeyCode::Char('r'),
-            crossterm::event::KeyModifiers::CONTROL,
-        );
+        let _ = a.apply_key_with_mods(KeyCode::Char('r'), crossterm::event::KeyModifiers::CONTROL);
         assert!(!a.history[idx].collapsed, "Ctrl+R re-expanded the wall");
     }
 
@@ -10913,10 +11392,7 @@ mod tests {
         let mut a = fresh_app(Some("offline"));
         a.push(ChatRole::Host, "short");
         let before = a.clone();
-        let _ = a.apply_key_with_mods(
-            KeyCode::Char('r'),
-            crossterm::event::KeyModifiers::CONTROL,
-        );
+        let _ = a.apply_key_with_mods(KeyCode::Char('r'), crossterm::event::KeyModifiers::CONTROL);
         // No foldable row → history unchanged (fail-open).
         assert_eq!(a.history.len(), before.history.len());
         assert!(!a.history.back().unwrap().collapsed);
@@ -10962,7 +11438,10 @@ mod tests {
             },
         });
         let last = a.history.back().unwrap();
-        assert!(last.body().contains("[ok]"), "success should show checkmark");
+        assert!(
+            last.body().contains("[ok]"),
+            "success should show checkmark"
+        );
         assert!(last.body().contains("4.6.0"));
     }
 

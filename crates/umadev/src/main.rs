@@ -2205,7 +2205,7 @@ fn print_engine_event(event: &umadev_agent::EngineEvent) {
         // Now the base's body is visible: which file it writes, which command it
         // runs, and its streamed reasoning, exactly like the TUI render path.
         EngineEvent::WorkerStream { event } => match event {
-            umadev_runtime::StreamEvent::ToolUse { name, detail } => {
+            umadev_runtime::StreamEvent::ToolUse { name, detail, .. } => {
                 let d = detail.chars().take(100).collect::<String>();
                 eprintln!("  ● [{name}] {d}");
             }

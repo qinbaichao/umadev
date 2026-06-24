@@ -24,6 +24,9 @@ unicode-width = { workspace = true }
 # ratatui Line/Span compiler. The dependency-light constraint only binds the
 # spec / governance / contract crates, not the TUI.
 pulldown-cmark = { version = "0.13", default-features = false }
+# Pure-Rust line-level text diff for the Write/Edit diff card (P1). Lightweight,
+# no transitive ICU/parser trees — fits the pure-Rust / dependency-light bar.
+similar = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 anyhow = { workspace = true }

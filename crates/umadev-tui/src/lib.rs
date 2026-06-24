@@ -431,7 +431,10 @@ fn start_preview_server(
         if open_browser {
             let _ = open_url(url);
         }
-        sink.emit(EngineEvent::Note(umadev_i18n::tlf("preview.port_busy", &[url])));
+        sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+            "preview.port_busy",
+            &[url],
+        )));
     }
 }
 
@@ -2671,8 +2674,12 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                     react_to_first_write(Some(&reactive), &project_root, &sink);
                 }
                 let detail = session_tool_target(&input);
+                // P1: forward the structured before/after for a Write/Edit so the
+                // TUI draws a live diff card on the reactive session path too.
+                // Fail-open: non-edit / unreadable input → None → plain row.
+                let edit = umadev_runtime::ToolEdit::from_claude_tool_input(&name, &input);
                 sink.emit(EngineEvent::WorkerStream {
-                    event: umadev_runtime::StreamEvent::ToolUse { name, detail },
+                    event: umadev_runtime::StreamEvent::ToolUse { name, detail, edit },
                 });
             }
             umadev_runtime::SessionEvent::ToolResult { ok, summary } => {
@@ -4353,6 +4360,7 @@ mod tests {
             on_event(umadev_runtime::StreamEvent::ToolUse {
                 name: "Read".to_string(),
                 detail: "app.rs".to_string(),
+                edit: None,
             });
             on_event(umadev_runtime::StreamEvent::Text {
                 delta: "no bug found".to_string(),
@@ -5280,7 +5288,10 @@ mod tests {
             before,
             "no completion card for a zero-source phantom build"
         );
-        assert!(app.preview_server.lock().unwrap().is_none(), "no server started");
+        assert!(
+            app.preview_server.lock().unwrap().is_none(),
+            "no server started"
+        );
     }
 
     #[test]
@@ -5295,7 +5306,10 @@ mod tests {
         finalize_build_completion(&mut app, &sink);
         assert_eq!(app.history.len(), before + 1, "exactly one completion card");
         // Non-web (pure rust) → no dev server started.
-        assert!(app.preview_server.lock().unwrap().is_none(), "no server for a non-web build");
+        assert!(
+            app.preview_server.lock().unwrap().is_none(),
+            "no server for a non-web build"
+        );
     }
 
     #[test]
@@ -5311,7 +5325,10 @@ mod tests {
         let target = app.post_build_completion_card();
         assert!(target.is_none(), "non-web build resolves no preview target");
         assert_eq!(app.history.len(), before + 1, "exactly one card is pushed");
-        assert!(app.preview_server.lock().unwrap().is_none(), "no server started");
+        assert!(
+            app.preview_server.lock().unwrap().is_none(),
+            "no server started"
+        );
     }
 
     #[test]
@@ -5725,6 +5742,7 @@ mod tests {
             on_event(umadev_runtime::StreamEvent::ToolUse {
                 name: self.tool_name.to_string(),
                 detail: "src/App.tsx".to_string(),
+                edit: None,
             });
             (self.effect)();
             on_event(umadev_runtime::StreamEvent::Text {

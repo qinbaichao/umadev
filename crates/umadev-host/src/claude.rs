@@ -481,9 +481,11 @@ fn parse_claude_stream_line(line: &str) -> Option<umadev_runtime::StreamEvent> {
                     "tool_use" => {
                         let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
                         let detail = summarize_tool_input(name, block.get("input"));
+                        let edit = claude_tool_edit(name, block.get("input"));
                         return Some(umadev_runtime::StreamEvent::ToolUse {
                             name: name.to_string(),
                             detail,
+                            edit,
                         });
                     }
                     _ => {}
@@ -512,6 +514,20 @@ fn parse_claude_stream_line(line: &str) -> Option<umadev_runtime::StreamEvent> {
         }
         _ => None, // "result", "system", "rate_limit_event" — no display needed
     }
+}
+
+/// Pull a structured [`umadev_runtime::ToolEdit`] off a Claude `Edit` /
+/// `MultiEdit` / `Write` tool-call input, so the TUI can render a live diff
+/// card. Thin wrapper over [`umadev_runtime::ToolEdit::from_claude_tool_input`]
+/// (the shared extractor) that tolerates a missing `input`.
+///
+/// **Fail-open:** a missing/malformed input yields `None` and the caller falls
+/// back to the plain tool row.
+fn claude_tool_edit(
+    name: &str,
+    input: Option<&serde_json::Value>,
+) -> Option<umadev_runtime::ToolEdit> {
+    umadev_runtime::ToolEdit::from_claude_tool_input(name, input?)
 }
 
 /// Extract the final result text from a stream-json stdout.
@@ -940,9 +956,10 @@ mod tests {
         let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/tmp/Cargo.toml"}}]}}"#;
         let ev = parse_claude_stream_line(line).expect("should parse tool_use");
         match ev {
-            StreamEvent::ToolUse { name, detail } => {
+            StreamEvent::ToolUse { name, detail, edit } => {
                 assert_eq!(name, "Read");
                 assert_eq!(detail, "/tmp/Cargo.toml");
+                assert!(edit.is_none(), "a Read carries no structured edit");
             }
             _ => panic!("expected ToolUse, got {ev:?}"),
         }
@@ -953,12 +970,61 @@ mod tests {
         let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"npm install"}}]}}"#;
         let ev = parse_claude_stream_line(line).expect("should parse");
         match ev {
-            StreamEvent::ToolUse { name, detail } => {
+            StreamEvent::ToolUse { name, detail, .. } => {
                 assert_eq!(name, "Bash");
                 assert_eq!(detail, "npm install");
             }
             _ => panic!("expected ToolUse"),
         }
+    }
+
+    #[test]
+    fn parse_extracts_edit_as_tool_edit_before_after() {
+        // P1: an Edit tool call carries old_string/new_string — pass them through
+        // as a structured ToolEdit so the TUI can draw a diff card.
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"src/app.rs","old_string":"let x = 1;","new_string":"let x = 2;"}}]}}"#;
+        let ev = parse_claude_stream_line(line).expect("should parse Edit");
+        let StreamEvent::ToolUse { name, edit, .. } = ev else {
+            panic!("expected ToolUse, got {ev:?}");
+        };
+        assert_eq!(name, "Edit");
+        let edit = edit.expect("an Edit must carry a structured ToolEdit");
+        assert_eq!(edit.path, "src/app.rs");
+        assert_eq!(edit.before, "let x = 1;");
+        assert_eq!(edit.after, "let x = 2;");
+    }
+
+    #[test]
+    fn parse_extracts_write_as_all_additions() {
+        // P1: a Write is a fresh file — before is empty, after is the full
+        // content (an all-additions diff card).
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"file_path":"src/new.rs","content":"fn main() {}\n"}}]}}"#;
+        let ev = parse_claude_stream_line(line).expect("should parse Write");
+        let StreamEvent::ToolUse { edit, .. } = ev else {
+            panic!("expected ToolUse, got {ev:?}");
+        };
+        let edit = edit.expect("a Write must carry a structured ToolEdit");
+        assert_eq!(edit.path, "src/new.rs");
+        assert!(edit.before.is_empty(), "a fresh Write has no `before`");
+        assert_eq!(edit.after, "fn main() {}\n");
+    }
+
+    #[test]
+    fn claude_tool_edit_is_fail_open_on_bad_input() {
+        // Fail-open: a tool call missing the edit fields (or a non-edit tool)
+        // yields None instead of a fabricated / panicking card.
+        // Edit missing new_string → None.
+        assert!(claude_tool_edit(
+            "Edit",
+            Some(&serde_json::json!({"file_path": "a.rs", "old_string": "x"}))
+        )
+        .is_none());
+        // A non-edit tool → None.
+        assert!(
+            claude_tool_edit("Read", Some(&serde_json::json!({"file_path": "a.rs"}))).is_none()
+        );
+        // Missing input entirely → None.
+        assert!(claude_tool_edit("Write", None).is_none());
     }
 
     #[test]

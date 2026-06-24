@@ -363,10 +363,10 @@ fn recognize_tool_step(trimmed: &str) -> Option<umadev_runtime::StreamEvent> {
         _ => return None,
     };
     let detail: String = parts.next().unwrap_or("").trim().chars().take(80).collect();
-    Some(umadev_runtime::StreamEvent::ToolUse {
-        name: name.to_string(),
-        detail,
-    })
+    // opencode's step is scraped from a decorated gutter line — we only ever
+    // recover the tool name + a short detail, never the file's before/after
+    // content — so `edit` stays `None` and the TUI shows the plain tool row.
+    Some(umadev_runtime::StreamEvent::tool_use(name, detail))
 }
 
 #[async_trait]
@@ -684,9 +684,11 @@ mod tests {
         let ev = parse_opencode_stream_line("│  Read  src/app.tsx")
             .expect("gutter tool line should emit an event");
         match ev {
-            umadev_runtime::StreamEvent::ToolUse { name, detail } => {
+            umadev_runtime::StreamEvent::ToolUse { name, detail, edit } => {
                 assert_eq!(name, "Read");
                 assert_eq!(detail, "src/app.tsx");
+                // opencode's scraped gutter has no content → never a diff card.
+                assert!(edit.is_none(), "opencode gutter scrape carries no edit");
             }
             other => panic!("expected ToolUse, got {other:?}"),
         }

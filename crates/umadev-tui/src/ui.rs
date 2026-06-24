@@ -292,7 +292,7 @@ mod theme {
 }
 use ratatui::Frame;
 
-use crate::app::{App, AppMode, ChatRole, MessageBody, ToolCall, ToolStatus};
+use crate::app::{App, AppMode, ChatRole, FileDiff, MessageBody, ToolCall, ToolStatus};
 
 /// Set the terminal's light/dark classification, probed once at launch
 /// (OSC 11 + COLORFGBG) before raw mode. Re-exported from [`theme`].
@@ -2114,6 +2114,162 @@ fn result_gutter() -> String {
     s
 }
 
+/// Decimal digit count of `n` (`0`/`1`→1, `42`→2, …). Integer-only — no float
+/// `log10` cast — so the gutter width is computed without a lossy conversion.
+fn decimal_digits(mut n: u32) -> usize {
+    let mut d = 1;
+    while n >= 10 {
+        n /= 10;
+        d += 1;
+    }
+    d
+}
+
+/// Derive a syntax-highlighting language hint from a file path's extension. The
+/// returned token feeds [`highlight_code_line`] / `keywords_for`, which key off
+/// the extension directly (`rs` / `py` / `ts` / …). `None` when there's no
+/// extension — the highlighter then degrades to its plaintext heuristics
+/// (strings / numbers / comments), never a panic.
+fn lang_hint_from_path(path: &str) -> Option<String> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let ext = name.rsplit_once('.').map(|(_, e)| e)?;
+    if ext.is_empty() || ext.len() > 12 {
+        return None;
+    }
+    Some(ext.to_ascii_lowercase())
+}
+
+/// Render a structured file diff as a Claude-Code-style diff card (P1):
+///
+/// - a header `path (+N −M)` (the path syntax-neutral, the metric in
+///   add/del colors), framed by a dashed TOP/BOTTOM border (no left/right
+///   sides — it sits in the transcript flow);
+/// - one row per diff line: a FIXED-WIDTH left gutter = `digits(max_line_no)+3`
+///   columns holding the `+`/`-`/` ` marker + a right-aligned line number, then
+///   the line content syntax-highlighted by [`highlight_code_line`] keyed on the
+///   file extension;
+/// - all colors via [`SynRole`] (`DiffAdd`/`DiffDel`/`Muted`) — **no naked
+///   `Color`** — so a theme swap re-skins the card.
+///
+/// **Folding (P6 reuse):** a big diff (over the fold threshold) renders ONLY its
+/// header line with a `· Ctrl+R 展开` hint; expanding shows the hunks. Returns
+/// `(Line, hang)` pairs the way the transcript expects.
+///
+/// **Fail-open:** pure formatting over already-built data; never panics. CJK
+/// content is width-measured (`disp_width`) so a wide glyph never miscounts the
+/// gutter.
+fn diff_to_lines(d: &FileDiff, lang: umadev_i18n::Lang) -> Vec<(Line<'static>, usize)> {
+    let mut out: Vec<(Line<'static>, usize)> = Vec::new();
+
+    // ── Folded: just the header with the expand hint ──────────────────────
+    if d.collapsed {
+        let hint = umadev_i18n::t(lang, "tui.fold.expand_hint");
+        let text = umadev_i18n::tf(
+            lang,
+            "tui.diff.collapsed",
+            &[&d.path, &d.added.to_string(), &d.removed.to_string(), hint],
+        );
+        out.push((
+            Line::from(role_span(text, SynRole::Muted, Modifier::empty())),
+            2,
+        ));
+        return out;
+    }
+
+    // ── Header row: ┄┄ path (+N −M) (dashed top frame, no left/right sides) ─
+    let mut head: Vec<Span<'static>> = Vec::with_capacity(5);
+    head.push(role_span("┄┄ ", SynRole::Muted, Modifier::empty()));
+    head.push(Span::styled(
+        d.path.clone(),
+        Style::default()
+            .fg(theme::TEXT())
+            .add_modifier(Modifier::BOLD),
+    ));
+    head.push(role_span(" (", SynRole::Muted, Modifier::empty()));
+    head.push(role_span(
+        format!("+{}", d.added),
+        SynRole::DiffAdd,
+        Modifier::empty(),
+    ));
+    head.push(role_span(" ", SynRole::Muted, Modifier::empty()));
+    head.push(role_span(
+        format!("−{}", d.removed),
+        SynRole::DiffDel,
+        Modifier::empty(),
+    ));
+    head.push(role_span(") ", SynRole::Muted, Modifier::empty()));
+    out.push((Line::from(head), 2));
+
+    // Fixed gutter number column: enough digits for the largest line number.
+    let num_w = decimal_digits(d.max_line_no().max(1));
+
+    let lang_hint = lang_hint_from_path(&d.path);
+    let last_hunk = d.hunks.len().saturating_sub(1);
+    for (hi, hunk) in d.hunks.iter().enumerate() {
+        // A thin separator between non-adjacent hunks (a dim "⋮" under the gutter).
+        if hi > 0 {
+            out.push((
+                Line::from(role_span(
+                    format!("{:>w$} ⋮", "", w = num_w + 1),
+                    SynRole::Muted,
+                    Modifier::empty(),
+                )),
+                2,
+            ));
+        }
+        for dl in &hunk.lines {
+            // Fixed-width left gutter (no left frame char — dashed top/bottom
+            // only): marker + right-aligned line number + a space, width =
+            // digits(max_line_no)+3 (marker + space-after-number + trailing
+            // space). All colors from semantic roles.
+            let num = dl
+                .line_no
+                .map_or_else(|| " ".repeat(num_w), |n| format!("{n:>num_w$}"));
+            let marker_role = match dl.tag {
+                '+' => SynRole::DiffAdd,
+                '-' => SynRole::DiffDel,
+                _ => SynRole::Muted,
+            };
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            spans.push(role_span(
+                format!("{} {} ", dl.tag, num),
+                marker_role,
+                Modifier::empty(),
+            ));
+            // Content: syntax-highlight context/added lines per the file
+            // extension; a deletion is rendered uniformly in the delete color
+            // (the read is "this is gone", no need to re-color its tokens). An
+            // empty line still emits a (blank) row so line numbers stay
+            // continuous.
+            if dl.tag == '-' {
+                spans.push(role_span(
+                    dl.text.clone(),
+                    SynRole::DiffDel,
+                    Modifier::empty(),
+                ));
+            } else {
+                spans.extend(highlight_code_line(&dl.text, lang_hint.as_deref()));
+            }
+            out.push((Line::from(spans), 2));
+        }
+        // Dashed bottom frame after the final hunk (no left/right sides).
+        if hi == last_hunk {
+            out.push((
+                Line::from(role_span("┄┄┄┄┄┄┄┄┄┄", SynRole::Muted, Modifier::empty())),
+                2,
+            ));
+        }
+    }
+    // An empty diff (no hunks) still closes its frame so it never looks broken.
+    if d.hunks.is_empty() {
+        out.push((
+            Line::from(role_span("┄┄┄┄┄┄┄┄┄┄", SynRole::Muted, Modifier::empty())),
+            2,
+        ));
+    }
+    out
+}
+
 /// Render one structured tool call as a single status line plus (when present
 /// and not collapsed) its result in a dim gutter below.
 ///
@@ -2174,7 +2330,10 @@ fn render_tool_row(
         rendered.push((
             Line::from(vec![
                 Span::styled(prefix, Style::default().fg(theme::TEXT_MUTED())),
-                Span::styled((*line).to_string(), Style::default().fg(theme::TEXT_MUTED())),
+                Span::styled(
+                    (*line).to_string(),
+                    Style::default().fg(theme::TEXT_MUTED()),
+                ),
             ]),
             3,
         ));
@@ -2268,6 +2427,13 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
         // role-text match so its body never falls through to the prose path.
         if let MessageBody::Tool(tool) = &msg.kind {
             render_tool_row(tool, &mut rendered, app.lang, app.spinner());
+            continue;
+        }
+        // A structured diff card (P1) — a Write/Edit rendered as a real diff.
+        // Handled here for the same reason: it has its own renderer, never the
+        // prose path.
+        if let MessageBody::Diff(d) = &msg.kind {
+            rendered.extend(diff_to_lines(d, app.lang));
             continue;
         }
 
@@ -4544,6 +4710,122 @@ mod tests {
         assert!(
             !out.chars().any(|c| c.is_control() && c != '\n'),
             "no control chars in the rendered transcript"
+        );
+    }
+
+    // ── P1 diff-card rendering ────────────────────────────────────────────
+
+    #[test]
+    fn diff_card_renders_gutter_markers_and_add_del_colors() {
+        use crate::app::FileDiff;
+        let d = FileDiff::from_tool_edit(&umadev_runtime::ToolEdit {
+            path: "src/app.rs".into(),
+            before: "let x = 1;\nlet y = 2;\n".into(),
+            after: "let x = 1;\nlet y = 3;\n".into(),
+        });
+        let lines = diff_to_lines(&d, umadev_i18n::Lang::En);
+        // Header carries the path + the +N −M metric in add/del colors.
+        let header: String = lines[0]
+            .0
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(header.contains("src/app.rs"), "header path: {header}");
+        assert!(header.contains("+1"), "added metric: {header}");
+        assert!(header.contains("−1"), "removed metric: {header}");
+
+        // Find the added line's row: its FIRST span (the gutter) is the '+'
+        // marker, colored with the DiffAdd role.
+        let add_color = theme::syn_color(SynRole::DiffAdd);
+        let del_color = theme::syn_color(SynRole::DiffDel);
+        let mut saw_add_gutter = false;
+        let mut saw_del_gutter = false;
+        for (line, _) in &lines {
+            let Some(first) = line.spans.first() else {
+                continue;
+            };
+            let g = first.content.as_ref();
+            if g.starts_with('+') {
+                saw_add_gutter = true;
+                assert_eq!(first.style.fg, Some(add_color), "+ gutter uses DiffAdd");
+                // The gutter holds a right-aligned line number, not naked text.
+                assert!(
+                    g.chars().any(|c| c.is_ascii_digit()),
+                    "gutter has a line no: {g:?}"
+                );
+            } else if g.starts_with('-') {
+                saw_del_gutter = true;
+                assert_eq!(first.style.fg, Some(del_color), "- gutter uses DiffDel");
+            }
+        }
+        assert!(saw_add_gutter, "an added row with a + gutter renders");
+        assert!(saw_del_gutter, "a removed row with a - gutter renders");
+    }
+
+    #[test]
+    fn collapsed_diff_card_renders_only_the_header_with_expand_hint() {
+        use crate::app::FileDiff;
+        // A big diff defaults collapsed → just the header + the Ctrl+R hint.
+        use std::fmt::Write as _;
+        let mut after = String::new();
+        for i in 0..40 {
+            let _ = writeln!(after, "row{i}");
+        }
+        let d = FileDiff::from_tool_edit(&umadev_runtime::ToolEdit {
+            path: "big.rs".into(),
+            before: String::new(),
+            after,
+        });
+        assert!(d.collapsed);
+        let lines = diff_to_lines(&d, umadev_i18n::Lang::En);
+        assert_eq!(lines.len(), 1, "folded card is a single header row");
+        let text: String = lines[0]
+            .0
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("big.rs"));
+        assert!(text.contains("expand"), "shows the expand hint: {text}");
+    }
+
+    #[test]
+    fn diff_card_renders_end_to_end_without_panic_or_control_bytes() {
+        // A Write/Edit diff card paints to a real buffer cleanly (CJK-safe).
+        let mut app = app_with(Some("offline"));
+        app.apply_engine(umadev_agent::EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ToolUse {
+                name: "Edit".into(),
+                detail: "面板.rs".into(),
+                edit: Some(umadev_runtime::ToolEdit {
+                    path: "面板.rs".into(),
+                    before: "第一行\n".into(),
+                    after: "第一行改\n".into(),
+                }),
+            },
+        });
+        let out = render_chat_at(&app, 60, 24);
+        // The TestBackend pads each wide CJK glyph with a trailing space cell, so
+        // assert on the card's ASCII landmarks (the dashed frame, the +N −M
+        // metric, the +/- gutter markers) + the CJK content char, not a literal
+        // contiguous "面板.rs".
+        assert!(
+            out.contains('面') && out.contains('板'),
+            "CJK header path on screen: {out}"
+        );
+        assert!(out.contains("┄┄"), "dashed top frame on screen: {out}");
+        assert!(
+            out.contains("+1") && out.contains("−1"),
+            "metric on screen: {out}"
+        );
+        assert!(
+            out.contains("第") && out.contains("改"),
+            "diff content on screen: {out}"
+        );
+        assert!(
+            !out.chars().any(|c| c.is_control() && c != '\n'),
+            "no control chars in the diff card"
         );
     }
 }
