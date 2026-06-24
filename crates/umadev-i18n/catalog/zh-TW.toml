@@ -270,6 +270,9 @@
 # /run and /redo
 "run.busy_reopen" = "流水線正在跑 — 先 /cancel 停掉再重開,避免兩個流水線同時寫同一個工作區。"
 "run.usage" = "用法:/run [slug] <需求>\n  範例:/run my-app 做一個登入系統\n  範例:/run 做一個 todo list (slug 自動用目錄名)"
+"goal.busy_reopen" = "已經有任務在跑 — 先 /cancel 停掉再 /goal,避免兩個任務同時寫同一個工作區。"
+"goal.usage" = "用法:/goal <目標>\n  範例:/goal 做一個能上線的待辦應用,帶登入和提醒\n  設定一個目標後,我會帶團隊朝它一直做到達成(底座支援持續模式時用其原生 /goal)。"
+"goal.starting" = "[goal] 收到目標:\"{}\"。我會帶團隊朝它持續推進,直到做完、建置/品質校驗通過為止(中途想停用 /cancel)。"
 "run.slug_invalid" = "slug `{}` 包含非法字元。只允許字母、數字、`-`、`_`。"
 "redo.busy" = "流水線正在跑 — 先 /cancel 停掉再 /redo,避免兩個流水線同時寫同一個工作區。"
 "redo.no_requirement" = "還沒有跑過任何需求 — 直接輸入需求或用 /run 啟動。"

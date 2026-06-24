@@ -80,6 +80,13 @@ pub enum Action {
     Continue(Gate),
     /// User submitted a fresh requirement — start the initial pipeline block.
     StartRun(String),
+    /// `/goal <objective>` — start a goal-driven director build: the base keeps
+    /// working toward the objective until it's met (Claude Code's native persistent
+    /// `/goal` framing on a capable base; a "don't stop early" prompt fallback on
+    /// the rest). Rides the SAME director-build path as [`Self::StartRun`] with the
+    /// full system (design / team / knowledge / evolution); the only difference is
+    /// the goal-mode flag the event loop forwards into the director loop.
+    StartGoal(String),
     /// `/quick <task>` — run the lightweight fast track (spec-lite -> implement
     /// -> quality, no gates) for a trivial change instead of the full pipeline.
     StartQuick(String),
@@ -1511,6 +1518,10 @@ impl App {
             "pick a seed template (e.g. /template dashboard)",
         ),
         ("run", "start a new run (/run [slug] <requirement>)"),
+        (
+            "goal",
+            "set a goal — keep the base working until it's met (/goal <objective>)",
+        ),
         (
             "quick",
             "lightweight fast track for a trivial task (/quick <task>)",
@@ -3506,6 +3517,7 @@ impl App {
             "design" => self.slash_design(rest),
             "template" => self.slash_template(rest),
             "run" => self.slash_run(rest),
+            "goal" => self.slash_goal(rest),
             "quick" => self.slash_quick(rest),
             "plan" => self.slash_plan(rest),
             "status" => {
@@ -4155,6 +4167,43 @@ impl App {
         self.maybe_suggest_design();
         self.push_preflight(&req);
         Action::StartRun(req)
+    }
+
+    /// `/goal <objective>` — start a GOAL-DRIVEN director build: drive the borrowed
+    /// brain toward `<objective>` until it's met (Claude Code's native persistent
+    /// `/goal` mode on a capable base; a "don't stop early" prompt fallback on the
+    /// rest — the director loop drives both to completion). It rides the SAME
+    /// director-build path as [`Self::slash_run`] (full design / team / knowledge /
+    /// evolution + budget), so the only behavioural difference is the goal-mode
+    /// framing the event loop forwards. The whole arg IS the objective (no `slug`
+    /// prefix parsing — a goal is a sentence, not a project name); empty → a usage
+    /// hint. Busy-pipeline + design-suggest + preflight are reused verbatim from
+    /// `/run`, so the hardened interaction (streaming / alive / ESC / queue / memory)
+    /// is identical.
+    fn slash_goal(&mut self, arg: &str) -> Action {
+        if self.is_pipeline_active() {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "goal.busy_reopen"),
+            );
+            return Action::None;
+        }
+        let objective = arg.trim();
+        if objective.is_empty() {
+            self.push(ChatRole::System, umadev_i18n::t(self.lang, "goal.usage"));
+            return Action::None;
+        }
+        let objective = objective.to_string();
+        if self.run_started {
+            self.reset_for_new_run();
+        }
+        self.maybe_suggest_design();
+        self.push(
+            ChatRole::UmaDev,
+            umadev_i18n::tf(self.lang, "goal.starting", &[&objective]),
+        );
+        self.push_preflight(&objective);
+        Action::StartGoal(objective)
     }
 
     fn open_status_overlay(&mut self) {
@@ -7977,6 +8026,44 @@ mod tests {
         let action = app.apply_key(KeyCode::Enter);
         assert_eq!(action, Action::None);
         assert!(app.history.iter().any(|m| m.body.contains("/revise")));
+    }
+
+    #[test]
+    fn slash_goal_with_objective_starts_a_goal_driven_build() {
+        // `/goal <objective>` → a goal-driven director build (StartGoal), carrying
+        // the whole arg as the objective (no slug parsing — a goal is a sentence).
+        let mut app = fresh_app(Some("offline"));
+        for c in "/goal build a shippable todo app".chars() {
+            let _ = app.apply_key(KeyCode::Char(c));
+        }
+        let action = app.apply_key(KeyCode::Enter);
+        assert_eq!(
+            action,
+            Action::StartGoal("build a shippable todo app".to_string())
+        );
+        // A goal acknowledgement was surfaced to the user (the `goal.starting` line).
+        assert!(app
+            .history
+            .iter()
+            .any(|m| m.body.contains("build a shippable todo app")));
+    }
+
+    #[test]
+    fn slash_goal_without_objective_is_noop_with_usage_hint() {
+        // Empty `/goal` → a usage hint, no build kicked off.
+        let mut app = fresh_app(Some("offline"));
+        for c in "/goal".chars() {
+            let _ = app.apply_key(KeyCode::Char(c));
+        }
+        let action = app.apply_key(KeyCode::Enter);
+        assert_eq!(action, Action::None);
+        assert!(app.history.iter().any(|m| m.body.contains("/goal")));
+    }
+
+    #[test]
+    fn goal_is_a_registered_slash_verb() {
+        // The `/goal` verb is in the palette so completion + help surface it.
+        assert!(App::SLASH_VERBS.iter().any(|(v, _)| *v == "goal"));
     }
 
     #[test]

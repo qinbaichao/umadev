@@ -696,6 +696,7 @@ fn spawn_director_loop(
     autonomous: bool,
     conversation: Vec<Message>,
     route_override: Option<RoutePlan>,
+    goal_mode: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_director_loop(
         options,
@@ -704,6 +705,7 @@ fn spawn_director_loop(
         autonomous,
         conversation,
         route_override,
+        goal_mode,
     ))
 }
 
@@ -723,6 +725,7 @@ async fn run_director_loop(
     autonomous: bool,
     conversation: Vec<Message>,
     route_override: Option<RoutePlan>,
+    goal_mode: bool,
 ) {
     {
         let backend = options.backend.clone();
@@ -840,6 +843,24 @@ async fn run_director_loop(
         let directive = match firmware.as_deref() {
             Some(fw) if backend != "claude-code" => format!("{fw}\n\n---\n\n{goal}"),
             _ => goal,
+        };
+        // GOAL MODE (mirrors the legacy pipeline's `with_goal_mode`): front-load a
+        // persistent-`/goal` framing so the base keeps working until the objective is
+        // met instead of stopping early. `goal_mode` is set by the `/goal` command
+        // (and defaulted on for every director build — Claude Code's native persistent
+        // mode is strictly stronger than a plain prompt loop). The ENCODING follows the
+        // borrowed brain's CAPABILITY: a native-`/goal` base (claude) gets a real
+        // `/goal` command, codex / opencode get the same intent as a prompt fallback
+        // (the director loop drives them to completion regardless). It MUST be the very
+        // first thing the base reads, so it prepends ahead of the firmware block too.
+        // Fail-open: `UMADEV_NO_GOAL_MODE=1`, or a backend whose capabilities can't be
+        // read, leaves the directive exactly as before.
+        let directive = match resolve_goal_mode(&backend, goal_mode) {
+            Some(persistent_goal) => format!(
+                "{}{directive}",
+                umadev_agent::experts::goal_mode_prefix(&options.requirement, persistent_goal)
+            ),
+            None => directive,
         };
         let sink_dyn: Arc<dyn EventSink> = sink.clone();
         // Drive the loop ROUTED (Blocker #1 fix): pass the route computed at the top
@@ -1698,6 +1719,32 @@ fn director_directive_with_history(
         "chat.director_build_with_history",
         &[transcript.trim_end(), &goal],
     )
+}
+
+/// Whether THIS director build should front-load a goal-mode framing — and, if so,
+/// whether the borrowed brain has NATIVE persistent-`/goal` support.
+///
+/// `goal_mode` is the `/goal`-command flag: every director build can OPT INTO the
+/// goal framing (the universal enhancement — Claude Code's native persistent mode
+/// is strictly stronger than a plain prompt loop), but the explicit `/goal` command
+/// is the one that always carries it. The `UMADEV_NO_GOAL_MODE=1` opt-out (shared
+/// verbatim with the legacy pipeline's `with_goal_mode`) suppresses it on every
+/// path. When framing IS applied, the borrowed brain's
+/// [`BrainCapabilities::persistent_goal`](umadev_runtime::BrainCapabilities) is read
+/// from the backend id via [`umadev_host::driver_for`] — claude → native `/goal`,
+/// codex / opencode → the prompt-level fallback.
+///
+/// **Fail-open by contract:** an unknown / unbuildable backend id (offline, a typo)
+/// can't report capabilities → `None`, so NO goal framing is prepended and the
+/// directive degrades to exactly today's behaviour. Reads the env once at the call
+/// boundary (the build is about to start), never mid-loop.
+fn resolve_goal_mode(backend: &str, goal_mode: bool) -> Option<bool> {
+    if !goal_mode || std::env::var("UMADEV_NO_GOAL_MODE").as_deref() == Ok("1") {
+        return None;
+    }
+    // Capability, not a host-id string: ask the driver what the brain can do. An
+    // offline / unknown backend has no driver → no goal framing (fail-open).
+    umadev_host::driver_for(backend).map(|d| d.capabilities().persistent_goal)
 }
 
 /// Build the tools-unlocked execution request and drive the base's streaming
@@ -3312,7 +3359,21 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                 while route_rx.try_recv().is_ok() {}
                                 app.cancel_run();
                             }
-                            Action::StartRun(req) => {
+                            Action::StartRun(req) | Action::StartGoal(req) => {
+                                // `/goal <objective>` and `/run` BOTH ride this one
+                                // director-build path (the orchestration that owns the
+                                // plan / team / firmware / finalize). Both opt into goal
+                                // mode (the universal enhancement — Claude Code's native
+                                // persistent `/goal` is strictly stronger than a plain
+                                // prompt loop), so the base gets a persistent-`/goal`
+                                // framing — "keep working until the objective is met."
+                                // `StartGoal` is a distinct Action only so the `/goal`
+                                // command can carry its own usage / preflight in
+                                // `slash_goal`; from here the build branch is shared
+                                // byte-for-byte. The framing itself is applied inside
+                                // `run_director_loop`, gated by the brain's capability +
+                                // `UMADEV_NO_GOAL_MODE` (so it fully reverts).
+                                let goal_mode = true;
                                 // Wave 1 (docs/AGENT_WIELDS_BASE_ARCHITECTURE.md §5):
                                 // an explicit `/run` is now the DIRECTOR-driven agentic
                                 // path by default — the SAME engine a free-text message
@@ -3369,6 +3430,9 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                         // `None` → `for_run` FORCES a Build (the
                                         // explicit-run contract), unchanged.
                                         None,
+                                        // `/goal` (and `/run`) → persistent-goal framing,
+                                        // gated by capability + opt-out inside the loop.
+                                        goal_mode,
                                     ));
                                 } else {
                                     // LEGACY (opt-in) or offline / non-host: drive the
@@ -3907,6 +3971,41 @@ mod tests {
         let only_current = vec![msg("user", "build a forum")];
         let out2 = director_directive_with_history(&only_current, "build a forum", goal.clone());
         assert_eq!(out2, goal);
+    }
+
+    #[test]
+    fn resolve_goal_mode_reads_the_brain_capability_per_backend() {
+        // GOAL MODE wiring: a director build with `goal_mode` on resolves the
+        // borrowed brain's `persistent_goal` capability from the backend id. ALL
+        // THREE first-class bases (claude-code / codex / opencode) support a native
+        // persistent `/goal` mode, so each resolves to Some(true).
+        assert_eq!(resolve_goal_mode("claude-code", true), Some(true));
+        assert_eq!(resolve_goal_mode("codex", true), Some(true));
+        assert_eq!(resolve_goal_mode("opencode", true), Some(true));
+    }
+
+    #[test]
+    fn resolve_goal_mode_is_fail_open_off() {
+        // `goal_mode == false` (a build that did not opt in) → no framing.
+        assert_eq!(resolve_goal_mode("claude-code", false), None);
+        // An unknown / offline backend has no driver → no capability, no framing
+        // (fail-open: the directive degrades to exactly today's behaviour).
+        assert_eq!(resolve_goal_mode("nonexistent-backend", true), None);
+        assert_eq!(resolve_goal_mode("offline", true), None);
+    }
+
+    #[test]
+    fn resolve_goal_mode_honors_the_no_goal_opt_out() {
+        // `UMADEV_NO_GOAL_MODE=1` suppresses goal framing on EVERY path (shared
+        // verbatim with the legacy pipeline's `with_goal_mode`). The env guard is
+        // global, so scope the mutation tightly and restore it.
+        let prev = std::env::var("UMADEV_NO_GOAL_MODE").ok();
+        std::env::set_var("UMADEV_NO_GOAL_MODE", "1");
+        assert_eq!(resolve_goal_mode("claude-code", true), None);
+        match prev {
+            Some(v) => std::env::set_var("UMADEV_NO_GOAL_MODE", v),
+            None => std::env::remove_var("UMADEV_NO_GOAL_MODE"),
+        }
     }
 
     #[test]
@@ -5269,7 +5368,7 @@ mod tests {
 
         // Drive the director loop body directly (no spawn): the session start fails
         // open AFTER the baseline write, so the loop returns cleanly.
-        run_director_loop(options, sink, route_tx, false, Vec::new(), None).await;
+        run_director_loop(options, sink, route_tx, false, Vec::new(), None, false).await;
 
         // The baseline is on disk and carries the run's identity — exactly what the
         // CLI surfaces read.

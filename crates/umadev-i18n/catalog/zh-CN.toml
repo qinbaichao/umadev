@@ -270,6 +270,9 @@
 # /run and /redo
 "run.busy_reopen" = "流水线正在跑 — 先 /cancel 停掉再重开,避免两个流水线同时写同一个工作区。"
 "run.usage" = "用法:/run [slug] <需求>\n  示例:/run my-app 做一个登录系统\n  示例:/run 做一个 todo list (slug 自动用目录名)"
+"goal.busy_reopen" = "已经有任务在跑 — 先 /cancel 停掉再 /goal,避免两个任务同时写同一个工作区。"
+"goal.usage" = "用法:/goal <目标>\n  示例:/goal 做一个能上线的待办应用,带登录和提醒\n  设定一个目标后,我会带团队朝它一直干到达成(底座支持持续模式时用其原生 /goal)。"
+"goal.starting" = "[goal] 收到目标:\"{}\"。我会带团队朝它持续推进,直到做完、构建/质量校验通过为止(中途想停用 /cancel)。"
 "run.slug_invalid" = "slug `{}` 包含非法字符。只允许字母、数字、`-`、`_`。"
 "redo.busy" = "流水线正在跑 — 先 /cancel 停掉再 /redo,避免两个流水线同时写同一个工作区。"
 "redo.no_requirement" = "还没有跑过任何需求 — 直接输入需求或用 /run 启动。"

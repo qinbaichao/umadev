@@ -270,6 +270,9 @@
 # /run and /redo
 "run.busy_reopen" = "A pipeline is running — /cancel it before starting again, to avoid two pipelines writing the same workspace."
 "run.usage" = "Usage: /run [slug] <requirement>\n  Example: /run my-app build a login system\n  Example: /run build a todo list (slug auto-uses the directory name)"
+"goal.busy_reopen" = "A task is already running — /cancel it before /goal, to avoid two tasks writing the same workspace."
+"goal.usage" = "Usage: /goal <objective>\n  Example: /goal build a shippable todo app with login and reminders\n  Set a goal and I'll lead the team toward it until it's met (using the base's native persistent /goal when it supports one)."
+"goal.starting" = "[goal] Goal received: \"{}\". I'll drive the team toward it until it's done and the build/quality checks pass (/cancel to stop mid-way)."
 "run.slug_invalid" = "slug `{}` contains illegal characters. Only letters, digits, `-`, `_` are allowed."
 "redo.busy" = "A pipeline is running — /cancel it before /redo, to avoid two pipelines writing the same workspace."
 "redo.no_requirement" = "No requirement has been run yet — just type a requirement or use /run to start."

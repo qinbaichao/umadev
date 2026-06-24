@@ -176,11 +176,16 @@ impl Runtime for OpenCodeDriver {
     }
 
     fn capabilities(&self) -> umadev_runtime::BrainCapabilities {
-        // OpenCode has no `/goal` mode, no structured stream-json (its
-        // `complete_streaming` override forwards plain-text lines, but there's
-        // no machine-readable event schema), no usage on stdout, and no
-        // PreToolUse hook — the most conservative of the three CLIs.
-        umadev_runtime::BrainCapabilities::default()
+        // OpenCode supports a persistent `/goal` mode (keep working until the
+        // objective is met), so UmaDev frames a goal-driven build with the native
+        // `/goal` directive — same as claude / codex. It still has no structured
+        // stream-json (its `complete_streaming` forwards plain-text lines, no
+        // machine-readable event schema), no usage on stdout, and no PreToolUse hook
+        // — otherwise the most conservative of the three CLIs.
+        umadev_runtime::BrainCapabilities {
+            persistent_goal: true,
+            ..umadev_runtime::BrainCapabilities::default()
+        }
     }
 
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, RuntimeError> {

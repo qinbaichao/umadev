@@ -822,6 +822,53 @@ pub fn director_build_directive(requirement: &str) -> String {
     )
 }
 
+/// Frame a director build as a **goal-driven, run-until-met** directive prefix.
+///
+/// Mirrors the legacy pipeline's `with_goal_mode` (runner.rs): a borrowed brain
+/// with NATIVE persistent-goal mode (Claude Code's `/goal`) gets a real `/goal`
+/// command front-loaded so the base keeps working until the objective is met
+/// instead of stopping early with a half-built result; a base WITHOUT native
+/// `/goal` (codex / opencode) gets a strong prompt-level fallback that achieves
+/// the same intent (the director loop itself also drives to completion). The
+/// `commercial` clause is the single most important thing a goal command makes
+/// explicit: COMMERCIAL-GRADE and COMPLETE, never a demo / stub / placeholder.
+///
+/// `persistent_goal` is the borrowed brain's `BrainCapabilities::persistent_goal`
+/// — the CAPABILITY, not a host-id string — so the encoding is chosen by what the
+/// brain can do, exactly like the legacy path. Pure + deterministic (no env / IO)
+/// so it is trivially testable; the `UMADEV_NO_GOAL_MODE=1` opt-out and the
+/// capability lookup are the CALLER's responsibility (fail-open: no prefix on
+/// opt-out or when capabilities can't be read).
+///
+/// The returned string is meant to be prepended to the FRONT of the build
+/// directive so the `/goal` line is the very first thing the base reads.
+#[must_use]
+pub fn goal_mode_prefix(requirement: &str, persistent_goal: bool) -> String {
+    let req = requirement.trim();
+    // The standard the director holds the base to — COMMERCIAL-GRADE + COMPLETE,
+    // not a demo / skeleton / MVP-stub / placeholder. Shared verbatim with the
+    // legacy `with_goal_mode` so both paths hold the base to the same bar.
+    let commercial = "做到**商业级、完整可用**:实现需求里的**每一个**功能/路由/验收点\
+         (不是子集、不是演示版);每条交互都有真实的加载/空/错误/边界处理;用真实的数据\
+         流与接口对接,**绝不**交 demo、占位、Lorem、mock-only 或带 TODO 的半成品。把它\
+         当成要直接上线给真实用户用的产品来写。";
+    if persistent_goal {
+        // Native persistent mode → a real `/goal` command (mirrors runner.rs).
+        format!(
+            "/goal 完成「{req}」这个目标。你是项目总监,带领你的团队把它做出来 —— 自己\
+             决定计划、引入哪些角色、用多少流程。{commercial}这个目标的全部任务做完、运行/\
+             构建与质量校验通过之前不要停下;声明完成前再核对一遍有没有遗漏。\n\n---\n\n"
+        )
+    } else {
+        // No native `/goal` → a strong prompt-level fallback with the SAME intent.
+        format!(
+            "这是一个持续目标:完成「{req}」。你是项目总监,带领团队把它做到底 —— 自己决定\
+             计划与角色编排。{commercial}做完每一项、运行/构建与质量校验通过之前不要停;\
+             声明完成前再核对一遍这个目标有没有遗漏。\n\n---\n\n"
+        )
+    }
+}
+
 /// Truncate `text` to at most `max_chars` characters, keeping head.
 /// Returns text with a trailing `…` marker when it had to cut.
 #[must_use]
@@ -991,6 +1038,39 @@ mod tests {
         assert!(lower.contains("complete") && lower.contains("product"));
         // The full seat roster is named (the heavy path only).
         assert!(lower.contains("architect") && lower.contains("devops"));
+    }
+
+    #[test]
+    fn goal_mode_prefix_uses_native_goal_for_a_persistent_base() {
+        // A brain with native persistent-goal mode (claude) gets a REAL `/goal`
+        // command, front-loaded so it is the first line the base reads.
+        let p = goal_mode_prefix("做一个带邮箱登录的 SaaS 落地页", true);
+        assert!(p.starts_with("/goal "), "must lead with /goal: {p}");
+        // The objective is carried verbatim.
+        assert!(p.contains("做一个带邮箱登录的 SaaS 落地页"));
+        // The commercial-grade / complete bar is explicit (mirrors runner.rs).
+        assert!(p.contains("商业级") && p.contains("绝不"));
+        // "Don't stop until the goal is met."
+        assert!(p.contains("不要停"));
+        // It ends with the separator so it prepends cleanly onto the directive.
+        assert!(p.trim_end().ends_with("---"));
+    }
+
+    #[test]
+    fn goal_mode_prefix_falls_back_to_a_prompt_for_a_non_persistent_base() {
+        // A brain WITHOUT native `/goal` (codex / opencode) gets the SAME intent as
+        // a prompt-level fallback — but NEVER the literal `/goal` command (which
+        // those bases don't understand).
+        let p = goal_mode_prefix("做一个待办应用", false);
+        assert!(
+            !p.starts_with("/goal "),
+            "no literal /goal on a non-persistent base: {p}"
+        );
+        assert!(p.contains("持续目标"));
+        assert!(p.contains("做一个待办应用"));
+        // Same commercial-grade bar + "don't stop early" intent.
+        assert!(p.contains("商业级"));
+        assert!(p.contains("不要停"));
     }
 
     #[test]
