@@ -672,7 +672,26 @@ fn summarize_tool_input(name: &str, input: Option<&serde_json::Value>) -> String
     // Grep/Glob → pattern; WebSearch → query.
     let get_str = |key: &str| input.get(key).and_then(|v| v.as_str()).unwrap_or("");
     match name {
-        "Read" | "Write" | "Edit" | "NotebookEdit" => {
+        "Read" => {
+            let p = {
+                let fp = get_str("file_path");
+                if fp.is_empty() {
+                    get_str("path")
+                } else {
+                    fp
+                }
+            };
+            // Surface the line window when the model reads a slice (offset/limit),
+            // language-neutral: `L<from>-<to>` or `L<from>+`.
+            let offset = input.get("offset").and_then(serde_json::Value::as_u64);
+            let limit = input.get("limit").and_then(serde_json::Value::as_u64);
+            match (offset, limit) {
+                (Some(o), Some(l)) if l > 0 => format!("{p} · L{o}-{}", o + l - 1),
+                (Some(o), _) if o > 0 => format!("{p} · L{o}+"),
+                _ => p.to_string(),
+            }
+        }
+        "Write" | "Edit" | "NotebookEdit" => {
             let p = get_str("file_path");
             if p.is_empty() {
                 get_str("path").to_string()
@@ -681,7 +700,33 @@ fn summarize_tool_input(name: &str, input: Option<&serde_json::Value>) -> String
             }
         }
         "Bash" => get_str("command").to_string(),
-        "Grep" | "Glob" => get_str("pattern").to_string(),
+        "Grep" => {
+            // Pattern + its search scope (path or glob), so a search reads as
+            // `<pattern> · <where>` instead of a bare regex.
+            let pat = get_str("pattern");
+            let scope = {
+                let path = get_str("path");
+                if path.is_empty() {
+                    get_str("glob")
+                } else {
+                    path
+                }
+            };
+            if scope.is_empty() {
+                pat.to_string()
+            } else {
+                format!("{pat} · {scope}")
+            }
+        }
+        "Glob" => {
+            let pat = get_str("pattern");
+            let path = get_str("path");
+            if path.is_empty() {
+                pat.to_string()
+            } else {
+                format!("{pat} · {path}")
+            }
+        }
         "WebSearch" | "WebFetch" => get_str("query").to_string(),
         "Task" | "Agent" => get_str("description").to_string(),
         _ => {
@@ -1109,6 +1154,29 @@ mod tests {
         assert_eq!(summarize_tool_input("Grep", Some(&grep_input)), "TODO");
 
         assert_eq!(summarize_tool_input("Unknown", None), "");
+
+        // Read with a line window surfaces it (language-neutral).
+        let read_slice = serde_json::json!({"file_path": "/a.rs", "offset": 10, "limit": 5});
+        assert_eq!(
+            summarize_tool_input("Read", Some(&read_slice)),
+            "/a.rs · L10-14"
+        );
+        let read_from = serde_json::json!({"file_path": "/a.rs", "offset": 30});
+        assert_eq!(
+            summarize_tool_input("Read", Some(&read_from)),
+            "/a.rs · L30+"
+        );
+        // Grep with a path/glob scope reads as `pattern · where`.
+        let grep_scope = serde_json::json!({"pattern": "fn foo", "path": "src/"});
+        assert_eq!(
+            summarize_tool_input("Grep", Some(&grep_scope)),
+            "fn foo · src/"
+        );
+        let glob_scope = serde_json::json!({"pattern": "**/*.rs", "path": "crates/"});
+        assert_eq!(
+            summarize_tool_input("Glob", Some(&glob_scope)),
+            "**/*.rs · crates/"
+        );
     }
 
     #[test]
