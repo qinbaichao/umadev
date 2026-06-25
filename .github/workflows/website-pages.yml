@@ -45,7 +45,7 @@ jobs:
         env:
           GITHUB_PAGES: "true"
           GITHUB_PAGES_REPO: umadev
-          GITHUB_PAGES_DOMAIN: umadev.umayun.com
+          GITHUB_PAGES_DOMAIN: umadev.goder.ai
         run: npm run build
 
       - name: Upload Pages artifact

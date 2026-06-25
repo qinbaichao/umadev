@@ -3,6 +3,7 @@
 import Image from "next/image";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { useEffect, useRef, useState } from "react";
+import { TerminalDemo } from "./TerminalDemo";
 import { asset, docs, gallery, i18n, releases, type DocBlock, type Lang, type View } from "./content";
 import styles from "./page.module.css";
 
@@ -10,15 +11,308 @@ const githubUrl = "https://github.com/umacloud/umadev";
 type DocItem = { id: string; title: string; blocks: readonly DocBlock[] };
 type DocCategory = { cat: string; items: readonly DocItem[] };
 
+const CHARS = "010101010101ABCDEF0123456789X%#$@";
+
+export function ScrambledHoverText({ text, className }: { text: string; className?: string }) {
+  const [displayText, setDisplayText] = useState(text);
+  const intervalRef = useRef<any>(null);
+
+  useEffect(() => {
+    setDisplayText(text);
+  }, [text]);
+
+  const handleMouseEnter = () => {
+    let iteration = 0;
+    if (intervalRef.current) clearInterval(intervalRef.current);
+    
+    intervalRef.current = window.setInterval(() => {
+      setDisplayText(
+        text
+          .split("")
+          .map((char, index) => {
+            if (char === " ") return " ";
+            if (index < iteration) return text[index];
+            return CHARS[Math.floor(Math.random() * CHARS.length)];
+          })
+          .join("")
+      );
+      
+      iteration += 1 / 2;
+      if (iteration >= text.length) {
+        setDisplayText(text);
+        if (intervalRef.current) clearInterval(intervalRef.current);
+      }
+    }, 25);
+  };
+  
+  const handleMouseLeave = () => {
+    if (intervalRef.current) clearInterval(intervalRef.current);
+    setDisplayText(text);
+  };
+  
+  useEffect(() => {
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+    };
+  }, []);
+
+  return (
+    <span 
+      onMouseEnter={handleMouseEnter} 
+      onMouseLeave={handleMouseLeave} 
+      className={className}
+      style={{ position: "relative", display: "inline-block" }}
+    >
+      <span style={{ visibility: "hidden" }} aria-hidden="true">{text}</span>
+      <span style={{ position: "absolute", left: 0, top: 0, width: "100%", height: "100%", whiteSpace: "nowrap" }}>
+        {displayText}
+      </span>
+    </span>
+  );
+}
+
+export function FloatingDiagnosticTerminal({
+  lang,
+  setLang,
+  setView,
+  setHeroSlideIndex,
+  setMode,
+  setStageIndex,
+}: {
+  lang: Lang;
+  setLang: (l: Lang) => void;
+  setView: (v: View) => void;
+  setHeroSlideIndex: (s: number | ((prev: number) => number)) => void;
+  setMode: (m: string) => void;
+  setStageIndex: (i: number) => void;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [logs, setLogs] = useState<string[]>([
+    "UMADEV CORE DIAGNOSTICS v1.0.6",
+    "Initializing MCP channels... OK",
+    "Status: ONLINE [SECURE_MODE]",
+    "Type /help for diagnostic commands."
+  ]);
+  const [inputValue, setInputValue] = useState("");
+  const bodyRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (bodyRef.current) {
+      bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
+    }
+  }, [logs, isOpen]);
+
+  const handleCommand = (cmdStr: string) => {
+    const raw = cmdStr.trim();
+    if (!raw) return;
+    
+    setLogs((prev) => [...prev, `umadev_hud > ${raw}`]);
+    const tokens = raw.split(/\s+/);
+    const cmd = tokens[0].toLowerCase();
+    const arg = tokens[1]?.toLowerCase();
+    
+    setTimeout(() => {
+      if (cmd === "/help" || cmd === "help") {
+        setLogs((prev) => [
+          ...prev,
+          "--- Active HUD Controller Commands ---",
+          "  /lang <zh|en>     - Switch language",
+          "  /slide <1-3|next> - Switch Hero visual slides",
+          "  /mode <id>        - Switch base (claude-code | codex | opencode)",
+          "  /stage <1-3>      - Switch pipeline stage",
+          "  /view <home|docs> - Navigate page views",
+          "  /stats            - Print system & browser diagnostics",
+          "  /scan             - Run code & secret checks",
+          "  /governance       - Verify governance checklists",
+          "  /clear            - Clear console screen"
+        ]);
+      } else if (cmd === "/clear" || cmd === "clear") {
+        setLogs([]);
+      } else if (cmd === "/lang") {
+        if (arg === "en") {
+          setLang("en");
+          setLogs((prev) => [...prev, "System: Language set to ENGLISH."]);
+        } else if (arg === "zh") {
+          setLang("zh");
+          setLogs((prev) => [...prev, "系统：语言切换为【中文】。"]);
+        } else {
+          setLogs((prev) => [...prev, "Usage: /lang <zh|en>"]);
+        }
+      } else if (cmd === "/slide") {
+        const val = parseInt(arg, 10);
+        if (arg === "next") {
+          setHeroSlideIndex((prev) => (prev + 1) % 3);
+          setLogs((prev) => [...prev, "System: Rotated to next hero slide."]);
+        } else if (val >= 1 && val <= 3) {
+          setHeroSlideIndex(val - 1);
+          setLogs((prev) => [...prev, `System: Loaded hero slide ${val}.`]);
+        } else {
+          setLogs((prev) => [...prev, "Usage: /slide <1-3|next>"]);
+        }
+      } else if (cmd === "/mode") {
+        const valid = ["claude-code", "codex", "opencode"];
+        if (valid.includes(arg)) {
+          setMode(arg);
+          setLogs((prev) => [...prev, `System: Base switched to ${arg}.`]);
+        } else {
+          setLogs((prev) => [...prev, "Usage: /mode <claude-code|codex|opencode>"]);
+        }
+      } else if (cmd === "/stage") {
+        const val = parseInt(arg, 10);
+        if (val >= 1 && val <= 3) {
+          setStageIndex(val - 1);
+          setLogs((prev) => [...prev, `System: Pipeline stage set to ${val}.`]);
+        } else {
+          setLogs((prev) => [...prev, "Usage: /stage <1-3>"]);
+        }
+      } else if (cmd === "/view") {
+        if (arg === "home" || arg === "docs") {
+          setView(arg);
+          setLogs((prev) => [...prev, `System: Navigating to ${arg.toUpperCase()} view.`]);
+        } else {
+          setLogs((prev) => [...prev, "Usage: /view <home|docs>"]);
+        }
+      } else if (cmd === "/stats" || cmd === "stats") {
+        const res = typeof window !== "undefined" ? `${window.screen.width}x${window.screen.height}` : "Unknown";
+        const ua = typeof navigator !== "undefined" ? navigator.userAgent.split(" ").slice(-2).join(" ") : "Unknown";
+        const conn = typeof navigator !== "undefined" && (navigator as any).connection ? `RTT: ${(navigator as any).connection.rtt}ms, Speed: ${(navigator as any).connection.downlink}Mbps` : "N/A";
+        setLogs((prev) => [
+          ...prev,
+          "--- Browser & System Diagnostics ---",
+          `  Resolution  : ${res}`,
+          `  UserAgent   : ${ua}`,
+          `  Network     : ${conn}`,
+          `  App Status  : ONLINE (Ready)`,
+          `  Engine      : Next.js 16.2.9 (Turbopack)`
+        ]);
+      } else if (cmd === "/scan" || cmd === "scan") {
+        setLogs((prev) => [
+          ...prev,
+          "Scanning workspace... [■■■■■■■■■■] 100%",
+          "  -> Found 9 modules in Rust workspace",
+          "  -> 0 hardcoded secrets detected",
+          "  -> 0 clippy warnings",
+          "  -> Quality Gate: 94% PASS"
+        ]);
+      } else if (cmd === "/governance" || cmd === "governance") {
+        setLogs((prev) => [
+          ...prev,
+          "Checking 112 governance rules...",
+          "  [RULE_01] No raw unwraps - PASS",
+          "  [RULE_02] Secure MCP transport - PASS",
+          "  [RULE_03] No hardcoded styles - PASS",
+          "Governance Status: SECURE / FAILS OPEN"
+        ]);
+      } else if (cmd === "/deploy" || cmd === "deploy") {
+        setLogs((prev) => [
+          ...prev,
+          "Triggering local deploy simulator...",
+          "  Running subprocess: next build...",
+          "  Deploying static bundle to GitHub Pages...",
+          "  Success! Domain: umadev.dev/preview"
+        ]);
+      } else if (cmd === "/proof" || cmd === "proof") {
+        setLogs((prev) => [
+          ...prev,
+          "Compiling Proof Pack...",
+          "  Archiving .umadev/audit/session.jsonl...",
+          "  Generating scorecard-v1.0.6.html...",
+          "  Created delivery: release/proof-pack.zip"
+        ]);
+      } else {
+        setLogs((prev) => [
+          ...prev,
+          `Error: Command "${raw}" not recognized. Type /help for assistance.`
+        ]);
+      }
+    }, 100);
+    
+    setInputValue("");
+  };
+
+  return (
+    <>
+      {!isOpen && (
+        <button
+          className={styles.hudFloatBtn}
+          onClick={() => setIsOpen(true)}
+          title="Open system diagnostics console"
+        >
+          <span className={styles.hudPulseLight} />
+          <span>SYS_OK: 94%</span>
+        </button>
+      )}
+
+      {isOpen && (
+        <div className={styles.hudOverlayTerm}>
+          <div className={styles.hudTermHeader}>
+            <span>SYS DIAGNOSTICS</span>
+            <button onClick={() => setIsOpen(false)}>×</button>
+          </div>
+          <div className={styles.hudTermBody} ref={bodyRef}>
+            {logs.map((log, i) => (
+              <div key={i} className={styles.hudTermLine}>
+                {log}
+              </div>
+            ))}
+          </div>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              handleCommand(inputValue);
+            }}
+            className={styles.hudTermForm}
+          >
+            <span>&gt;</span>
+            <input
+              type="text"
+              value={inputValue}
+              onChange={(e) => setInputValue(e.target.value)}
+              placeholder="Type /help..."
+              autoFocus
+            />
+          </form>
+        </div>
+      )}
+    </>
+  );
+}
+
 export default function Home() {
   const [lang, setLang] = useState<Lang>("zh");
   const [view, setView] = useState<View>("home");
+
+  // Auto language detection based on browser locale
+  useEffect(() => {
+    const savedLang = localStorage.getItem("umadev_lang") as Lang | null;
+    if (savedLang === "zh" || savedLang === "en") {
+      setLang(savedLang);
+      return;
+    }
+    const browserLang = navigator.language || (navigator as any).userLanguage || "";
+    if (browserLang.toLowerCase().includes("zh")) {
+      setLang("zh");
+    } else {
+      setLang("en");
+    }
+  }, []);
+
+  // Synchronize language selection to localStorage
+  useEffect(() => {
+    localStorage.setItem("umadev_lang", lang);
+  }, [lang]);
+
   const [stageIndex, setStageIndex] = useState(0);
   const [mode, setMode] = useState("claude-code");
   const [docId, setDocId] = useState("quickstart");
   const [lightbox, setLightbox] = useState<number | null>(null);
   const [copied, setCopied] = useState(false);
+  const [copiedMode, setCopiedMode] = useState<string | null>(null);
+  const [showcaseIndex, setShowcaseIndex] = useState(0);
+  const [heroSlideIndex, setHeroSlideIndex] = useState(0);
+  const [activeRole, setActiveRole] = useState<string>("Director");
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const modeCopyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stageButtonRefs = useRef<(HTMLButtonElement | null)[]>([]);
 
   const t = i18n[lang];
@@ -28,6 +322,40 @@ export default function Home() {
   const activeDoc =
     docCats.flatMap((cat) => cat.items).find((item) => item.id === docId) ??
     docCats[0].items[0];
+
+  // Dynamically update document title and description based on language and view
+  useEffect(() => {
+    let title = "";
+    if (view === "home") {
+      title = lang === "zh"
+        ? "UmaDev - AI 编码项目总监 Agent"
+        : "UmaDev - AI coding project director";
+    } else if (view === "docs") {
+      title = lang === "zh"
+        ? "文档中心 | UmaDev - AI 编码项目总监 Agent"
+        : "Documentation | UmaDev - AI coding project director";
+    } else if (view === "gallery") {
+      title = lang === "zh"
+        ? "形象相册 | UmaDev - AI 编码项目总监 Agent"
+        : "Mascot Gallery | UmaDev - AI coding project director";
+    } else if (view === "changelog") {
+      title = lang === "zh"
+        ? "更新日志 | UmaDev - AI 编码项目总监 Agent"
+        : "Changelog | UmaDev - AI coding project director";
+    }
+    
+    document.title = title;
+
+    const descMeta = document.querySelector('meta[name="description"]');
+    if (descMeta) {
+      descMeta.setAttribute(
+        "content",
+        lang === "zh"
+          ? "把 Claude Code、Codex 或 OpenCode 变成项目总监 Agent，交付 PRD、架构、UI/UX、代码、质量门和交付包。"
+          : "Turn Claude Code, Codex, or OpenCode into a project-director agent that ships PRD, architecture, UI/UX, code, quality gates and proof packs."
+      );
+    }
+  }, [lang, view]);
 
   // Docs: scroll-spy — highlight the sidebar entry for the section near the top
   // of the viewport as the reader scrolls (the big-docs pattern).
@@ -68,20 +396,183 @@ export default function Home() {
     };
   }, [lightbox]);
 
-  const heroTitle = `${t.hero.title1} ${t.hero.titleHi}${t.hero.title2}`;
-  const titleLines =
+  const heroSlides =
     lang === "zh"
       ? [
-          { text: "把 AI 编码工具", accent: false },
-          { text: "变成真正的", accent: false },
-          { text: "项目总监 Agent", accent: true },
+          {
+            key: "director",
+            overline: "在你的项目中交付",
+            lines: [
+              { text: "把 AI 编码工具", accent: false },
+              { text: "变成真正的", accent: false },
+              { text: "项目总监 Agent", accent: true },
+            ],
+            sub: t.hero.sub,
+            visual: "/assets/1_v2.png",
+            hud: ["运行模式 / 本地", "质量门槛 / 90+", "支持底座 / 23"],
+            ticker: ["cargo test --workspace", "quality_gate: 94 / 100", "release/proof-pack.zip"],
+          },
+          {
+            key: "workflow",
+            overline: "从需求到交付凭证",
+            lines: [
+              { text: "从一句需求", accent: false },
+              { text: "自动调度", accent: false },
+              { text: "10 步交付闭环", accent: true },
+            ],
+            sub: "澄清、调研、文档、前端、后端、质量门、交付包按流程推进。每一步都有状态、产物和可追溯证据。",
+            visual: "/assets/2_v2.png",
+            hud: ["标准流程 / 10步", "核心门槛 / 3", "交付证据 / 开启"],
+            ticker: ["phase: docs_confirm", "output/prd.md + architecture.md", ".umadev/audit/session.jsonl"],
+          },
+          {
+            key: "runtime",
+            overline: "自带编码底座",
+            lines: [
+              { text: "连接你已登录的", accent: false },
+              { text: "Claude Code", accent: true },
+              { text: "Codex CLI OpenCode", accent: false },
+            ],
+            sub: "UmaDev 负责流程、治理、质量门和证据链；真实读写文件和运行命令，交给你本机已经登录的编码底座。",
+            visual: "/assets/3_v2.png",
+            hud: ["CLAUDE CODE", "CODEX CLI", "OPENCODE"],
+            ticker: ["driver: codex exec", "sandbox: workspace-write", "secrets: local only"],
+          },
         ]
       : [
-          { text: "Turn AI coding tools into", accent: false },
-          { text: "real project director", accent: true },
-          { text: "agents", accent: false },
+          {
+            key: "director",
+            overline: "Code Where You Ship",
+            lines: [
+              { text: "Turn AI coding tools into", accent: false },
+              { text: "real project director", accent: true },
+              { text: "agents", accent: false },
+            ],
+            sub: t.hero.sub,
+            visual: "/assets/1_v2.png",
+            hud: ["RUN_MODE / LOCAL", "QUALITY_GATE / 90+", "HOSTS / 23"],
+            ticker: ["cargo test --workspace", "quality_gate: 94 / 100", "release/proof-pack.zip"],
+          },
+          {
+            key: "workflow",
+            overline: "From Prompt To Proof",
+            lines: [
+              { text: "From one prompt", accent: false },
+              { text: "to a governed", accent: false },
+              { text: "10-step delivery loop", accent: true },
+            ],
+            sub: "Clarify, research, docs, frontend, backend, quality gates and proof packs move as one traceable workflow.",
+            visual: "/assets/2_v2.png",
+            hud: ["FLOW / 10 STEPS", "GATES / 3", "PROOF / ON"],
+            ticker: ["phase: docs_confirm", "output/prd.md + architecture.md", ".umadev/audit/session.jsonl"],
+          },
+          {
+            key: "runtime",
+            overline: "Bring Your Coding Base",
+            lines: [
+              { text: "Connect your logged-in", accent: false },
+              { text: "Claude Code", accent: true },
+              { text: "Codex CLI OpenCode", accent: false },
+            ],
+            sub: "UmaDev owns orchestration, governance, gates and proof. Your local coding base does the real file edits and commands.",
+            visual: "/assets/3_v2.png",
+            hud: ["CLAUDE CODE", "CODEX CLI", "OPENCODE"],
+            ticker: ["driver: codex exec", "sandbox: workspace-write", "secrets: local only"],
+          },
         ];
+  const activeHeroSlide = heroSlides[heroSlideIndex] ?? heroSlides[0];
+  const heroTitle = activeHeroSlide.lines.map((line) => line.text).join(" ");
+  const titleLines = activeHeroSlide.lines;
+  const heroSlideLabels =
+    lang === "zh" ? ["主视觉", "交付闭环", "编码底座"] : ["Hero", "Workflow", "Runtime"];
+  const showcaseItems =
+    lang === "zh"
+      ? [
+          {
+            key: "clarify",
+            tab: "需求澄清",
+            kicker: "01 / CLARIFY",
+            title: "先问清楚，再让 AI 动手",
+            body: "把一句模糊需求拆成目标、边界、角色、验收标准和风险点。需要确认的地方停下来，不需要确认的地方自动推进。",
+            image: "/assets/umadev/ip/uma-ip-41.png",
+            command: "umadev new booking --mode auto",
+            status: "waiting_for_requirements",
+            bullets: ["目标 / 范围 / 验收标准", "缺失信息追问", "确认门或自动跳过"],
+            files: ["output/<slug>-clarify.md", "output/<slug>-clarify-answers.md"],
+          },
+          {
+            key: "docs",
+            tab: "文档生成",
+            kicker: "02 / SPEC",
+            title: "PRD、架构、UI/UX 一次成套",
+            body: "把调研结论转成真实项目文件：产品说明、技术架构、界面方案、任务拆解和契约草案，后续编码全部回链这些产物。",
+            image: "/assets/umadev/ip/uma-ip-34.png",
+            command: "umadev continue --phase docs",
+            status: "writing_prd_architecture_uiux",
+            bullets: ["PRD 与验收标准", "架构与接口边界", "UI/UX 页面与组件逻辑"],
+            files: ["output/<slug>-prd.md", "output/<slug>-architecture.md", "output/<slug>-uiux.md"],
+          },
+          {
+            key: "quality",
+            tab: "质量门",
+            kicker: "03 / QUALITY",
+            title: "不是写完就交，是过门后交付",
+            body: "构建、lint、契约、安全、设计规范、证据链一起检查。默认 90 分通过，失败时回到对应阶段修复。",
+            image: "/assets/umadev/ip/uma-ip-36.png",
+            command: "umadev gate --threshold 90",
+            status: "quality_gate: 94 / 100",
+            bullets: ["构建 / 测试 / lint", "契约和安全规则", "proof pack 与成绩单"],
+            files: ["output/<slug>-quality-gate.md", "release/proof-pack-*.zip", "release/scorecard-*.html"],
+          },
+        ]
+      : [
+          {
+            key: "clarify",
+            tab: "Clarify",
+            kicker: "01 / CLARIFY",
+            title: "Clarify first, then let AI act",
+            body: "Turn a vague request into goals, boundaries, roles, acceptance criteria and risks. Pause where confirmation is needed, continue where it is not.",
+            image: "/assets/umadev/ip/uma-ip-41.png",
+            command: "umadev new booking --mode auto",
+            status: "waiting_for_requirements",
+            bullets: ["Goals / scope / acceptance", "Missing-info questions", "Gate or auto-continue"],
+            files: ["output/<slug>-clarify.md", "output/<slug>-clarify-answers.md"],
+          },
+          {
+            key: "docs",
+            tab: "Docs",
+            kicker: "02 / SPEC",
+            title: "PRD, architecture and UI/UX as real files",
+            body: "Research becomes project artifacts: product spec, technical architecture, interface plan, task breakdown and contract drafts.",
+            image: "/assets/umadev/ip/uma-ip-34.png",
+            command: "umadev continue --phase docs",
+            status: "writing_prd_architecture_uiux",
+            bullets: ["PRD and acceptance", "Architecture and contracts", "UI/UX page logic"],
+            files: ["output/<slug>-prd.md", "output/<slug>-architecture.md", "output/<slug>-uiux.md"],
+          },
+          {
+            key: "quality",
+            tab: "Quality",
+            kicker: "03 / QUALITY",
+            title: "Ship after the gate, not after the chat",
+            body: "Build, lint, contracts, security, design rules and proof chain are checked together. Default pass line is 90.",
+            image: "/assets/umadev/ip/uma-ip-36.png",
+            command: "umadev gate --threshold 90",
+            status: "quality_gate: 94 / 100",
+            bullets: ["Build / test / lint", "Contracts and security", "Proof pack and scorecard"],
+            files: ["output/<slug>-quality-gate.md", "release/proof-pack-*.zip", "release/scorecard-*.html"],
+          },
+        ];
+  const showcase = showcaseItems[showcaseIndex] ?? showcaseItems[0];
   const stageProgress = `${Math.round(((stageIndex + 1) / t.stages.length) * 100)}%`;
+
+  useEffect(() => {
+    if (view !== "home") return;
+    const timer = window.setInterval(() => {
+      setHeroSlideIndex((index) => (index + 1) % heroSlides.length);
+    }, 6500);
+    return () => window.clearInterval(timer);
+  }, [heroSlides.length, view]);
 
   function go(nextView: View) {
     setView(nextView);
@@ -95,6 +586,13 @@ export default function Home() {
     copyTimerRef.current = setTimeout(() => setCopied(false), 1500);
   }
 
+  function copyModeCommand(command: string, key: string) {
+    navigator.clipboard?.writeText(command).catch(() => undefined);
+    setCopiedMode(key);
+    if (modeCopyTimerRef.current) clearTimeout(modeCopyTimerRef.current);
+    modeCopyTimerRef.current = setTimeout(() => setCopiedMode(null), 1500);
+  }
+
   function pickStage(index: number) {
     setStageIndex(index);
     stageButtonRefs.current[index]?.scrollIntoView({
@@ -104,13 +602,9 @@ export default function Home() {
     });
   }
 
-  function trackPointer(event: ReactPointerEvent<HTMLDivElement>) {
-    event.currentTarget.style.setProperty("--mx", `${event.clientX}px`);
-    event.currentTarget.style.setProperty("--my", `${event.clientY}px`);
-  }
-
   return (
-    <div className={styles.shell} onPointerMove={trackPointer}>
+    <div className={styles.shell}>
+
       <div className={styles.gridBg} aria-hidden="true" />
       <div className={styles.topGlow} aria-hidden="true" />
       <div className={styles.pointerGlow} aria-hidden="true" />
@@ -122,7 +616,7 @@ export default function Home() {
           <Image
             className={styles.logo}
             src={asset("/assets/umadev-icon.png")}
-            alt="UmaDev logo"
+            alt={lang === "zh" ? "UmaDev 图标" : "UmaDev logo"}
             width={42}
             height={42}
             priority
@@ -132,20 +626,20 @@ export default function Home() {
 
         <div className={styles.navLinks}>
           <button className={navClass(view === "home")} type="button" onClick={() => go("home")}>
-            {t.nav.product}
+            <ScrambledHoverText text={t.nav.product} />
           </button>
           <button className={navClass(view === "docs")} type="button" onClick={() => go("docs")}>
-            {t.nav.docs}
+            <ScrambledHoverText text={t.nav.docs} />
           </button>
           <button className={navClass(view === "gallery")} type="button" onClick={() => go("gallery")}>
-            {t.nav.gallery}
+            <ScrambledHoverText text={t.nav.gallery} />
           </button>
           <button
             className={navClass(view === "changelog")}
             type="button"
             onClick={() => go("changelog")}
           >
-            {t.nav.changelog}
+            <ScrambledHoverText text={t.nav.changelog} />
           </button>
         </div>
 
@@ -187,14 +681,15 @@ export default function Home() {
                 />
               </div>
               <div className={styles.heroCopy}>
+                <span className={styles.heroOverline}>{activeHeroSlide.overline}</span>
                 <div className={styles.badge}>
                   <span className={styles.pulseDot} />
                   {t.hero.badge}
                 </div>
                 <div className={styles.heroHud}>
-                  <span>RUN_MODE / LOCAL</span>
-                  <span>QUALITY_GATE / 90+</span>
-                  <span>HOSTS / 23</span>
+                  {activeHeroSlide.hud.map((item) => (
+                    <span key={item}>{item}</span>
+                  ))}
                 </div>
                 <h1 className={styles.heroTitle} data-text={heroTitle}>
                   {titleLines.map((line) => (
@@ -206,7 +701,7 @@ export default function Home() {
                     </span>
                   ))}
                 </h1>
-                <p>{t.hero.sub}</p>
+                <p>{activeHeroSlide.sub}</p>
 
                 <button className={styles.installCommand} type="button" onClick={copyInstall}>
                   <span className={styles.promptMark}>$</span>
@@ -216,11 +711,11 @@ export default function Home() {
 
                 <div className={styles.heroActions}>
                   <a href={githubUrl} target="_blank" rel="noreferrer">
-                    {t.hero.cta1}
+                    <ScrambledHoverText text={t.hero.cta1} />
                     <span aria-hidden="true">→</span>
                   </a>
                   <button type="button" onClick={() => go("docs")}>
-                    {t.hero.cta2}
+                    <ScrambledHoverText text={t.hero.cta2} />
                   </button>
                 </div>
 
@@ -232,9 +727,21 @@ export default function Home() {
                     </div>
                   ))}
                 </dl>
+
               </div>
 
               <div className={styles.heroVisual}>
+                <div className={styles.productFrame}>
+                  <Image
+                    className={styles.productShot}
+                    src={asset(activeHeroSlide.visual)}
+                    alt=""
+                    width={832}
+                    height={520}
+                    priority
+                    aria-hidden="true"
+                  />
+                </div>
                 <Image
                   className={styles.heroMark}
                   src={asset("/assets/umadev/neon-logo-cut.png")}
@@ -245,9 +752,93 @@ export default function Home() {
                   aria-hidden="true"
                 />
                 <div className={styles.codeTicker} aria-hidden="true">
-                  <span>cargo test --workspace</span>
-                  <span>quality_gate: 94 / 100</span>
-                  <span>release/proof-pack.zip</span>
+                  {activeHeroSlide.ticker.map((item) => (
+                    <span key={item}>{item}</span>
+                  ))}
+                </div>
+              </div>
+
+              <div className={styles.heroCarouselControls} aria-label="Hero carousel">
+                {heroSlides.map((slide, index) => (
+                  <button
+                    key={slide.key}
+                    type="button"
+                    aria-label={`Show ${slide.overline}`}
+                    data-state={index < heroSlideIndex ? "past" : index === heroSlideIndex ? "active" : "future"}
+                    onClick={() => setHeroSlideIndex(index)}
+                  >
+                    {index === heroSlideIndex && (
+                      <svg className={styles.carouselBtnBorder} aria-hidden="true">
+                        <rect
+                          x="1"
+                          y="1"
+                          rx="18"
+                          ry="18"
+                          style={{ width: "calc(100% - 2px)", height: "calc(100% - 2px)" }}
+                          pathLength="100"
+                        />
+                      </svg>
+                    )}
+                    <span>{String(index + 1).padStart(2, "0")}</span>
+                    {heroSlideLabels[index]}
+                  </button>
+                ))}
+              </div>
+            </section>
+
+            <section className={styles.premiumShowcase}>
+              <div className={styles.showcaseBrand}>
+                <Image
+                  src={asset("/assets/umadev-icon.png")}
+                  alt=""
+                  width={34}
+                  height={34}
+                  aria-hidden="true"
+                />
+                <span>UMADEV</span>
+              </div>
+              <div className={styles.showcaseMascot} aria-hidden="true">
+                <Image
+                  src={asset("/assets/mascot-thumb.png")}
+                  alt=""
+                  width={520}
+                  height={520}
+                />
+              </div>
+              <div className={styles.showcaseCopy}>
+                <div className={styles.showcaseTabs}>
+                  {showcaseItems.map((item, index) => (
+                    <button
+                      key={item.key}
+                      type="button"
+                      data-active={index === showcaseIndex ? "true" : undefined}
+                      onClick={() => setShowcaseIndex(index)}
+                    >
+                      <span>{String(index + 1).padStart(2, "0")}</span>
+                      <ScrambledHoverText text={item.tab} />
+                    </button>
+                  ))}
+                </div>
+                <p className={styles.showcaseKicker}>{showcase.kicker}</p>
+                <h2>{showcase.title}</h2>
+                <p>{showcase.body}</p>
+                <ul>
+                  {showcase.bullets.map((bullet) => (
+                    <li key={bullet}>{bullet}</li>
+                  ))}
+                </ul>
+                <div className={styles.showcaseTerminal}>
+                  <code>$ {showcase.command}</code>
+                  <span>{showcase.status}</span>
+                </div>
+              </div>
+              <div className={styles.showcaseScreen}>
+                <TerminalDemo slideIndex={showcaseIndex} lang={lang} />
+                <div className={styles.showcaseNote}>{lang === "zh" ? "项目总监模式" : "PROJECT DIRECTOR MODE"}</div>
+                <div className={styles.showcaseFiles}>
+                  {showcase.files.map((file) => (
+                    <code key={file}>{file}</code>
+                  ))}
                 </div>
               </div>
             </section>
@@ -270,13 +861,31 @@ export default function Home() {
               <div className={styles.mascotRail}>
                 {t.mascots.cards.map((card, index) => (
                   <article className={styles.mascotCard} key={card.title}>
-                    <Image src={asset(card.img)} alt={card.title} width={360} height={360} />
+                    <div className={styles.mascotImageWrapper}>
+                      <Image src={asset(card.img)} alt={card.title} width={360} height={360} />
+                      {card.type === "director" && (
+                        <span className={styles.mascotTypeTagDirector}>L0 Director</span>
+                      )}
+                      {card.type === "doer" && (
+                        <span className={styles.mascotTypeTagDoer}>Doer · Serial Write</span>
+                      )}
+                      {card.type === "critic" && (
+                        <span className={styles.mascotTypeTagCritic}>Critic · Parallel Review</span>
+                      )}
+                    </div>
                     <div>
                       <small>
                         {String(index + 1).padStart(2, "0")} / {card.role}
                       </small>
                       <h3>{card.title}</h3>
                       <p>{card.desc}</p>
+                      {card.details && (
+                        <ul className={styles.mascotDetails}>
+                          {card.details.map((detail) => (
+                            <li key={detail}>{detail}</li>
+                          ))}
+                        </ul>
+                      )}
                     </div>
                   </article>
                 ))}
@@ -350,10 +959,17 @@ export default function Home() {
                   ))}
                 </div>
                 <small>{t.modes.callLabel}</small>
-                <code>
-                  <span>$ </span>
-                  <b>{activeTab.bin}</b> {activeTab.cmd.replace(activeTab.bin, "").trim()}
-                </code>
+                <button
+                  className={styles.modeCommand}
+                  type="button"
+                  onClick={() => copyModeCommand(activeTab.cmd, activeTab.id)}
+                >
+                  <code>
+                    <span>$ </span>
+                    <b>{activeTab.bin}</b> {activeTab.cmd.replace(activeTab.bin, "").trim()}
+                  </code>
+                  <em>{copiedMode === activeTab.id ? t.hero.copied : t.hero.copy}</em>
+                </button>
                 <small>{t.modes.whoLabel}</small>
                 <p>{activeTab.who}</p>
               </article>
@@ -362,7 +978,14 @@ export default function Home() {
                   <article key={card.title}>
                     <header>
                       <h3>{card.title}</h3>
-                      <code>{card.cmd}</code>
+                      <button
+                        className={styles.modeCardCommand}
+                        type="button"
+                        onClick={() => copyModeCommand(card.cmd, card.cmd)}
+                      >
+                        <code>{card.cmd}</code>
+                        <span>{copiedMode === card.cmd ? t.hero.copied : t.hero.copy}</span>
+                      </button>
                     </header>
                     <p>{card.desc}</p>
                   </article>
@@ -407,9 +1030,17 @@ export default function Home() {
                 <p>{t.ip.desc}</p>
               </div>
               <div className={styles.ipCards}>
-                {t.ip.cards.map((card) => (
+                {t.ip.cards.map((card, index) => (
                   <figure key={card.cap}>
-                    <Image src={asset(card.img)} alt={card.cap} width={390} height={390} />
+                    <Image
+                      src={asset(card.img)}
+                      alt={card.cap}
+                      width={390}
+                      height={390}
+                      loading={index === 0 ? undefined : "eager"}
+                      priority={index === 0}
+                      sizes="(max-width: 720px) 100vw, (max-width: 1080px) 50vw, 32vw"
+                    />
                     <figcaption>{card.cap}</figcaption>
                   </figure>
                 ))}
@@ -429,7 +1060,10 @@ export default function Home() {
                   </button>
                 </div>
               </div>
-              <code>{t.cta.note}</code>
+              <button className={styles.ctaCommand} type="button" onClick={copyInstall}>
+                <code>{t.cta.note}</code>
+                <span>{copied ? t.hero.copied : t.hero.copy}</span>
+              </button>
             </section>
           </>
         )}
@@ -573,7 +1207,7 @@ export default function Home() {
             <Image
               className={styles.logo}
               src={asset("/assets/umadev-icon.png")}
-              alt="UmaDev logo"
+              alt={lang === "zh" ? "UmaDev 图标" : "UmaDev logo"}
               width={42}
               height={42}
             />
@@ -599,6 +1233,16 @@ export default function Home() {
         ))}
         <small>{t.footer.rights}</small>
       </footer>
+
+      {/* Floating System Diagnostic Console */}
+      <FloatingDiagnosticTerminal
+        lang={lang}
+        setLang={setLang}
+        setView={setView}
+        setHeroSlideIndex={setHeroSlideIndex}
+        setMode={setMode}
+        setStageIndex={setStageIndex}
+      />
     </div>
   );
 

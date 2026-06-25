@@ -31,19 +31,75 @@ export const i18n = {
     trust: "驱动你已登录的本机编码底座",
     backends: ["Claude Code", "Codex CLI", "OpenCode"],
     mascots: {
-      eyebrow: "Uma 角色阵列",
-      title: "每一步交付，都有一个 Uma 在场",
-      desc: "把吉祥物从装饰变成产品语言：不同姿态对应不同阶段，让用户一眼看懂 UmaDev 正在做什么。",
+      eyebrow: "仿真开发团队 (Simulation Dev Team)",
+      title: "每一步交付，都有一位 Uma 专家在场",
+      desc: "把吉祥物从纯装饰重塑为真实干活的开发岗位：1位项目总监带领8大技术席位。Doers 串行写入主干，Critics 则基于 Verdict Engine 在隔离的只读分叉 (Read-only forks) 上并行评审。全员共享主底座 subprocess 交互会话，免除您配置或购买多份 API Key 的高昂成本，保障工程级的高效安全交付。",
       cards: [
-        { img: "/assets/umadev/mascot-wave.png", role: "Clarify", title: "澄清官", desc: "先问清需求边界，避免 AI 一上来就乱写。" },
-        { img: "/assets/umadev/mascot-hud-panel.png", role: "Research", title: "调研员", desc: "拉起领域资料、竞品和风险，形成可追溯调研。" },
-        { img: "/assets/umadev/mascot-laptop-chair.png", role: "Docs", title: "文档员", desc: "沉下来写 PRD、架构和 UI/UX，不只聊天。" },
-        { img: "/assets/umadev/mascot-point.png", role: "Plan", title: "执行导演", desc: "拆任务、定顺序、把每一步和交付物对齐。" },
-        { img: "/assets/umadev/mascot-sit-code.png", role: "Code", title: "编码搭档", desc: "驱动本机 CLI 读写真实文件，推进实现。" },
-        { img: "/assets/umadev/mascot-city-dashboard.png", role: "Review", title: "质量门", desc: "盯住规则、契约、构建结果和证据链。" },
-        { img: "/assets/umadev/mascot-run.png", role: "Ship", title: "交付冲刺", desc: "生成 proof pack、成绩单和可审计归档。" },
-        { img: "/assets/umadev/mascot-thumb-lead.png", role: "Director", title: "项目总监", desc: "总控流程，决定什么时候暂停、确认、继续。" },
-      ],
+        {
+          img: "/assets/umadev/mascot-thumb-lead.png",
+          role: "Director",
+          type: "director",
+          title: "项目总监 Agent",
+          desc: "总控流程，路由意图，管理动态计划，人在环确认及流程纠错自愈。",
+          details: ["路由用户构建意图", "可视化执行计划管理", "人在环双重确认门控", "编译异常回滚自愈"]
+        },
+        {
+          img: "/assets/umadev/mascot-wave.png",
+          role: "PM (Critic)",
+          type: "critic",
+          title: "产品经理 Agent",
+          desc: "只读分叉并行评审。把关业务功能与验收指标，防止 AI 需求漂移。",
+          details: ["核对 PRD 验收标准", "防范功能范围漂移", "评审用户交互文案"]
+        },
+        {
+          img: "/assets/umadev/mascot-hud-panel.png",
+          role: "Architect (Critic)",
+          type: "critic",
+          title: "系统架构师 Agent",
+          desc: "只读分叉并行评审。审计 API 设计、接口契约和深层依赖树。",
+          details: ["维护清晰模块化架构", "强校验前后端 API 契约", "依赖树循环导入审计"]
+        },
+        {
+          img: "/assets/umadev/mascot-laptop-chair.png",
+          role: "UI/UX (Critic)",
+          type: "critic",
+          title: "视觉设计师 Agent",
+          desc: "只读分叉并行评审。严苛推行 ANTI_SLOP_LAW，阻断 Emoji 与裸色乱用。",
+          details: ["强制实施反垃圾设计律", "审核亮暗 Design Tokens", "杜绝 AI 痕迹色彩渐变"]
+        },
+        {
+          img: "/assets/umadev/mascot-point.png",
+          role: "FE (Doer)",
+          type: "doer",
+          title: "前端工程师 Agent",
+          desc: "主会话串行写入。驱动本地 CLI 开发组件，实现交互及设计对齐。",
+          details: ["开发交互式前端页面", "绑定 CSS 变量 Tokens", "保障前端编译与静态导出"]
+        },
+        {
+          img: "/assets/umadev/mascot-sit-code.png",
+          role: "BE (Doer)",
+          type: "doer",
+          title: "后端工程师 Agent",
+          desc: "主会话串行写入。设计 DB Schema 迁移，编写 API 与单元测试。",
+          details: ["实现 RESTful/GraphQL API", "设计稳健 DB 迁移脚本", "编写单元与集成测试"]
+        },
+        {
+          img: "/assets/umadev/mascot-city-dashboard.png",
+          role: "QA & Security (Critic)",
+          type: "critic",
+          title: "测试与安全专家 Agent",
+          desc: "只读分叉并行评审。渗透与注入审计，执行编译校验，卡死 90% 覆盖率门槛。",
+          details: ["拦截覆盖率 < 90% 提交", "代码漏洞静态扫描", "阻断危险 shell 命令注入"]
+        },
+        {
+          img: "/assets/umadev/mascot-run.png",
+          role: "DevOps (Doer)",
+          type: "doer",
+          title: "运维交付工程师 Agent",
+          desc: "主会话串行写入。拉起 dev server 拨测，沉淀坑位记忆并打包 Proof Pack。",
+          details: ["本地 dev server 动态就绪拨测", "捕获报错蒸馏 Lessons 记忆", "打包 SOC 2 可审计交付包"]
+        }
+      ]
     },
     flow: {
       eyebrow: "工作方式",
@@ -172,19 +228,75 @@ export const i18n = {
     trust: "Drives the local coding CLI you already logged into",
     backends: ["Claude Code", "Codex CLI", "OpenCode"],
     mascots: {
-      eyebrow: "Uma roster",
-      title: "A different Uma shows up for every delivery phase",
-      desc: "The mascots become product language, not decoration: each pose maps to a phase so people understand what UmaDev is doing.",
+      eyebrow: "Simulation Dev Team",
+      title: "An Uma Expert Present for Every Delivery",
+      desc: "Mascots transformed from decoration into a real-working team: 1 Project Director leading 8 Expert Seats. Doers write code serially, while Critics run parallel reviews on read-only forks via the Verdict Engine. All roles share the primary subprocess session, eliminating the need for multiple API Keys or extra costs while securing robust delivery.",
       cards: [
-        { img: "/assets/umadev/mascot-wave.png", role: "Clarify", title: "Requirement scout", desc: "Clarifies scope before the AI starts writing." },
-        { img: "/assets/umadev/mascot-hud-panel.png", role: "Research", title: "Research operator", desc: "Pulls domain context, competitors and risks into traceable notes." },
-        { img: "/assets/umadev/mascot-laptop-chair.png", role: "Docs", title: "Documentation pilot", desc: "Writes PRD, architecture and UI/UX instead of just chatting." },
-        { img: "/assets/umadev/mascot-point.png", role: "Plan", title: "Execution director", desc: "Breaks tasks down and aligns every step with artifacts." },
-        { img: "/assets/umadev/mascot-sit-code.png", role: "Code", title: "Coding partner", desc: "Drives local CLIs to read and write real project files." },
-        { img: "/assets/umadev/mascot-city-dashboard.png", role: "Review", title: "Quality gate", desc: "Checks rules, contracts, builds and the evidence chain." },
-        { img: "/assets/umadev/mascot-run.png", role: "Ship", title: "Delivery sprint", desc: "Packages proof pack, scorecard and audit-ready records." },
-        { img: "/assets/umadev/mascot-thumb-lead.png", role: "Director", title: "Project director", desc: "Controls the flow: pause, confirm, continue and ship." },
-      ],
+        {
+          img: "/assets/umadev/mascot-thumb-lead.png",
+          role: "Director",
+          type: "director",
+          title: "Project Director Agent",
+          desc: "Controls workflow, routes intent, manages dynamic plans, guides gates and triggers self-correction.",
+          details: ["Routes user intent", "Manages execution plans", "Enforces Human-in-the-Loop gates", "Self-corrects and rolls back"]
+        },
+        {
+          img: "/assets/umadev/mascot-wave.png",
+          role: "PM (Critic)",
+          type: "critic",
+          title: "Product Manager Agent",
+          desc: "Concurrently reviews features on read-only forks to prevent AI scope creep.",
+          details: ["Checks PRD acceptance criteria", "Blocks scope creep", "Audits interactive copy"]
+        },
+        {
+          img: "/assets/umadev/mascot-hud-panel.png",
+          role: "Architect (Critic)",
+          type: "critic",
+          title: "System Architect Agent",
+          desc: "Concurrently reviews API contracts and modules to ensure clean modular patterns.",
+          details: ["Maintains modular architecture", "Enforces contract schemas", "Checks dependency tree loops"]
+        },
+        {
+          img: "/assets/umadev/mascot-laptop-chair.png",
+          role: "UI/UX (Critic)",
+          type: "critic",
+          title: "UI/UX Designer Agent",
+          desc: "Concurrently reviews visuals to block hardcoded colors or emojis under ANTI_SLOP_LAW.",
+          details: ["Enforces anti-slop rules", "Checks css variables & tokens", "Rejects generic AI gradients"]
+        },
+        {
+          img: "/assets/umadev/mascot-point.png",
+          role: "FE (Doer)",
+          type: "doer",
+          title: "Frontend Developer Agent",
+          desc: "Serially writes components on the primary session, implementing pages and design tokens.",
+          details: ["Implements interactive pages", "Aligns CSS Design Tokens", "Ensures build and export success"]
+        },
+        {
+          img: "/assets/umadev/mascot-sit-code.png",
+          role: "BE (Doer)",
+          type: "doer",
+          title: "Backend Developer Agent",
+          desc: "Serially writes backend API endpoints, migrations, and unit tests on the primary session.",
+          details: ["Implements REST/GraphQL APIs", "Designs migration scripts", "Writes unit and integration tests"]
+        },
+        {
+          img: "/assets/umadev/mascot-city-dashboard.png",
+          role: "QA & Security (Critic)",
+          type: "critic",
+          title: "QA & Security Expert Agent",
+          desc: "Concurrently audits coverage floors, codes static vulnerability scans, and command injections.",
+          details: ["Enforces 90% coverage limits", "Performs vulnerability checks", "Blocks shell command injection"]
+        },
+        {
+          img: "/assets/umadev/mascot-run.png",
+          role: "DevOps (Doer)",
+          type: "doer",
+          title: "DevOps Developer Agent",
+          desc: "Serially pings dev servers for HTTP status, learns pitfalls, and packages SOC 2 Proof Packs.",
+          details: ["Runs runtime dev server pings", "Captures and refines DevErrors", "Assembles SOC 2 Proof Packs"]
+        }
+      ]
     },
     flow: {
       eyebrow: "How it works",

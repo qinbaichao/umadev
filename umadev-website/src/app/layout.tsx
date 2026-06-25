@@ -48,8 +48,9 @@ export default function RootLayout({
     <html
       lang="zh-CN"
       className={`${manrope.variable} ${spaceGrotesk.variable} ${jetBrainsMono.variable}`}
+      suppressHydrationWarning
     >
-      <body>{children}</body>
+      <body suppressHydrationWarning>{children}</body>
     </html>
   );
 }
