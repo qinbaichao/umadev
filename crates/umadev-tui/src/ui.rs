@@ -735,10 +735,65 @@ impl MdState {
     }
 }
 
+thread_local! {
+    /// The viewport content width a table must fit within, set once per transcript
+    /// render by [`render_transcript`]. `0` = unbounded (tests / no caller), so a
+    /// table renders at its natural width exactly as before.
+    static TABLE_WIDTH_BUDGET: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Set the per-render table width budget (the content width tables must fit).
+fn set_table_width_budget(w: usize) {
+    TABLE_WIDTH_BUDGET.with(|c| c.set(w));
+}
+
+/// Truncate styled `spans` to at most `max` display columns, appending a muted `…`
+/// when content is dropped. CJK-safe (display-width, never bytes). Used only on the
+/// over-budget table path so a wide cell can't overflow the terminal.
+fn truncate_spans(spans: &[Span<'static>], max: usize) -> Vec<Span<'static>> {
+    if max == 0 {
+        return Vec::new();
+    }
+    let total: usize = spans.iter().map(|s| disp_width(s.content.as_ref())).sum();
+    if total <= max {
+        return spans.to_vec();
+    }
+    let keep = max.saturating_sub(1); // leave a column for the ellipsis
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for s in spans {
+        let w = disp_width(s.content.as_ref());
+        if used + w <= keep {
+            out.push(s.clone());
+            used += w;
+        } else {
+            // Take as many leading chars of this span as fit.
+            let mut piece = String::new();
+            for ch in s.content.chars() {
+                let cw = disp_width(&ch.to_string());
+                if used + cw > keep {
+                    break;
+                }
+                piece.push(ch);
+                used += cw;
+            }
+            if !piece.is_empty() {
+                out.push(Span::styled(piece, s.style));
+            }
+            break;
+        }
+    }
+    out.push(role_span("\u{2026}".to_string(), SynRole::Muted, Modifier::empty()));
+    out
+}
+
 /// Render an assembled table into aligned, CJK-safe rows and push them onto
 /// `state.lines`. Column widths are the max VISIBLE (style-stripped, `unicode-
 /// width`-measured, CJK = 2) cell width — never byte length — so Chinese columns
-/// line up. A muted separator row sits under the header.
+/// line up. A muted separator row sits under the header. When the natural width
+/// exceeds the per-render budget ([`TABLE_WIDTH_BUDGET`]), columns shrink
+/// proportionally and over-long cells truncate with `…` so the table never
+/// overflows the viewport (which previously char-folded and scrambled the grid).
 fn render_table(state: &mut MdState, table: &TableBuf) {
     let cols = table
         .rows
@@ -760,12 +815,47 @@ fn render_table(state: &mut MdState, table: &TableBuf) {
             }
         }
     }
+    // Shrink to the per-render width budget when the natural table overflows it, so
+    // a wide table can't scramble the grid by char-folding past the viewport.
+    let indent_w = state.list_indent() + 1;
+    let sep_w = 5usize; // the "  │  " column separator
+    let budget = TABLE_WIDTH_BUDGET.with(std::cell::Cell::get);
+    let natural: usize = widths.iter().sum::<usize>() + sep_w * cols.saturating_sub(1) + indent_w;
+    let shrunk = budget > 0 && natural > budget;
+    if shrunk {
+        let avail = budget
+            .saturating_sub(indent_w + sep_w * cols.saturating_sub(1))
+            .max(cols * 4);
+        let nat_sum: usize = widths.iter().sum::<usize>().max(1);
+        for w in &mut widths {
+            *w = (*w * avail / nat_sum).max(4);
+        }
+        // The per-column `max(4)` floor can push the total a few cols over `avail`;
+        // trim the widest column(s) back down (never below 4) so the row truly fits.
+        let mut sum: usize = widths.iter().sum();
+        while sum > avail {
+            match widths.iter_mut().filter(|w| **w > 4).max() {
+                Some(w) => {
+                    *w -= 1;
+                    sum -= 1;
+                }
+                None => break,
+            }
+        }
+    }
     let indent = " ".repeat(state.list_indent() + 1);
     let empty: Vec<Span<'static>> = Vec::new();
     for (r, row) in table.rows.iter().enumerate() {
         let mut spans: Vec<Span<'static>> = vec![Span::raw(indent.clone())];
         for (c, &col_w) in widths.iter().enumerate() {
-            let cell = row.get(c).unwrap_or(&empty);
+            let cell_src = row.get(c).unwrap_or(&empty);
+            // On the over-budget path, clip each cell to its shrunk column width.
+            let cell_owned: Vec<Span<'static>> = if shrunk {
+                truncate_spans(cell_src, col_w)
+            } else {
+                cell_src.clone()
+            };
+            let cell = &cell_owned;
             let cell_w: usize = cell.iter().map(|s| disp_width(s.content.as_ref())).sum();
             let pad = col_w.saturating_sub(cell_w);
             let align = table
@@ -2962,6 +3052,11 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // so a multi-line turn reads as one vertical bar in the speaker's color) +
     // an optional full-row bg fill (the user bubble tint). Welcome art is plain
     // (it isn't a turn).
+    // Tables rendered inside `markdown_to_lines` below must fit this width (minus a
+    // small margin) instead of overflowing + getting char-folded into a scrambled
+    // grid. Set once per render; read by `render_table`.
+    set_table_width_budget((area.width as usize).saturating_sub(GUTTER_W + 2).max(20));
+
     let mut rendered: Vec<RenderedRow> = welcome_lines(app)
         .into_iter()
         .map(|l| RenderedRow::plain(l, 0))
@@ -4543,6 +4638,36 @@ mod tests {
         assert!(
             txt.contains("https://x.test/a.png"),
             "image href surfaced (not dropped): {txt}"
+        );
+    }
+
+    #[test]
+    fn wide_table_shrinks_to_the_width_budget() {
+        // A table wider than the viewport must shrink + truncate, not overflow and
+        // char-fold into a scrambled grid.
+        set_table_width_budget(40);
+        let md = "| Name | Description |\n|---|---|\n\
+                  | alpha | a very long description that would overflow the narrow budget by far |";
+        let lines = markdown_to_lines(md, Color::White);
+        set_table_width_budget(0); // reset so other tests render naturally
+        for l in &lines {
+            let w: usize = l.spans.iter().map(|s| disp_width(s.content.as_ref())).sum();
+            assert!(w <= 40, "every table row fits the 40-col budget: width={w}");
+        }
+        assert!(
+            md_text(&lines).contains('\u{2026}'),
+            "the over-long cell was truncated with an ellipsis"
+        );
+    }
+
+    #[test]
+    fn narrow_table_under_budget_is_not_truncated() {
+        set_table_width_budget(80);
+        let lines = markdown_to_lines("| a | b |\n|---|---|\n| 1 | 2 |", Color::White);
+        set_table_width_budget(0);
+        assert!(
+            !md_text(&lines).contains('\u{2026}'),
+            "a small table within budget keeps its full cells"
         );
     }
 
