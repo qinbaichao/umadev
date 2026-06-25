@@ -50,6 +50,11 @@ const CONVERSATION_CAP: usize = 16;
 /// Max chars in the input box.
 const INPUT_CAP: usize = 8192;
 
+/// Marker prefix on the live `Thinking` placeholder System row (P5c). Used to
+/// re-validate the row before collapsing it to a summary, so a shifted/rolled-off
+/// history index can never rewrite an unrelated row.
+pub(crate) const THINKING_PLACEHOLDER_TAG: &str = "[thinking]";
+
 /// Which screen the TUI is showing.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum AppMode {
@@ -738,7 +743,21 @@ pub struct App {
     /// history, so the renderer STOPS auto-sticking to the bottom until they
     /// return (End / scroll back down to 0). Clamped each frame against
     /// [`Self::transcript_max_scroll`].
-    pub transcript_scroll: usize,
+    ///
+    /// **Interior-mutable (P5b)** so the pure `&App` renderer can *re-anchor* it
+    /// when the user is scrolled up and new content lands below: without that the
+    /// from-bottom offset would let fresh rows push the content the user is
+    /// reading upward out of view (a partial auto-follow). When scrolled up, the
+    /// renderer bumps this by exactly the number of rows that appeared below so
+    /// the same rows stay put ("release the pin, hold the anchor"); at offset `0`
+    /// the view stays pinned to the bottom and follows new tokens (sticky). Key
+    /// handlers read/write it through [`Self::transcript_scroll`] /
+    /// [`Self::set_transcript_scroll`].
+    pub transcript_scroll: std::cell::Cell<usize>,
+    /// Previous frame's `hidden_above` (rows hidden above the viewport), published
+    /// by the renderer so the next frame can tell how many rows appeared below and
+    /// re-anchor a scrolled-up view (P5b). `0` until the first render.
+    pub transcript_prev_hidden: std::cell::Cell<usize>,
     /// The maximum the transcript can scroll up (= rows hidden above the
     /// viewport), recomputed by the renderer every frame from the CURRENT
     /// width/height. Interior-mutable so the pure `render` fn can publish it for
@@ -866,6 +885,19 @@ pub struct App {
     pub thinking: bool,
     /// When the current thinking turn began — for the live elapsed readout.
     pub thinking_started: Option<std::time::Instant>,
+
+    /// **P5c — reasoning-block collapse.** When the base emits a `Thinking`
+    /// stream event we push ONE placeholder System line (live spinner) and stamp
+    /// the moment here; the moment the next real content (text / tool) arrives we
+    /// rewrite that line in place to a one-line summary `思考 · 4.2s` instead of
+    /// leaving a stack of orphan `[thinking]` rows. `None` when no reasoning block
+    /// is open. Fail-open: a missing timestamp collapses to a plain "思考完成".
+    pub(crate) thinking_block_start: Option<std::time::Instant>,
+    /// History index of the live `Thinking` placeholder row to rewrite on
+    /// collapse (P5c). `None` when no reasoning block is open. Re-validated
+    /// against the row's content before rewrite so a rolled-off / shifted index
+    /// can never clobber an unrelated row (fail-open).
+    pub(crate) thinking_block_idx: Option<usize>,
     /// A tools-enabled agentic execution call (the SECOND call after an
     /// `agentic` route classification) is streaming — the base is reading /
     /// running / editing in its own tool loop. Drives Ctrl-C: an interrupt
@@ -930,6 +962,14 @@ pub struct App {
     pub status: String,
     /// Spinner animation tick.
     pub tick: u8,
+    /// **P5d — animation master switch.** `true` (default) animates every spinner
+    /// surface through the shared braille frames; `false` (accessibility / a
+    /// non-TTY render target / `/animations off`) renders a single static glyph
+    /// instead, so the UI never strobes. Read once at construction from
+    /// `~/.umadev/settings.json` (`animations_enabled`) AND the real-stdout TTY
+    /// probe, and flipped live by `/animations`. Fail-open: an unreadable setting
+    /// or probe defaults to animated (today's behaviour).
+    pub animations: bool,
     /// `true` when the user asked to quit.
     pub should_quit: bool,
 
@@ -979,6 +1019,17 @@ pub struct App {
     /// to the last Host message (typewriter effect) instead of pushing a new
     /// line. Set false by any non-text event (tool use, result, etc.).
     pub stream_text_active: bool,
+
+    /// **P5a stable-prefix markdown cache** — interior-mutable so the pure
+    /// `&App` renderer can reuse the closed-block render of the message
+    /// currently being streamed, re-rendering only the unclosed tail per delta
+    /// (kills the old O(n²) re-parse of the whole body each frame). Reset when a
+    /// streamed turn settles ([`Self::record_agentic_done`] /
+    /// [`Self::record_route_failed`]) or the context breaks (`/clear`), so the
+    /// next frame falls back to a clean whole-body render. Fully fail-open: any
+    /// precondition miss inside [`crate::ui::stream_markdown_lines`] discards the
+    /// cache and renders the whole body (the prior behaviour).
+    pub(crate) stream_md_cache: std::cell::RefCell<crate::ui::StreamMarkdownCache>,
 
     /// Wall-clock of the LAST sign of life from the base — any worker stream
     /// event, host output line, or progress note. Drives the honest "stall"
@@ -1087,7 +1138,8 @@ impl App {
             input_history_idx: None,
             palette_selected: 0,
             history: VecDeque::new(),
-            transcript_scroll: 0,
+            transcript_scroll: std::cell::Cell::new(0),
+            transcript_prev_hidden: std::cell::Cell::new(0),
             transcript_max_scroll: std::cell::Cell::new(0),
             transcript_viewport_rows: std::cell::Cell::new(0),
             input_text_cols: std::cell::Cell::new(0),
@@ -1115,6 +1167,8 @@ impl App {
             greeted: false,
             thinking: false,
             thinking_started: None,
+            thinking_block_start: None,
+            thinking_block_idx: None,
             agentic_in_flight: false,
             auto_approve_override: None,
             trust_mode_override: None,
@@ -1129,6 +1183,7 @@ impl App {
             pending_quit_confirm: false,
             status: String::new(),
             tick: 0,
+            animations: animations_enabled_default(),
             should_quit: false,
             run_started_at: None,
             phase_started_at: None,
@@ -1138,6 +1193,7 @@ impl App {
             queued_chat: std::collections::VecDeque::new(),
             stream_tool_batch: None,
             stream_text_active: false,
+            stream_md_cache: std::cell::RefCell::new(crate::ui::StreamMarkdownCache::default()),
             last_output_at: None,
             tool_in_progress: false,
             long_op_in_progress: false,
@@ -1753,27 +1809,41 @@ impl App {
     // current upper bound into `transcript_max_scroll` every frame, so these
     // helpers clamp against the real, width-aware overflow instead of guessing.
 
+    /// Current transcript scroll offset (rows scrolled UP from the bottom; `0` =
+    /// pinned to the bottom). Reads the interior-mutable cell (P5b).
+    #[must_use]
+    pub fn transcript_scroll(&self) -> usize {
+        self.transcript_scroll.get()
+    }
+
+    /// Set the transcript scroll offset directly (rows from the bottom).
+    pub fn set_transcript_scroll(&self, rows: usize) {
+        self.transcript_scroll.set(rows);
+    }
+
     /// Scroll the transcript UP by `rows` (toward older history). Any non-zero
     /// scroll makes the renderer STOP auto-sticking to the bottom.
     pub fn transcript_scroll_up(&mut self, rows: usize) {
         let max = self.transcript_max_scroll.get();
-        self.transcript_scroll = self.transcript_scroll.saturating_add(rows).min(max);
+        self.transcript_scroll
+            .set(self.transcript_scroll.get().saturating_add(rows).min(max));
     }
 
     /// Scroll the transcript DOWN by `rows` (toward the newest content). Hitting
     /// `0` re-pins to the bottom and re-enables auto-stick.
     pub fn transcript_scroll_down(&mut self, rows: usize) {
-        self.transcript_scroll = self.transcript_scroll.saturating_sub(rows);
+        self.transcript_scroll
+            .set(self.transcript_scroll.get().saturating_sub(rows));
     }
 
     /// Jump to the very top of the transcript (oldest content on screen).
     pub fn transcript_scroll_to_top(&mut self) {
-        self.transcript_scroll = self.transcript_max_scroll.get();
+        self.transcript_scroll.set(self.transcript_max_scroll.get());
     }
 
     /// Jump back to the bottom (newest content) and re-enable auto-stick.
     pub fn transcript_scroll_to_bottom(&mut self) {
-        self.transcript_scroll = 0;
+        self.transcript_scroll.set(0);
     }
 
     /// Half the transcript viewport, for Ctrl-U / Ctrl-D — at least one row so a
@@ -2840,6 +2910,9 @@ impl App {
                             // fail-open still applies). Comfortably above the soft
                             // cap to span any realistic single code block.
                             const SEGMENT_BYTES_MAX: usize = 24_000;
+                            // P5c: real content ends the reasoning block → collapse
+                            // its live placeholder to a `思考 · 4.2s` summary line.
+                            self.collapse_thinking_block();
                             // Decide WHERE the delta goes without holding a
                             // mutable borrow across a `self.push` (which also
                             // borrows `self.history`): append to the live Host
@@ -2879,12 +2952,18 @@ impl App {
                                 // Either a fresh stream, or a rollover because the
                                 // current segment is full — start a new Host bubble
                                 // so the long reply continues, never truncated.
+                                // P5a: a fresh segment is a fresh body — drop the
+                                // stable-prefix cache so it never reuses the prior
+                                // segment's render against the new (smaller) body.
+                                self.reset_stream_md_cache();
                                 self.push(ChatRole::Host, delta);
                                 self.stream_text_active = true;
                             }
                         }
                     }
                     umadev_runtime::StreamEvent::ToolUse { name, detail, edit } => {
+                        // P5c: a tool call ends the reasoning block.
+                        self.collapse_thinking_block();
                         self.stream_text_active = false; // text stream interrupted
                                                          // A tool call is now in flight — a long one (npm install)
                                                          // is WORK, not a stall, so suppress the red signal until
@@ -2909,6 +2988,8 @@ impl App {
                         }
                     }
                     umadev_runtime::StreamEvent::ToolResult { ok, summary } => {
+                        // P5c: a result is content → close any open reasoning block.
+                        self.collapse_thinking_block();
                         self.stream_text_active = false;
                         // The in-flight tool call returned → no longer "working
                         // on a tool"; the stall clock applies normally again.
@@ -2917,22 +2998,30 @@ impl App {
                         self.attach_tool_result(ok, &summary);
                     }
                     umadev_runtime::StreamEvent::Warning { message } => {
+                        // P5c: a warning closes any open reasoning block.
+                        self.collapse_thinking_block();
                         self.stream_text_active = false;
                         self.push(ChatRole::System, format!("[warn] {message}"));
                     }
                     umadev_runtime::StreamEvent::Thinking => {
-                        // Show a brief "thinking…" indicator. This is replaced
-                        // by actual content when the next text/tool event
-                        // arrives (stream_text_active = false resets it).
+                        // P5c: open (once) a reasoning block. A burst of `Thinking`
+                        // events must NOT stack a wall of `[thinking]` rows — the
+                        // FIRST opens one live placeholder (the bottom waiting
+                        // indicator animates the spinner); subsequent ones are
+                        // no-ops until the block collapses on the next real content.
                         self.stream_text_active = false;
                         self.stream_tool_batch = None;
-                        self.push(
-                            ChatRole::System,
-                            format!(
-                                "[thinking] {}",
-                                umadev_i18n::t(self.lang, "status.thinking")
-                            ),
-                        );
+                        if self.thinking_block_idx.is_none() {
+                            self.thinking_block_start = Some(std::time::Instant::now());
+                            self.push(
+                                ChatRole::System,
+                                format!(
+                                    "{THINKING_PLACEHOLDER_TAG} {}",
+                                    umadev_i18n::t(self.lang, "status.thinking")
+                                ),
+                            );
+                            self.thinking_block_idx = Some(self.history.len() - 1);
+                        }
                     }
                 }
             }
@@ -3648,6 +3737,11 @@ impl App {
         self.thinking = false;
         self.thinking_started = None;
         self.agentic_in_flight = false;
+        // P5c: close any open reasoning block on a failed/aborted route.
+        self.collapse_thinking_block();
+        // P5a: a failed/aborted route ends any in-flight stream — drop its cache.
+        self.stream_text_active = false;
+        self.reset_stream_md_cache();
         // A failed director run does NOT hand a session back to chat (there is no
         // settled build session to continue) — just clear the in-flight marker.
         self.director_run_in_flight = false;
@@ -3673,6 +3767,12 @@ impl App {
         self.tool_in_progress = false;
         self.stream_text_active = false;
         self.stream_tool_batch = None;
+        // P5c: a turn that ends still inside a reasoning block collapses it now.
+        self.collapse_thinking_block();
+        // P5a: the streamed turn is settled — drop the stable-prefix cache so the
+        // final, complete body renders through one clean whole-body pass (the
+        // guaranteed-consistent path) and the NEXT stream starts fresh.
+        self.reset_stream_md_cache();
         // Wave 5 deliverable 2 — unify chat ↔ /run memory. A finished director
         // build hands its session back to chat: the NEXT chat turn resumes the
         // base's most-recent session in this dir (`--continue`) so "why did you
@@ -3793,6 +3893,8 @@ impl App {
         self.finished = false;
         self.run_started = false;
         self.active_gate = None;
+        // P5c: a reset ends any open reasoning block (collapse its placeholder).
+        self.collapse_thinking_block();
         // Drop any not-yet-fired queued steers so they can't bleed into a later
         // run and fire at the wrong gate.
         self.queued_steer.clear();
@@ -3813,11 +3915,67 @@ impl App {
     /// marker so the user knows the reply is INCOMPLETE rather than reading a
     /// half-sentence as if it were the whole answer. No-op when nothing was
     /// streaming. Mirrors Claude Code marking an interrupted turn.
+    /// P5a: forget the stable-prefix streaming markdown cache. Called whenever a
+    /// streamed turn ends or the conversation context breaks, so the next frame
+    /// renders cleanly from scratch. Fail-open: a poisoned/borrowed cell is left
+    /// as-is (the cache's own precondition check discards a stale entry anyway).
+    pub(crate) fn reset_stream_md_cache(&self) {
+        if let Ok(mut c) = self.stream_md_cache.try_borrow_mut() {
+            *c = crate::ui::StreamMarkdownCache::default();
+        }
+    }
+
+    /// P5c: close an open reasoning block — rewrite its live `[thinking]`
+    /// placeholder row to a one-line summary (`正在思考… · 4.2s`, timed from the
+    /// block start) instead of leaving an orphan spinner row. Called the moment
+    /// real content (text / a tool call / a result) arrives after a `Thinking`
+    /// event. No-op when no block is open.
+    ///
+    /// Fail-open: the stored index is re-validated against the row's content
+    /// (still a System `[thinking]` row) before any rewrite, so a rolled-off or
+    /// shifted index can never clobber an unrelated message; a missing timestamp
+    /// degrades to a plain "思考完成"/"done thinking" with no seconds.
+    fn collapse_thinking_block(&mut self) {
+        let Some(idx) = self.thinking_block_idx.take() else {
+            return;
+        };
+        let start = self.thinking_block_start.take();
+        let summary = match start {
+            Some(t) => {
+                // One decimal place of seconds — `思考 · 4.2s`.
+                let secs = t.elapsed().as_secs_f64();
+                format!(
+                    "{} · {secs:.1}s",
+                    umadev_i18n::t(self.lang, "status.thinking")
+                )
+            }
+            // Fail-open: no timing → a plain completion marker, no seconds.
+            None => format!("{} ✓", umadev_i18n::t(self.lang, "status.thinking")),
+        };
+        // Re-validate: only rewrite if the row is still the System placeholder we
+        // pushed (its content starts with the marker tag). Otherwise leave it be.
+        if let Some(msg) = self.history.get_mut(idx) {
+            let is_placeholder = msg.role == ChatRole::System
+                && msg
+                    .body()
+                    .trim_start()
+                    .starts_with(THINKING_PLACEHOLDER_TAG);
+            if is_placeholder {
+                if let Some(text) = msg.text_mut() {
+                    *text = summary;
+                }
+            }
+        }
+    }
+
     pub(crate) fn seal_interrupted_stream(&mut self) {
         if !self.stream_text_active {
             return;
         }
         self.stream_text_active = false;
+        // P5a: the streamed reply was cut off — drop its cache so the sealed
+        // body (with the `[interrupted]` marker) renders as one whole pass.
+        self.reset_stream_md_cache();
         let marker = umadev_i18n::t(self.lang, "chat.interrupted");
         if let Some(last) = self.history.back_mut() {
             if last.role == ChatRole::Host {
@@ -3896,7 +4054,13 @@ impl App {
             "clear" => {
                 self.history.clear();
                 self.conversation.clear();
-                self.transcript_scroll = 0;
+                self.transcript_scroll.set(0);
+                self.transcript_prev_hidden.set(0);
+                // P5a: a cleared transcript invalidates the streaming cache.
+                self.reset_stream_md_cache();
+                // P5c: a cleared history drops any open reasoning-block index.
+                self.thinking_block_idx = None;
+                self.thinking_block_start = None;
                 // A cleared transcript also clears the live plan / review panel +
                 // the last-intent chip — nothing from the prior conversation lingers.
                 self.plan_steps.clear();
@@ -6575,6 +6739,9 @@ impl App {
             })
             .unwrap_or(true);
         let new_val = !current;
+        // P5d: flip the LIVE field so the spinner switches static/animated this
+        // instant — not only after the next restart re-reads settings.json.
+        self.animations = new_val;
         // Read-merge-write so toggling animations never clobbers sibling keys in
         // settings.json, and write atomically (temp+rename) so a crash mid-write
         // can't corrupt it.
@@ -6803,9 +6970,17 @@ impl App {
     /// Current spinner glyph for a running phase.
     #[must_use]
     pub fn spinner(&self) -> char {
-        // Braille-dots spinner, one frame per tick (~80ms) so it visibly spins.
-        const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-        FRAMES[(self.tick as usize) % FRAMES.len()]
+        // P5d: every spinner surface (tool-running glyph, thinking, aliveness)
+        // funnels through this ONE shared braille frame source.
+        //
+        // - Animations off / non-TTY → a single static glyph (`⋯`), so the UI
+        //   never strobes for accessibility or in a piped render.
+        // - Stalled → FREEZE on a fixed frame (the status surface paints it the
+        //   warning color via `is_stalled()`): a stall means "probably wedged", so
+        //   the spinner must STOP moving (a fake-smooth spin would lie that work
+        //   is flowing) while the content stays put.
+        // - Otherwise → advance one braille frame per ~80ms tick.
+        spinner_frame(self.tick, self.animations, self.is_stalled())
     }
 
     /// Animated glyph for the IN-PROGRESS phase circle in the progress bar.
@@ -6819,6 +6994,10 @@ impl App {
     #[must_use]
     pub fn running_circle(&self) -> char {
         const FRAMES: [char; 4] = ['◐', '◓', '◑', '◒'];
+        // P5d: a static, non-strobing glyph when animation is off / non-TTY.
+        if !self.animations {
+            return '○';
+        }
         // tick is ~80ms; /2 → ~160ms per frame (close to the ~120ms target,
         // and an integer divisor of the tick so the cadence stays steady).
         FRAMES[((self.tick as usize) / 2) % FRAMES.len()]
@@ -7056,6 +7235,61 @@ fn is_long_running_command(detail: &str) -> bool {
 /// which would split one code block across two independently-rendered segments
 /// and scramble both. Cheap line scan; fail-open (a malformed body just reads as
 /// "closed" and rolls over normally).
+/// The shared braille spinner frames — the ONE source every animated spinner
+/// surface (tool-running glyph, thinking indicator, aliveness cue) draws from
+/// (P5d), so they all rotate in lockstep at the same cadence.
+pub(crate) const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// The static glyph shown when animation is off / a non-TTY render (P5d) — a
+/// horizontal ellipsis, reading as "working" without strobing.
+pub(crate) const SPINNER_STATIC: char = '⋯';
+
+/// Resolve the spinner glyph for the current tick under the P5d rules: a static
+/// glyph when `animated` is false, a FROZEN frame when `stalled` (the spinner
+/// must stop moving so a stall never looks like smooth progress), else the live
+/// braille frame for `tick`. Pure + total — used by [`App::spinner`] and locked
+/// by unit tests.
+#[must_use]
+pub(crate) fn spinner_frame(tick: u8, animated: bool, stalled: bool) -> char {
+    if !animated {
+        return SPINNER_STATIC;
+    }
+    if stalled {
+        // Freeze on the first frame — the warning color is applied by the caller.
+        return SPINNER_FRAMES[0];
+    }
+    SPINNER_FRAMES[(tick as usize) % SPINNER_FRAMES.len()]
+}
+
+/// P5d: the initial animation state — `false` (static spinner) when stdout is not
+/// a real terminal (CI / piped output) OR the user persisted `animations_enabled
+/// = false`; `true` otherwise. Fail-open to `true` (animated, today's behaviour)
+/// on any read error.
+fn animations_enabled_default() -> bool {
+    use std::io::IsTerminal;
+    // A non-interactive stdout (piped / redirected) never benefits from a spinner
+    // and a strobing braille frame just spams the log — render static there.
+    if !std::io::stdout().is_terminal() {
+        return false;
+    }
+    // Honor a persisted `/animations off`. Absent / unreadable → animated.
+    let path = std::env::var("HOME")
+        .map(|h| {
+            std::path::PathBuf::from(h)
+                .join(".umadev")
+                .join("settings.json")
+        })
+        .unwrap_or_default();
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| {
+            v.get("animations_enabled")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(true)
+}
+
 pub(crate) fn has_open_code_fence(body: &str) -> bool {
     let mut open = false;
     for line in body.lines() {
@@ -7725,12 +7959,17 @@ mod tests {
             workspace.join(".umadevrc"),
             "[pipeline]\nauto_approve_gates = false\n",
         );
-        App::new(
+        let mut app = App::new(
             "demo",
             cfg,
             std::path::PathBuf::from(format!("/tmp/sd-test-cfg-{id}.toml")),
             workspace,
-        )
+        );
+        // P5d: force animations ON in tests so spinner-cadence assertions are
+        // deterministic regardless of whether the test host's stdout is a TTY
+        // (where `animations_enabled_default` would otherwise pick `false`).
+        app.animations = true;
+        app
     }
 
     #[test]
@@ -7813,13 +8052,13 @@ mod tests {
             crossterm::event::KeyCode::Up,
             crossterm::event::KeyModifiers::SHIFT,
         );
-        assert_eq!(app.transcript_scroll, 1);
+        assert_eq!(app.transcript_scroll(), 1);
         // Shift+↓ brings it back.
         let _ = app.apply_key_with_mods(
             crossterm::event::KeyCode::Down,
             crossterm::event::KeyModifiers::SHIFT,
         );
-        assert_eq!(app.transcript_scroll, 0);
+        assert_eq!(app.transcript_scroll(), 0);
     }
 
     #[test]
@@ -7829,20 +8068,20 @@ mod tests {
         app.transcript_viewport_rows.set(20);
         // PageUp = viewport - 1 rows.
         let _ = app.apply_key(crossterm::event::KeyCode::PageUp);
-        assert_eq!(app.transcript_scroll, 19);
+        assert_eq!(app.transcript_scroll(), 19);
         // Home jumps to the very top (= max scroll).
         let _ = app.apply_key(crossterm::event::KeyCode::Home);
-        assert_eq!(app.transcript_scroll, 100);
+        assert_eq!(app.transcript_scroll(), 100);
         // End re-pins to the bottom.
         let _ = app.apply_key(crossterm::event::KeyCode::End);
-        assert_eq!(app.transcript_scroll, 0);
+        assert_eq!(app.transcript_scroll(), 0);
         // Ctrl+Alt+U = half a page up (the half-page scroll moved off bare
         // Ctrl-U so the shell "clear line" key keeps its job).
         let _ = app.apply_key_with_mods(
             crossterm::event::KeyCode::Char('u'),
             crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT,
         );
-        assert_eq!(app.transcript_scroll, 10);
+        assert_eq!(app.transcript_scroll(), 10);
     }
 
     #[test]
@@ -7854,20 +8093,22 @@ mod tests {
         // Ctrl+Alt+U → half a viewport up (20 / 2 = 10).
         let _ = app.apply_key_with_mods(crossterm::event::KeyCode::Char('u'), cmd_alt);
         assert_eq!(
-            app.transcript_scroll, 10,
+            app.transcript_scroll(),
+            10,
             "Ctrl+Alt+U scrolls half a page up"
         );
         // Ctrl+Alt+D → half a viewport back down.
         let _ = app.apply_key_with_mods(crossterm::event::KeyCode::Char('d'), cmd_alt);
         assert_eq!(
-            app.transcript_scroll, 0,
+            app.transcript_scroll(),
+            0,
             "Ctrl+Alt+D scrolls half a page down"
         );
         // Ctrl+Alt+B / Ctrl+Alt+F are paging aliases.
         let _ = app.apply_key_with_mods(crossterm::event::KeyCode::Char('b'), cmd_alt);
-        assert_eq!(app.transcript_scroll, 10, "Ctrl+Alt+B aliases scroll-up");
+        assert_eq!(app.transcript_scroll(), 10, "Ctrl+Alt+B aliases scroll-up");
         let _ = app.apply_key_with_mods(crossterm::event::KeyCode::Char('f'), cmd_alt);
-        assert_eq!(app.transcript_scroll, 0, "Ctrl+Alt+F aliases scroll-down");
+        assert_eq!(app.transcript_scroll(), 0, "Ctrl+Alt+F aliases scroll-down");
     }
 
     #[test]
@@ -7882,19 +8123,21 @@ mod tests {
             crossterm::event::KeyModifiers::CONTROL,
         );
         assert_eq!(
-            app.transcript_scroll, 0,
+            app.transcript_scroll(),
+            0,
             "bare Ctrl-U must not move the transcript"
         );
         // Scroll up first, then bare Ctrl-D: it must NOT scroll back (Ctrl-D is
         // the terminal EOF/quit convention, not a scroll key). On empty input
         // it routes to quit, so assert via should_quit and a still-scrolled view.
-        app.transcript_scroll = 30;
+        app.transcript_scroll.set(30);
         let _ = app.apply_key_with_mods(
             crossterm::event::KeyCode::Char('d'),
             crossterm::event::KeyModifiers::CONTROL,
         );
         assert_eq!(
-            app.transcript_scroll, 30,
+            app.transcript_scroll(),
+            30,
             "bare Ctrl-D must not move the transcript"
         );
         assert!(app.should_quit, "bare Ctrl-D on empty input quits (EOF)");
@@ -7929,13 +8172,14 @@ mod tests {
     fn submitting_a_turn_repins_transcript_to_bottom() {
         let mut app = fresh_app(Some("offline"));
         app.transcript_max_scroll.set(50);
-        app.transcript_scroll = 30; // user is reviewing history
+        app.transcript_scroll.set(30); // user is reviewing history
         for c in "hello".chars() {
             let _ = app.apply_key(crossterm::event::KeyCode::Char(c));
         }
         let _ = app.apply_key(crossterm::event::KeyCode::Enter);
         assert_eq!(
-            app.transcript_scroll, 0,
+            app.transcript_scroll(),
+            0,
             "submitting must snap back to the newest content"
         );
     }
@@ -10490,6 +10734,122 @@ mod tests {
             a.tick();
         }
         assert_eq!(a.spinner(), first);
+    }
+
+    #[test]
+    fn p5c_thinking_collapses_to_one_summary_row() {
+        // P5c: a burst of Thinking events opens exactly ONE placeholder row; the
+        // next real content collapses it to a single `正在思考… · N.Ns` summary
+        // instead of leaving a stack of orphan `[thinking]` rows.
+        let mut a = fresh_app(Some("offline"));
+        let before = a.history.len();
+        for _ in 0..5 {
+            a.apply_engine(EngineEvent::WorkerStream {
+                event: umadev_runtime::StreamEvent::Thinking,
+            });
+        }
+        // Only ONE placeholder row was pushed despite five Thinking events.
+        assert_eq!(
+            a.history.len(),
+            before + 1,
+            "a thinking burst must not stack rows"
+        );
+        let placeholder_idx = a.history.len() - 1;
+        assert!(a
+            .history
+            .back()
+            .unwrap()
+            .body()
+            .contains(THINKING_PLACEHOLDER_TAG));
+        assert!(a.thinking_block_idx.is_some(), "a reasoning block is open");
+        // Real content arrives → the placeholder collapses to a summary in place
+        // (no new row added for the collapse itself).
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::Text {
+                delta: "here is the answer".into(),
+            },
+        });
+        assert!(a.thinking_block_idx.is_none(), "block closed after content");
+        let collapsed = a.history.get(placeholder_idx).unwrap().body().into_owned();
+        assert!(
+            !collapsed.contains(THINKING_PLACEHOLDER_TAG),
+            "placeholder tag is gone after collapse: {collapsed:?}"
+        );
+        // The summary carries the thinking label + a seconds figure (`· N.Ns`).
+        assert!(
+            collapsed.contains('·') && collapsed.contains('s'),
+            "summary shows elapsed seconds: {collapsed:?}"
+        );
+    }
+
+    #[test]
+    fn p5c_collapse_failopen_without_timing() {
+        // Fail-open: if the block-start timestamp is missing, the collapse still
+        // rewrites the placeholder (to a no-seconds completion marker), never
+        // leaving an orphan `[thinking]` row.
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::Thinking,
+        });
+        let idx = a.thinking_block_idx.unwrap();
+        a.thinking_block_start = None; // simulate lost timing
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ToolResult {
+                ok: true,
+                summary: "done".into(),
+            },
+        });
+        let row = a.history.get(idx).unwrap().body().into_owned();
+        assert!(
+            !row.contains(THINKING_PLACEHOLDER_TAG),
+            "placeholder still collapsed without timing: {row:?}"
+        );
+    }
+
+    #[test]
+    fn p5d_spinner_frame_static_when_animations_off() {
+        // P5d: animations off → a single static glyph, never a strobing frame.
+        for tick in 0..30u8 {
+            assert_eq!(
+                spinner_frame(tick, false, false),
+                SPINNER_STATIC,
+                "animations off must be static at tick {tick}"
+            );
+        }
+    }
+
+    #[test]
+    fn p5d_spinner_frame_freezes_on_stall() {
+        // P5d: a stall FREEZES the spinner on one frame (the status surface paints
+        // it the warning color) — it must not keep fake-spinning.
+        let frozen = spinner_frame(0, true, true);
+        for tick in 0..30u8 {
+            assert_eq!(
+                spinner_frame(tick, true, true),
+                frozen,
+                "stalled spinner must not advance (tick {tick})"
+            );
+        }
+        // And while NOT stalled it does advance through the braille frames.
+        let mut seen = std::collections::HashSet::new();
+        for tick in 0..10u8 {
+            seen.insert(spinner_frame(tick, true, false));
+        }
+        assert_eq!(seen.len(), SPINNER_FRAMES.len(), "all frames appear");
+    }
+
+    #[test]
+    fn p5d_app_spinner_uses_shared_frames() {
+        // The App-level spinner funnels through the shared frame source, so a
+        // non-animated app shows the static glyph and an animated one rotates.
+        let mut a = fresh_app(Some("offline"));
+        a.animations = false;
+        assert_eq!(a.spinner(), SPINNER_STATIC);
+        a.animations = true;
+        assert_eq!(
+            a.spinner(),
+            SPINNER_FRAMES[a.tick as usize % SPINNER_FRAMES.len()]
+        );
     }
 
     #[test]

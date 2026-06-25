@@ -47,6 +47,14 @@ mod theme {
         !IS_LIGHT.load(Ordering::Relaxed)
     }
 
+    /// A stable id for the ACTIVE palette (P3 highlight-cache key component). The
+    /// dark/light flip is the only thing that changes a highlighted line's colors,
+    /// so a single bool fully identifies the theme generation. Returned as `u8`
+    /// so the cache key stays a plain hashable tuple.
+    pub(crate) fn theme_id() -> u8 {
+        u8::from(IS_LIGHT.load(Ordering::Relaxed))
+    }
+
     fn pick(p: &Pair) -> Color {
         if is_dark() {
             p.dark
@@ -741,6 +749,131 @@ fn markdown_to_lines(text: &str, base_color: Color) -> Vec<Line<'static>> {
     }
 }
 
+/// **P5a — stable-prefix streaming cache.** Caches the rendered `Vec<Line>` for
+/// the *closed* markdown blocks of the message currently being streamed, so each
+/// arriving delta only re-renders the small, still-growing tail instead of
+/// re-parsing the whole (possibly 998-line) body every frame (the old O(n²)).
+///
+/// **Correctness — proven line-for-line identical to a whole-body render.** The
+/// split point is a byte offset immediately *after* a top-level `\n\n` block
+/// separator (and fence-balanced before it). At such a boundary the CommonMark
+/// compiler distributes exactly:
+///
+/// ```text
+/// markdown_to_lines(body)
+///   == markdown_to_lines(&body[..s]) ++ [blank line] ++ markdown_to_lines(&body[s..])
+/// ```
+///
+/// (the `markdown_to_lines(&body[..s])` render trims its own trailing blank, and
+/// the whole-render inserts exactly ONE separator blank between the last cached
+/// block and the next — so the single `[blank]` re-inserts it). This identity is
+/// locked by [`tests::stream_incremental_equals_whole_render`]. Fail-open: any
+/// mismatch in the monotonic-growth precondition discards the cache and renders
+/// the whole body (the prior behaviour).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StreamMarkdownCache {
+    /// Byte length of the body when [`Self::stable_offset`] / [`Self::prefix_lines`]
+    /// were last computed. A new body that does NOT start with this exact prefix
+    /// (shorter, or a different stable region) invalidates the cache.
+    body_len: usize,
+    /// Offset into the body up to which [`Self::prefix_lines`] is the render. Always
+    /// at a top-level `\n\n` boundary, fence-balanced. Advances monotonically.
+    stable_offset: usize,
+    /// `markdown_to_lines(&body[..stable_offset])` — the closed-block render reused
+    /// verbatim each frame. The separator blank is added at compose time, NOT here.
+    prefix_lines: Vec<Line<'static>>,
+}
+
+/// Find the stable split point for [P5a]: the byte offset just past the
+/// **second-to-last** top-level `\n\n` block separator that is fence-balanced and
+/// `>= min` — so the cached prefix holds every closed block EXCEPT the last one,
+/// and the re-rendered tail always carries that last full block plus any
+/// still-incomplete trailing content.
+///
+/// **Why keep the last block in the tail.** A bare trailing construct renders
+/// *differently* alone vs. after a block: e.g. `markdown_to_lines(">")` keeps a
+/// `>` line, but `markdown_to_lines("after\n\n>")` drops it. If the prefix
+/// absorbed `after` and the tail were just `>`, the streamed compose would gain a
+/// phantom line the settled whole-render lacks. Holding the last full block in
+/// the tail makes the tail render the trailing construct exactly as the whole
+/// does. (Boundaries strictly inside an open code fence are never eligible.)
+///
+/// Returns `min` when fewer than two qualifying boundaries exist at/after `min`
+/// (so the caller renders the whole small body). O(body) per call — cheap next to
+/// a full markdown re-parse, and monotonic in `min`.
+fn last_stable_md_boundary(body: &str, min: usize) -> usize {
+    let bytes = body.as_bytes();
+    // Track the LAST and SECOND-TO-LAST fence-balanced `\n\n` boundary at/after
+    // `min`. The prefix ends at the second-to-last so the last full block stays
+    // in the tail (see the "why" above).
+    let mut last = min;
+    let mut second_last = min;
+    let mut i = min;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'\n' && bytes[i + 1] == b'\n' {
+            let cand = i + 2;
+            if cand > last && cand <= body.len() && !crate::app::has_open_code_fence(&body[..cand])
+            {
+                second_last = last;
+                last = cand;
+            }
+        }
+        i += 1;
+    }
+    second_last.max(min)
+}
+
+/// **P5a compose.** Render a streaming body using `cache` for its stable prefix,
+/// re-rendering only the unclosed tail, and advance the cache in place. Returns
+/// the full `Vec<Line>` — guaranteed identical to `markdown_to_lines(body)`.
+///
+/// Fail-open: if the cache's recorded prefix is no longer a true prefix of `body`
+/// (the body shrank or the stable region changed — e.g. a `/clear`, a segment
+/// rollover, or a non-monotonic edit), the cache is reset and the whole body is
+/// rendered, exactly as before.
+fn stream_markdown_lines(cache: &mut StreamMarkdownCache, body: &str) -> Vec<Line<'static>> {
+    // Validate the monotonic-growth precondition: the cached stable region must
+    // still be a byte-prefix of the current body. If not, discard and recompute.
+    let prefix_ok = cache.stable_offset <= body.len()
+        && cache.body_len <= body.len()
+        && body.is_char_boundary(cache.stable_offset);
+    if !prefix_ok {
+        *cache = StreamMarkdownCache::default();
+    }
+
+    // Advance the stable boundary as far as the new content allows (monotonic).
+    let new_offset = last_stable_md_boundary(body, cache.stable_offset);
+    if new_offset > cache.stable_offset || (cache.prefix_lines.is_empty() && new_offset > 0) {
+        // Re-render the (now larger) closed prefix once. This is the only place
+        // the prefix is parsed; subsequent deltas reuse it untouched.
+        cache.prefix_lines = markdown_to_lines(&body[..new_offset], theme::TEXT());
+        cache.stable_offset = new_offset;
+    }
+    cache.body_len = body.len();
+
+    if cache.stable_offset == 0 {
+        // No closed block yet — nothing to reuse; render the whole (small) body.
+        return markdown_to_lines(body, theme::TEXT());
+    }
+
+    // Compose: cached closed-block lines + the freshly-rendered tail, with ONE
+    // separator blank between them — but ONLY when the tail actually renders a
+    // following block. When the tail is empty (the stable prefix IS the whole
+    // body so far, e.g. the delta just closed a block and nothing follows yet),
+    // the whole-render has no trailing block and no separator blank — so we must
+    // not add one either, or the streamed view would gain a spurious blank line
+    // that the settled whole-render lacks. Proven equal to the whole-body render.
+    let tail = markdown_to_lines(&body[cache.stable_offset..], theme::TEXT());
+    if tail.is_empty() {
+        return cache.prefix_lines.clone();
+    }
+    let mut out = Vec::with_capacity(cache.prefix_lines.len() + 1 + tail.len());
+    out.extend(cache.prefix_lines.iter().cloned());
+    out.push(Line::from(""));
+    out.extend(tail);
+    out
+}
+
 /// The plain per-line fallback (the old behavior): one styled Line per source
 /// line, no parsing. Used when CommonMark parsing fails. Never panics.
 fn plaintext_lines(text: &str, base_color: Color) -> Vec<Line<'static>> {
@@ -1036,13 +1169,94 @@ fn flush_run(spans: &mut Vec<Span<'static>>, buf: &mut String, is_ident: bool, k
     spans.push(role_span(std::mem::take(buf), role, Modifier::empty()));
 }
 
+/// **P3 — syntax-highlight LRU cache.** A small per-thread cache mapping
+/// `(line-content-hash, lang, theme-id)` → the highlighted spans, so scrolling
+/// back over already-rendered code/diff is O(1) per line instead of re-running
+/// the tokenizer every frame. Bounded (`HL_CACHE_CAP` entries, LRU eviction).
+/// Fully fail-open: a borrow conflict / a full cache simply computes uncached.
+const HL_CACHE_CAP: usize = 512;
+
+struct HlCache {
+    /// hash key → spans.
+    map: std::collections::HashMap<u64, Vec<Span<'static>>>,
+    /// Recency queue (front = oldest); the back is the most-recently used. On a
+    /// hit the key is moved to the back; on insert past the cap the front evicts.
+    order: std::collections::VecDeque<u64>,
+}
+
+impl HlCache {
+    fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+thread_local! {
+    static HL_CACHE: std::cell::RefCell<HlCache> = std::cell::RefCell::new(HlCache::new());
+}
+
+/// Hash `(line, lang, theme)` into the cache key. `DefaultHasher` is fine here —
+/// the cache is per-thread, advisory, and a (vanishingly unlikely) collision only
+/// re-highlights a line the same way, never corrupts output.
+fn hl_key(line: &str, lang: Option<&str>, theme: u8) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    line.hash(&mut h);
+    lang.unwrap_or("").hash(&mut h);
+    theme.hash(&mut h);
+    h.finish()
+}
+
+/// Syntax-highlight `line` with the P3 LRU cache in front of the tokenizer.
+/// Keyed on the content + language + active theme, so a theme flip never serves
+/// stale colors. Fail-open: any cache hiccup falls through to a direct compute.
+fn highlight_code_line(line: &str, lang: Option<&str>) -> Vec<Span<'static>> {
+    let key = hl_key(line, lang, theme::theme_id());
+    // Fast path: a cache hit clones the stored spans and promotes the key.
+    let hit = HL_CACHE.with(|c| {
+        c.try_borrow_mut().ok().and_then(|mut cache| {
+            if let Some(spans) = cache.map.get(&key).cloned() {
+                // Promote to most-recently-used.
+                if let Some(pos) = cache.order.iter().position(|k| *k == key) {
+                    cache.order.remove(pos);
+                }
+                cache.order.push_back(key);
+                Some(spans)
+            } else {
+                None
+            }
+        })
+    });
+    if let Some(spans) = hit {
+        return spans;
+    }
+    // Miss: compute once, then store (LRU-evicting the oldest past the cap).
+    let spans = highlight_code_line_uncached(line, lang);
+    HL_CACHE.with(|c| {
+        if let Ok(mut cache) = c.try_borrow_mut() {
+            if cache.map.insert(key, spans.clone()).is_none() {
+                cache.order.push_back(key);
+                while cache.order.len() > HL_CACHE_CAP {
+                    if let Some(evict) = cache.order.pop_front() {
+                        cache.map.remove(&evict);
+                    }
+                }
+            }
+        }
+    });
+    spans
+}
+
 /// Per-language lightweight tokenizer → semantic-role spans. NOT a parser: a
 /// regex-free, allocation-light scan that recognises comments, string/char
 /// literals, numbers, keywords (per language family), type-ish identifiers
 /// (CamelCase / known primitives), and diff markers — emitting [`SynRole`] tags
 /// only. An unknown language falls back to plaintext with string/number/comment
-/// heuristics. Never panics (char-boundary safe).
-fn highlight_code_line(line: &str, lang: Option<&str>) -> Vec<Span<'static>> {
+/// heuristics. Never panics (char-boundary safe). The cached entry point is
+/// [`highlight_code_line`] (P3).
+fn highlight_code_line_uncached(line: &str, lang: Option<&str>) -> Vec<Span<'static>> {
     // Diff hunks: color the whole line by its first column (but NOT the
     // `+++`/`---` file headers, which carry no add/del meaning).
     let lang = lang.unwrap_or("");
@@ -2465,7 +2679,27 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
                 } else {
                     body.into_owned()
                 };
-                let body_lines = markdown_to_lines(&folded, theme::TEXT());
+                // **P5a**: the message currently being streamed (the LAST Host
+                // text segment while `stream_text_active`) renders through the
+                // stable-prefix cache — only its unclosed tail is re-parsed each
+                // frame. Every other message renders whole, unchanged. The cached
+                // compose is proven line-for-line identical to a whole render, so
+                // the visible output is byte-for-byte the same either way.
+                let is_live_stream = app.stream_text_active
+                    && msg_idx + 1 == app.history.len()
+                    && matches!(msg.role, ChatRole::Host)
+                    && matches!(msg.kind, MessageBody::Text(_))
+                    && !(msg.collapsed && crate::app::message_is_collapsible(msg));
+                let body_lines = if is_live_stream {
+                    // Fail-open: a borrow conflict (re-entrant render) falls back
+                    // to a plain whole-body render.
+                    match app.stream_md_cache.try_borrow_mut() {
+                        Ok(mut cache) => stream_markdown_lines(&mut cache, &folded),
+                        Err(_) => markdown_to_lines(&folded, theme::TEXT()),
+                    }
+                } else {
+                    markdown_to_lines(&folded, theme::TEXT())
+                };
                 for (i, bl) in body_lines.into_iter().enumerate() {
                     let mut spans: Vec<Span<'static>> = Vec::new();
                     if i == 0 {
@@ -2561,7 +2795,27 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // grew and content now fits) can't push the view off the end.
     app.transcript_max_scroll.set(hidden_above);
     app.transcript_viewport_rows.set(inner_height);
-    let user_offset = app.transcript_scroll.min(hidden_above);
+
+    // **P5b — sticky-to-bottom + scroll-up anchor.** `transcript_scroll` is the
+    // rows-from-bottom offset (`0` = pinned to the bottom). When the user is
+    // pinned (`0`), new content keeps the view glued to the newest line (sticky,
+    // follows streaming tokens). When the user has scrolled UP, fresh rows landing
+    // BELOW the viewport would otherwise push the content they're reading upward
+    // (the from-bottom offset stays fixed while the bottom moves). To hold the
+    // anchor, bump the offset by exactly the number of rows that appeared below
+    // since the last frame, so the SAME rows stay on screen — the pin is released
+    // but the reading position is held. Fail-open: clamps to `hidden_above`, and a
+    // first frame (`prev == 0`) makes no adjustment.
+    let prev_hidden = app.transcript_prev_hidden.get();
+    let cur_scroll = app.transcript_scroll.get();
+    if cur_scroll > 0 && hidden_above > prev_hidden {
+        let grew_below = hidden_above - prev_hidden;
+        let anchored = cur_scroll.saturating_add(grew_below).min(hidden_above);
+        app.transcript_scroll.set(anchored);
+    }
+    app.transcript_prev_hidden.set(hidden_above);
+
+    let user_offset = app.transcript_scroll.get().min(hidden_above);
 
     // Effective scroll: bottom-pinned is `hidden_above`; scrolling up SUBTRACTS
     // the user's offset so older content comes into view. At offset 0 the view
@@ -3594,6 +3848,136 @@ mod tests {
     use umadev_agent::{EngineEvent, Gate};
     use umadev_spec::Phase;
 
+    /// Line-for-line span+style equality, used to lock the P5a invariant.
+    fn lines_eq(a: &[Line<'static>], b: &[Line<'static>]) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b.iter()).all(|(x, y)| {
+                let xs: Vec<(&str, _)> = x
+                    .spans
+                    .iter()
+                    .map(|s| (s.content.as_ref(), s.style))
+                    .collect();
+                let ys: Vec<(&str, _)> = y
+                    .spans
+                    .iter()
+                    .map(|s| (s.content.as_ref(), s.style))
+                    .collect();
+                xs == ys
+            })
+    }
+
+    #[test]
+    fn stream_incremental_equals_whole_render() {
+        // P5a HARD INVARIANT: feeding a body to the stable-prefix cache one delta
+        // at a time and composing `cached-prefix ++ [blank] ++ tail` must equal a
+        // one-shot whole-body `markdown_to_lines` at EVERY intermediate length —
+        // otherwise the streaming view would diverge from the settled view.
+        let bodies = [
+            "# Heading\n\nFirst paragraph with **bold** and `code`.\n\n\
+             Second paragraph.\n\n- bullet one\n- bullet two\n\n\
+             ```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n\n\
+             Closing line of prose.",
+            "Para A.\n\nPara B.\n\nPara C.\n\nPara D.",
+            "intro text\n\n```\nplain code\nmore code\n```\n\nafter\n\n> a quote\n\nend",
+            "## Title\n\n1. one\n2. two\n3. three\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\ndone",
+            "中文段落一。\n\n中文段落二,带 **加粗**。\n\n- 列表项一\n- 列表项二\n\n结尾。",
+        ];
+        for body in bodies {
+            // Compare against the SAME base color the production compose uses
+            // (`theme::TEXT()`), so a plaintext-fallback path can't diverge purely
+            // on the unused base color rather than a real structural difference.
+            let whole = markdown_to_lines(body, theme::TEXT());
+            let mut cache = StreamMarkdownCache::default();
+            // Grow byte-by-byte at char boundaries — the worst case for the
+            // boundary finder (every possible split is exercised).
+            let mut prev: Vec<Line<'static>> = Vec::new();
+            for end in 1..=body.len() {
+                if !body.is_char_boundary(end) {
+                    continue;
+                }
+                let partial = &body[..end];
+                let inc = stream_markdown_lines(&mut cache, partial);
+                let whole_partial = markdown_to_lines(partial, theme::TEXT());
+                assert!(
+                    lines_eq(&inc, &whole_partial),
+                    "P5a divergence at len {end} of body {body:?}\n  inc={} whole={}",
+                    inc.len(),
+                    whole_partial.len()
+                );
+                prev = inc;
+            }
+            // Final full-body length matches the one-shot whole render.
+            assert!(
+                lines_eq(&prev, &whole),
+                "P5a final mismatch for body {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_cache_resets_on_shrink_failopen() {
+        // Fail-open: if the body shrinks (e.g. a segment rollover starts a fresh,
+        // smaller body), the cache must discard its stale prefix and still render
+        // the new body correctly (== whole render), never reuse the old prefix.
+        let mut cache = StreamMarkdownCache::default();
+        let big = "Block one.\n\nBlock two.\n\nBlock three.\n\nBlock four.";
+        let _ = stream_markdown_lines(&mut cache, big);
+        assert!(
+            cache.stable_offset > 0,
+            "a multi-block body builds a prefix"
+        );
+        // Now a SHORTER, different body (rollover): must reset + render correctly.
+        let small = "Totally new.\n\nDifferent body.";
+        let inc = stream_markdown_lines(&mut cache, small);
+        let whole = markdown_to_lines(small, theme::TEXT());
+        assert!(
+            lines_eq(&inc, &whole),
+            "shrink must render the new body whole"
+        );
+    }
+
+    #[test]
+    fn stream_cache_no_split_inside_code_fence() {
+        // The boundary finder must NEVER place a stable split inside an OPEN code
+        // fence — that would cache the opening ``` without its close and scramble
+        // the highlighting. With a body whose only `\n\n` sits inside an unclosed
+        // fence, there is no eligible boundary, so the offset stays 0 (whole-body
+        // render, fence intact).
+        let open = "text\n\n```rust\nlet x = 1;\n\nlet y = 2;\n";
+        let off = last_stable_md_boundary(open, 0);
+        // The `\n\n` after `text` (offset 6) is the only fence-balanced boundary;
+        // it's a SINGLE boundary, so the second-to-last rule keeps the offset at 0
+        // (the last block stays in the tail) — and the inner blank, being inside
+        // the open fence, is never eligible.
+        assert_eq!(off, 0, "a lone fence-balanced boundary keeps offset 0");
+        // Whichever offset is chosen, no split ever lands inside the open fence:
+        // every candidate offset leaves a fence-balanced prefix.
+        assert!(
+            !crate::app::has_open_code_fence(&open[..off]),
+            "the chosen prefix is never inside an open fence"
+        );
+        // The incremental render matches the whole render regardless.
+        let mut cache = StreamMarkdownCache::default();
+        let inc = stream_markdown_lines(&mut cache, open);
+        let whole = markdown_to_lines(open, theme::TEXT());
+        assert!(lines_eq(&inc, &whole));
+
+        // With the fence CLOSED and prose after it, there are now two boundaries
+        // (after `text`, after the closed fence) — the second-to-last (after
+        // `text`) is chosen, and it is fence-balanced (the closed fence is in the
+        // tail with its prose).
+        let closed = "text\n\n```rust\nlet x = 1;\n```\n\nmore prose here\n\ntail";
+        let off2 = last_stable_md_boundary(closed, 0);
+        assert!(
+            off2 > 0,
+            "a closed fence + following blocks yields a boundary"
+        );
+        assert!(
+            !crate::app::has_open_code_fence(&closed[..off2]),
+            "the prefix is fence-balanced"
+        );
+    }
+
     #[test]
     fn markdown_to_lines_handles_unicode_bullets_without_panic() {
         // Regression: `•` (U+2022) is 3 bytes; a hardcoded `&trimmed[2..]`
@@ -3847,7 +4231,7 @@ mod tests {
     }
 
     fn app_with(backend: Option<&str>) -> App {
-        App::new(
+        let mut app = App::new(
             "demo",
             UserConfig {
                 backend: backend.map(str::to_string),
@@ -3856,7 +4240,10 @@ mod tests {
             },
             std::path::PathBuf::from("/tmp/sd-test-config.toml"),
             std::path::PathBuf::from("/tmp/sd-test-workspace"),
-        )
+        );
+        // P5d: deterministic spinner cadence in render tests (see fresh_app).
+        app.animations = true;
+        app
     }
 
     // --- Picker ---
@@ -4325,12 +4712,13 @@ mod tests {
         // Ask for far more than exists.
         app.transcript_scroll_up(10_000);
         assert_eq!(
-            app.transcript_scroll, max,
+            app.transcript_scroll(),
+            max,
             "scroll-up must clamp at hidden_above"
         );
         // Scrolling back down past 0 re-pins to the bottom.
         app.transcript_scroll_down(10_000);
-        assert_eq!(app.transcript_scroll, 0);
+        assert_eq!(app.transcript_scroll(), 0);
     }
 
     #[test]
@@ -4363,10 +4751,135 @@ mod tests {
         // End re-pins to the bottom (auto-stick resumes): recent content is back
         // and the welcome banner is hidden again.
         app.transcript_scroll_to_bottom();
-        assert_eq!(app.transcript_scroll, 0);
+        assert_eq!(app.transcript_scroll(), 0);
         let back = render_chat_at(&app, 80, 18);
         assert!(back.contains("scroll-content-line-57"));
         assert!(!back.contains("▟▀▀▀▀▀▙"));
+    }
+
+    #[test]
+    fn p5b_scrolled_up_view_holds_anchor_when_content_grows() {
+        // P5b: while the user is scrolled UP reading history, content arriving at
+        // the BOTTOM must NOT push what they're reading off-screen. The renderer
+        // re-anchors the from-bottom offset by the rows that appeared below.
+        let mut app = app_with_long_transcript(60);
+        // Render once to publish the scroll bounds, then scroll up to a known spot.
+        let _ = render_chat_at(&app, 80, 18);
+        app.transcript_scroll_to_top();
+        let before = render_chat_at(&app, 80, 18);
+        assert!(
+            before.contains("▟▀▀▀▀▀▙"),
+            "scrolled to top shows the banner"
+        );
+        let off_before = app.transcript_scroll();
+        // New content lands at the bottom while the user is scrolled up.
+        for i in 60..75 {
+            app.apply_engine(umadev_agent::EngineEvent::Note(format!(
+                "scroll-content-line-{i}"
+            )));
+        }
+        let after = render_chat_at(&app, 80, 18);
+        // The anchored view still shows the very top (banner), NOT drifted down to
+        // the freshly-added lines — the offset grew to absorb the new rows.
+        assert!(
+            after.contains("▟▀▀▀▀▀▙"),
+            "anchor must hold the top in view after growth: {after}"
+        );
+        assert!(
+            app.transcript_scroll() >= off_before,
+            "offset must grow to hold the anchor (was {off_before}, now {})",
+            app.transcript_scroll()
+        );
+        // And re-pinning to the bottom still follows the newest content (sticky):
+        // the offset is 0 and a just-added recent line is on screen (the very last
+        // logical row can sit on the clipped bottom edge under the input, so assert
+        // on a recent-but-not-final line to prove the view jumped to the new tail).
+        app.transcript_scroll_to_bottom();
+        let bottom = render_chat_at(&app, 80, 18);
+        assert_eq!(app.transcript_scroll(), 0, "re-pinned to the bottom");
+        assert!(
+            bottom.contains("scroll-content-line-72") || bottom.contains("scroll-content-line-73"),
+            "bottom-pinned view follows the newest content: {bottom}"
+        );
+        // The OLD top (banner) is no longer on screen once pinned to the bottom.
+        assert!(
+            !bottom.contains("▟▀▀▀▀▀▙"),
+            "bottom view scrolled past the banner"
+        );
+    }
+
+    #[test]
+    fn p5b_pinned_to_bottom_follows_new_content() {
+        // Sticky: at offset 0 (pinned), new content keeps the view on the newest
+        // line — the offset stays 0 and the latest row is visible.
+        let mut app = app_with_long_transcript(40);
+        let _ = render_chat_at(&app, 80, 18);
+        assert_eq!(app.transcript_scroll(), 0, "starts pinned to the bottom");
+        // A recent line of the initial batch is on screen while pinned (the very
+        // last logical row can sit on the clipped bottom edge under the input, so
+        // assert on a recent-but-not-final line).
+        let initial = render_chat_at(&app, 80, 18);
+        assert!(
+            initial.contains("scroll-content-line-37")
+                || initial.contains("scroll-content-line-38"),
+            "pinned view shows recent lines: {initial}"
+        );
+        // New content arrives — pinned view stays at 0 (follows) and the new tail
+        // comes into view, pushing the previously-newest lines toward / off the top
+        // of the viewport. The offset never leaves 0 (sticky-to-bottom).
+        for i in 41..50 {
+            app.apply_engine(umadev_agent::EngineEvent::Note(format!(
+                "scroll-content-line-{i}"
+            )));
+        }
+        let out = render_chat_at(&app, 80, 18);
+        assert_eq!(app.transcript_scroll(), 0, "stays pinned after new content");
+        // The view followed the new tail: a just-added recent line is now visible
+        // and the old batch's lines have scrolled off the top.
+        assert!(
+            out.contains("scroll-content-line-46") || out.contains("scroll-content-line-47"),
+            "pinned view followed the new tail: {out}"
+        );
+        assert!(
+            !out.contains("scroll-content-line-30"),
+            "older lines scrolled off the top: {out}"
+        );
+    }
+
+    #[test]
+    fn p3_highlight_cache_hit_matches_uncached() {
+        // P3: the cached highlighter must return EXACTLY what the uncached
+        // tokenizer would — a cache hit can never alter the rendered spans.
+        let line = "fn main() { let x: i32 = 42; }";
+        let lang = Some("rust");
+        let direct = highlight_code_line_uncached(line, lang);
+        // First call populates the cache; second call hits it.
+        let first = highlight_code_line(line, lang);
+        let second = highlight_code_line(line, lang);
+        let as_pairs = |v: &[Span<'static>]| -> Vec<(String, ratatui::style::Style)> {
+            v.iter().map(|s| (s.content.to_string(), s.style)).collect()
+        };
+        assert_eq!(as_pairs(&direct), as_pairs(&first), "cached == uncached");
+        assert_eq!(as_pairs(&first), as_pairs(&second), "hit == miss result");
+    }
+
+    #[test]
+    fn p3_highlight_cache_keyed_on_theme() {
+        // P3: the theme id is part of the key, so a light/dark flip can't serve
+        // stale colors. (Different keys → independent entries.)
+        let k_dark = hl_key("let x = 1;", Some("rust"), 0);
+        let k_light = hl_key("let x = 1;", Some("rust"), 1);
+        assert_ne!(k_dark, k_light, "theme id must change the cache key");
+        // Same content+lang+theme → same key (a real hit).
+        assert_eq!(
+            hl_key("let x = 1;", Some("rust"), 0),
+            hl_key("let x = 1;", Some("rust"), 0)
+        );
+        // Different content → different key.
+        assert_ne!(
+            hl_key("let x = 1;", Some("rust"), 0),
+            hl_key("let y = 2;", Some("rust"), 0)
+        );
     }
 
     #[test]
