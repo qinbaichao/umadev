@@ -85,7 +85,21 @@ fn path_under_root(file_path: &str, root: &Path) -> bool {
     // only lexically normalized.
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let abs = lexically_normalize(&abs);
-    abs.starts_with(&root)
+    // Strip the Windows `\\?\` verbatim prefix before the prefix-match: on Windows
+    // `std::fs::canonicalize` returns a `\\?\C:\…` verbatim path, but `cwd.join`
+    // (used to build `abs`) is a plain `C:\…` path — so `starts_with` was ALWAYS
+    // false there, the write was judged "outside the root", and the governance
+    // floor never fired (the Windows-only hook test failures). No-op on Unix.
+    strip_verbatim(&abs).starts_with(strip_verbatim(&root))
+}
+
+/// Drop the Windows `\\?\` extended-length (verbatim) path prefix that
+/// `std::fs::canonicalize` adds, so a canonicalized path prefix-matches a plain
+/// one. A no-op on any path without the prefix (i.e. always, on Unix).
+fn strip_verbatim(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    s.strip_prefix(r"\\?\")
+        .map_or_else(|| p.to_path_buf(), PathBuf::from)
 }
 
 /// Collapse `.`/`..` components lexically WITHOUT hitting the filesystem (the
