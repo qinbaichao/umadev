@@ -1304,7 +1304,7 @@ impl App {
             input_text_cols: std::cell::Cell::new(0),
             // OFF by default so native click-drag text selection / copy keeps
             // working; `/mouse` opts into wheel-scroll (and takes over selection).
-            mouse_scroll: false,
+            mouse_scroll: true,
             conversation: Vec::new(),
             host_chat_session_active: false,
             chat_session_id: None,
@@ -8325,25 +8325,25 @@ mod tests {
     fn slash_mouse_emits_set_capture_action_and_uses_i18n() {
         let mut app = fresh_app(Some("offline"));
         assert!(
-            !app.mouse_scroll,
-            "wheel scroll defaults OFF (copy stays usable)"
+            app.mouse_scroll,
+            "wheel scroll defaults ON (the alt screen has no native scrollback, so the wheel must drive the app)"
         );
-        // Turning ON must emit SetMouseCapture(true) so the event loop issues the
-        // real EnableMouseCapture, not just flip a bool.
+        // First toggle turns it OFF → emits SetMouseCapture(false) so the event
+        // loop issues the real DisableMouseCapture (native click-drag selection).
         let action = app.slash_toggle_mouse();
-        assert_eq!(action, Action::SetMouseCapture(true));
-        assert!(app.mouse_scroll);
+        assert_eq!(action, Action::SetMouseCapture(false));
+        assert!(!app.mouse_scroll);
         // The pushed status line must be the i18n string, not a raw literal.
         let last = app.history.back().expect("a status line was pushed");
         assert_eq!(
             last.body(),
-            umadev_i18n::t(app.lang, "slash.mouse_on"),
+            umadev_i18n::t(app.lang, "slash.mouse_off"),
             "/mouse status text must come from the i18n catalog"
         );
-        // Toggling back OFF emits SetMouseCapture(false).
+        // Toggling back ON emits SetMouseCapture(true).
         let action = app.slash_toggle_mouse();
-        assert_eq!(action, Action::SetMouseCapture(false));
-        assert!(!app.mouse_scroll);
+        assert_eq!(action, Action::SetMouseCapture(true));
+        assert!(app.mouse_scroll);
     }
 
     #[test]
@@ -8365,12 +8365,12 @@ mod tests {
     #[test]
     fn slash_mouse_toggles_wheel_scroll_flag() {
         let mut app = fresh_app(Some("offline"));
-        assert!(!app.mouse_scroll, "wheel scroll defaults off");
+        assert!(app.mouse_scroll, "wheel scroll defaults ON");
         for c in "/mouse".chars() {
             let _ = app.apply_key(crossterm::event::KeyCode::Char(c));
         }
         let _ = app.apply_key(crossterm::event::KeyCode::Enter);
-        assert!(app.mouse_scroll, "/mouse turns the wheel binding on");
+        assert!(!app.mouse_scroll, "/mouse turns the wheel binding off (back to native selection)");
     }
 
     #[test]
