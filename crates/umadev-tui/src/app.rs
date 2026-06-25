@@ -691,6 +691,46 @@ fn push_range(ranges: &mut WordRanges, start: usize, end: usize) {
     ranges.push((start, end));
 }
 
+/// True when `s` ends with a recognised raster-image extension (case-insensitive).
+/// The set mirrors what the bases accept as an image (`png` / `jpe?g` / `gif` /
+/// `webp`); a dragged-in image arrives as exactly such a path.
+fn is_image_path(s: &str) -> bool {
+    let l = s.to_ascii_lowercase();
+    [".png", ".jpg", ".jpeg", ".gif", ".webp"]
+        .iter()
+        .any(|ext| l.ends_with(ext))
+}
+
+/// Normalise a pasted path token the way a terminal mangles a dragged file:
+/// drop a `file://` scheme, strip one layer of matching outer quotes, and undo
+/// shell backslash-escapes (`my\ pic.png` → `my pic.png`). Leaves a plain path
+/// untouched.
+fn unquote_unescape(s: &str) -> String {
+    let s = s.trim();
+    let s = s.strip_prefix("file://").unwrap_or(s);
+    let bytes = s.as_bytes();
+    let s = if s.len() >= 2
+        && ((bytes[0] == b'"' && bytes[s.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[s.len() - 1] == b'\''))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    };
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// The payload of one chat row — free text (rendered via the shared
 /// `markdown_to_lines` compiler), a structured tool call (a status line +
 /// folded result), or a structured file diff (a diff card). Keeping these as a
@@ -876,6 +916,11 @@ pub struct App {
     /// Caret position within `input`, measured in **characters** (not bytes).
     /// `0` = before first char; `chars().count()` = after last char.
     pub input_cursor: usize,
+    /// Image attachments for the turn being composed. A dragged/pasted image path
+    /// is stored here (absolute, verified) and shown in `input` as an `[图片 N]`
+    /// chip (N = 1-based index into this Vec); on submit the chip is rewritten to
+    /// an `@<abs-path>` mention the base ingests as an image. Cleared with the input.
+    pub attachments: Vec<std::path::PathBuf>,
     /// Past submitted texts. ↑↓ in an empty input box recalls them.
     pub input_history: VecDeque<String>,
     /// Recall cursor into `input_history`; `None` = editing a fresh draft.
@@ -1295,6 +1340,7 @@ impl App {
             picker_notice: None,
             input: String::new(),
             input_cursor: 0,
+            attachments: Vec::new(),
             input_history: VecDeque::new(),
             input_history_idx: None,
             palette_selected: 0,
@@ -2213,6 +2259,71 @@ impl App {
         self.input.clear();
         self.input_cursor = 0;
         self.input_history_idx = None;
+        self.attachments.clear();
+    }
+
+    /// The chip token shown in the input box for image attachment `n` (1-based),
+    /// e.g. `[图片 1]`. Used both when inserting on paste and when rewriting to an
+    /// `@<path>` mention on submit — one definition keeps the two in lockstep.
+    fn image_chip(&self, n: usize) -> String {
+        format!("[{} {n}]", umadev_i18n::t(self.lang, "attach.image"))
+    }
+
+    /// Handle a bracketed-paste payload. If it is one (or several newline-separated)
+    /// IMAGE file path(s) — how every terminal delivers a dragged-in image — attach
+    /// each as an `[图片 N]` chip; otherwise insert the text verbatim (the common
+    /// case). Fail-open: a path that can't be canonicalised / read falls back to
+    /// plain text, so a normal paste containing a `.png` word is never swallowed.
+    pub fn handle_paste(&mut self, text: &str) {
+        let lines: Vec<&str> = text.trim().lines().collect();
+        let all_images = !lines.is_empty()
+            && lines
+                .iter()
+                .all(|l| is_image_path(&unquote_unescape(l.trim())));
+        if all_images {
+            let mut any = false;
+            for l in &lines {
+                let p = unquote_unescape(l.trim());
+                if let Some(n) = self.attach_image(&p) {
+                    let chip = self.image_chip(n);
+                    self.insert_str_at_cursor(&chip);
+                    self.insert_str_at_cursor(" ");
+                    any = true;
+                }
+            }
+            if any {
+                return;
+            }
+        }
+        // Not an attachable image paste → verbatim (real text, the dominant case).
+        self.insert_str_at_cursor(text);
+    }
+
+    /// Canonicalise + validate a candidate image path; on success push it to
+    /// `attachments` and return its 1-based chip number. `None` (skip) if the path
+    /// doesn't resolve, isn't a regular file, or is empty.
+    fn attach_image(&mut self, path: &str) -> Option<usize> {
+        let abs = std::fs::canonicalize(path).ok()?;
+        let meta = std::fs::metadata(&abs).ok()?;
+        if !meta.is_file() || meta.len() == 0 {
+            return None;
+        }
+        self.attachments.push(abs);
+        Some(self.attachments.len())
+    }
+
+    /// Rewrite every `[图片 N]` chip in `raw` to an `@<abs-path>` mention so the base
+    /// CLI ingests it as an image (it reads the file itself — UmaDev never base64s).
+    /// A chip with no backing attachment is left as-is. No-op without attachments.
+    fn expand_attachments(&self, raw: &str) -> String {
+        if self.attachments.is_empty() {
+            return raw.to_string();
+        }
+        let mut out = raw.to_string();
+        for (i, path) in self.attachments.iter().enumerate() {
+            out = out.replace(&self.image_chip(i + 1), &format!("@{}", path.display()));
+        }
+        out
     }
 
     /// Push a submitted line onto the input-history ring. De-dups
@@ -3628,7 +3739,10 @@ impl App {
                         }
                     }
                 }
-                let raw = self.input.trim().to_string();
+                // Rewrite any `[图片 N]` chip → `@<abs-path>` BEFORE clearing the
+                // input (clear drops the attachment list), so the base receives a
+                // path it can open as an image.
+                let raw = self.expand_attachments(self.input.trim());
                 self.clear_input();
                 if raw.is_empty() {
                     return Action::None;
@@ -8449,6 +8563,46 @@ mod tests {
             tmp.path().to_path_buf(),
         );
         (app, tmp)
+    }
+
+    #[test]
+    fn pasted_image_path_becomes_a_chip_and_expands_to_an_at_mention() {
+        let mut app = fresh_app(Some("offline"));
+        let dir = tempfile::TempDir::new().unwrap();
+        let img = dir.path().join("shot.png");
+        std::fs::write(&img, b"\x89PNG\r\n\x1a\n").unwrap();
+        app.handle_paste(img.to_str().unwrap());
+        // A chip is shown in the input (not the raw path); one attachment tracked.
+        assert!(
+            app.input.contains("图片") || app.input.contains("Image"),
+            "chip inserted, got: {}",
+            app.input
+        );
+        assert_eq!(app.attachments.len(), 1);
+        // On submit the chip rewrites to an @<abs-path> mention the base can open.
+        let abs = std::fs::canonicalize(&img).unwrap();
+        let expanded = app.expand_attachments(app.input.trim());
+        assert!(
+            expanded.contains(&format!("@{}", abs.display())),
+            "expanded to @path, got: {expanded}"
+        );
+    }
+
+    #[test]
+    fn pasted_plain_text_with_a_png_word_is_verbatim_not_attached() {
+        let mut app = fresh_app(Some("offline"));
+        app.handle_paste("see the png export in the docs");
+        assert_eq!(app.input, "see the png export in the docs");
+        assert!(app.attachments.is_empty());
+    }
+
+    #[test]
+    fn a_nonexistent_image_path_is_left_as_plain_text() {
+        let mut app = fresh_app(Some("offline"));
+        app.handle_paste("/no/such/dir/ghost.png");
+        // Can't canonicalise → not attached → inserted verbatim, no chip.
+        assert!(app.attachments.is_empty());
+        assert!(app.input.contains("ghost.png"));
     }
 
     #[test]

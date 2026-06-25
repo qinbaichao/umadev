@@ -3415,7 +3415,10 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                     // cursor instead of letting it arrive as a scrambled stream of
                     // raw `Char` events. Without this the buffer and the rendered
                     // cursor desync — the reported "打字乱串 / 输入框乱跳".
-                    app.insert_str_at_cursor(pasted);
+                    // `handle_paste` also detects a dragged-in image PATH and turns
+                    // it into an `[图片 N]` attachment chip (forwarded to the base as
+                    // an `@<path>` mention on submit); plain text is inserted as-is.
+                    app.handle_paste(pasted);
                 } else if let Some(Ok(Event::Key(key))) = maybe_key {
                     // Accept Press AND Repeat. On terminals that negotiate the
                     // kitty / enhanced-keyboard protocol (Ghostty, recent iTerm2,
