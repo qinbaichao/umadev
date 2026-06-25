@@ -1,482 +1,394 @@
-# UmaDev
+# umadev
 
 <div align="center">
 
-<img src="docs/assets/umadev-logo.png" alt="UmaDev" width="760">
+<img src="docs/assets/umadev-logo.png" alt="umadev" width="760">
 
-### 一个 AI 项目总监，带领一支完整团队，把你的需求交付成可上线产品
-
-**产品 / 架构 / 设计 / 前后端 / 测试 / 安全 / 运维——像真实开发团队那样协作。底座是大脑，UmaDev 是带队交付的总监。**
+### A project-director agent for the coding CLI you already use.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.87%2B-orange)](https://www.rust-lang.org/)
 [![Spec](https://img.shields.io/badge/Spec-UMADEV__HOST__SPEC__V1-blue)](spec/UMADEV_HOST_SPEC_V1.md)
 [![Version](https://img.shields.io/badge/Version-1.0.7-success)](CHANGELOG.md)
 
-简体中文 | [繁體中文](README.zh-TW.md) | [English](README_EN.md)
+English | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md)
 
 </div>
 
 ---
 
-## 目录
+umadev is a single command-line tool that drives an AI coding CLI you already have — Claude Code, Codex, or OpenCode — as one continuous session. It owns no model of its own: the model your base is connected to is the brain.
 
-- [简介](#简介) · [项目来源](#项目来源) · [它解决什么问题](#它解决什么问题)
-- [快速体验](#快速体验) · [一个完整例子](#一个完整例子) · [UmaDev 如何工作](#umadev-如何工作) · [团队怎么协作](#团队怎么协作)
-- [为什么可信](#为什么可信) · [运行模式](#运行模式) · [流水线设计](#流水线设计) · [质量门是什么](#质量门是什么)
-- [治理规则是什么](#治理规则是什么) · [知识库是什么](#知识库是什么) · [交付产物长什么样](#交付产物长什么样)
-- [**命令大全**](#命令大全) · [配置](#配置) · [Rust 架构](#rust-架构) · [开发](#开发)
+You describe what you want in plain language, and umadev drives the base to build it: it plans the work, writes the code, convenes a review team — product, architecture, design, frontend, backend, QA, security — runs quality and governance checks, and hands back runnable code plus a delivery proof. It sizes itself to the task: a small edit stays a small edit; a full project gets the full pipeline.
 
-## 简介
+The central idea is that umadev works like a real software delivery team. It leads a roster of roles — product manager, architect, UI/UX designer, frontend, backend, QA, security, DevOps, and the director — that plan, build, review, and sign off the way a real team does. The director doesn't type code directly; the base (the AI coding CLI) is the engineer that does the work. The roles coordinate only through shared artifact files and structured verdicts — they never chat to each other.
 
-UmaDev 是一个本地运行的 **AI 项目总监 Agent**。它加载你**已经登录的 AI 编码底座**（Claude Code / Codex / OpenCode）的大脑——一个**常驻的持续会话**就是它的工作意识——然后像一位真正的项目总监那样，**带领一支完整团队**把你的一句需求交付成可上线产品。
+It's a single Rust binary. npm is just the delivery shell.
 
-总监不亲自敲代码。它做三件事：**理解你**、**调度团队**、**把关交付**。底座是干活的工程师（思考、调研、设计、写代码、审查都是底座的认知）；UmaDev 是带队的总监 + 确定性工具层（编排阶段、设置确认门、实时治理、跑质量门、留下审计证据）。
+---
 
-它的团队是一组**可调度的角色席位**，而非写死的判断逻辑：
+## Table of Contents
 
-- **产品经理** 拆解需求、定范围与验收标准
-- **架构师** 定技术选型、分层分包、接口契约
-- **UI/UX 设计师** 定设计系统、令牌、信息架构，盯住"不像 AI 模板"
-- **前端 / 后端工程师** 真写代码（驱动底座连续用工具产出文件）
-- **测试 / QA** 真跑构建测试、查覆盖
-- **安全 / 红队** 扫漏洞、查攻击面、做 pre-PR 安全检查
-- **运维 / DevOps** 管构建、CI、运行时证据、上线
-- **总监** 在每道门汇总裁决、对照计划验收、拍板过或返工
+- [Install](#install)
+- [Quickstart](#quickstart)
+- [Project Origin](#project-origin)
+- [What Problem It Solves](#what-problem-it-solves)
+- [Features](#features)
+- [How It Works](#how-it-works)
+- [The Review Team](#the-review-team)
+- [Why You Can Trust the Output](#why-you-can-trust-the-output)
+- [Runtime Modes](#runtime-modes)
+- [The Full Delivery Flow](#the-full-delivery-flow)
+- [Quality Gate](#quality-gate)
+- [Governance](#governance)
+- [Knowledge Base](#knowledge-base)
+- [Deliverables](#deliverables)
+- [Commands](#commands)
+- [Configuration](#configuration)
+- [Rust Architecture](#rust-architecture)
+- [Development](#development)
+- [License](#license)
 
-干活的角色串行写主会话；评审的角色各自 fork 出**只读分叉会话并行**审，把结构化裁决交回总监。角色之间**不互相聊天**——它们只通过共享的产物文件（黑板）和结构化裁决沟通，避免多 Agent 互聊放大幻觉。总监**确定性地**汇总：把阻断项折成一条返工指令注入主会话，让团队带上下文修，循环由确定性信号（覆盖 / 契约 / 验证 / 硬门）有界终止——不靠模型自评"够不够好"。
+---
 
-它驱动的恰好是这三个一等底座；想覆盖更多模型，是把底座路由到第三方/本地模型，那是底座自己的事，UmaDev 不注入、不覆盖、不持有任何模型端点。
-
-> 持续会话是**默认**：整条流水线复用一个底座会话，上下文全程在线；过去"每阶段单发"的旧模型只作为底座会话起不来时的兜底。这让底座连续干活、真写代码，而不是九个"陌生人"各做一段、客套不动手。
-
-## 项目来源
-
-UmaDev 脱胎于原项目 [shangyankeji/super-dev](https://github.com/shangyankeji/super-dev)。
-
-早期的 `super-dev` 更像一个 **AI 编码治理工具**：它主要关注“AI 生成代码时不能写什么”，例如不要用 emoji 当图标、不要硬编码颜色、不要写不安全代码。
-
-现在的 UmaDev 在这之上长成了一个带队交付的项目总监 Agent：
-
-- **从单点治理扩展到全流程交付**：不只检查代码，而是把从需求到上线的每个阶段都交给对应角色，并加上门禁与验收。
-- **从零散脚本升级为规范驱动系统**：核心是 [UMADEV_HOST_SPEC_V1](spec/UMADEV_HOST_SPEC_V1.md)，所有实现都围绕规范（持续会话与团队模型见 §9.3–§9.4）。
-- **使用 Rust 重写**：单二进制、跨平台、启动快、依赖少、适合本地长期运行。
-- **从“拦截问题”升级为“带队走完交付”**：Claude Code / Codex / OpenCode 是大脑和手，UmaDev 是加载这颗大脑、调度整支团队、把关交付的总监。
-
-一句话概括这个演进：
-
-> `super-dev` 关注“AI 不要写烂代码”；`UmaDev` 关注“一个 AI 项目总监如何带领一支团队，把需求交付成可上线、可审计的商业产品”。
-
-## 它解决什么问题
-
-很多人第一次用 AI 编码工具时都会遇到类似问题：
-
-- AI 一上来就写代码，没有 PRD、没有架构、没有验收标准。
-- 前端做完了，后端接口路径对不上。
-- UI 看起来像模板，颜色和字体很随意。
-- AI 写了占位代码、假数据、TODO，却说“完成了”。
-- 修改一次需求后，上下文开始乱，前面约定被忘掉。
-- 代码能生成，但没有质量报告、没有证据链，不知道能不能交付。
-- 团队有自己的规范和知识库，但每次都要手动复制给 AI。
-
-UmaDev 的目标就是把这些问题系统化解决——靠的不是更长的提示词，而是一支分工明确的团队，每个角色在该出手的节点出手：
-
-```mermaid
-flowchart LR
-    A["一句需求"] --> B["产品经理<br/>拆解 + 调研"]
-    B --> C["架构师 ‖ 设计师<br/>架构 + UIUX 并行"]
-    C --> D{"文档确认门<br/>团队并行评审 + 你拍板"}
-    D --> E["技术负责人<br/>Spec / 任务"]
-    E --> F["前端工程师<br/>照设计系统实现"]
-    F --> G{"预览确认门"}
-    G --> H["后端工程师<br/>照契约实现"]
-    H --> I["QA · 安全 · 运维<br/>质量门 / 红队"]
-    I --> J["交付包<br/>总监验收 + 证据"]
-```
-
-## 快速体验
-
-### 1. 安装
-
-推荐用 npm 安装预编译二进制：
+## Install
 
 ```bash
 npm install -g umadev
 ```
 
-npm 只是分发壳。真正运行的是 Rust 编译出的 `umadev` 二进制。
+The npm package is a distribution shim. The actual program is a Rust binary. Prebuilt binaries ship for macOS (Apple Silicon and Intel), Linux (x86_64 and ARM64), and Windows (x86_64).
 
-支持的平台：
-
-- macOS Apple Silicon
-- macOS Intel
-- Linux x86_64
-- Linux ARM64
-- Windows x86_64
-
-也可以从源码构建：
+Build from source:
 
 ```bash
 git clone https://github.com/umacloud/umadev.git
-cd umadev
-cargo build --release
+cd umadev && cargo build --release
 ./target/release/umadev --version
 ```
 
-### 2. 准备一个 AI 编码底座
+You also need one AI coding CLI installed and logged in — that's the brain umadev drives:
 
-UmaDev 推荐驱动你已经登录的 CLI：
+| Base | Install | Log in |
+|---|---|---|
+| Claude Code | `npm i -g @anthropic-ai/claude-code` | `claude auth login` |
+| Codex | `npm i -g @openai/codex` | `codex login` |
+| OpenCode | see opencode.ai | `opencode auth login` |
 
-```bash
-# 三选一即可
-npm install -g @anthropic-ai/claude-code
-npm install -g @openai/codex
-npm install -g opencode-ai
-```
+umadev injects nothing into the base. Whatever your base is configured with — an official login or your own third-party / local-model routing — is exactly what runs.
 
-然后按这些工具自己的方式登录。
+---
 
-UmaDev 不保存你的 Claude / Codex / OpenCode 登录信息。它只是把任务作为非交互命令发给它们。
-
-### 3. 初始化项目
+## Quickstart
 
 ```bash
-cd your-project
-umadev init
+umadev                       # launch the chat UI; first run lets you pick a base
 ```
 
-这一步会写入一些项目配置：
+Tell it what you want built:
 
 ```text
-umadev.yaml              # 声明这是一个 UmaDev 管理的项目
-.umadevrc               # 项目级配置
-.umadev/rules.toml      # 治理规则配置
-CLAUDE.md               # 给 Claude Code 看的项目说明
-.gitignore              # 忽略 UmaDev 运行产物
-knowledge/              # 项目内知识库和设计系统种子
+> add CSV export to the reports page
+> build me a todo app with a Postgres backend
+> /goal ship a working SaaS landing page       # keep working until the goal is met
 ```
 
-### 4. 启动
+Or run a build non-interactively:
 
 ```bash
-umadev
+umadev run "add CSV export to the reports page" --backend claude-code
 ```
 
-第一次打开会让你选择：
+umadev sizes the work to the request — you don't pick a mode. A build typed in chat earns the same planning, team review, governance, and delivery proof as a `/run` — there is no separate chat path and build path. All builds run on an isolated `umadev/<slug>` branch; your working branch is never touched, and umadev never merges or pushes on its own.
 
-1. 界面语言。
-2. 使用哪个底座：Claude Code、Codex 或 OpenCode（你已经登录的那个）。
+### A full worked example
 
-之后直接输入需求：
-
-```text
-做一个面向独立开发者的 SaaS 订阅管理后台，包含登录、订阅计划、账单记录和管理员仪表盘。
-```
-
-UmaDev 会开始组织完整流程。
-
-### 5. 预览和交付
-
-前端阶段完成后：
-
-```text
-/preview
-```
-
-交付阶段完成后：
-
-```text
-/deploy
-```
-
-最终交付证据会在：
-
-```text
-output/
-release/
-.umadev/audit/
-```
-
-其中最重要的是：
-
-```text
-release/proof-pack-<project>-<time>.zip
-release/scorecard-<project>-<time>.html
-```
-
-这两个文件就是给团队、客户或审计方看的交付证明。
-
-## 一个完整例子
-
-假设你在一个空项目里运行：
+Suppose you run:
 
 ```bash
 umadev init
 umadev
 ```
 
-然后输入：
+Then type:
 
 ```text
-做一个课程预约小程序，用户可以查看课程、选择时间、预约、取消预约，管理员可以管理课程和预约记录。
+Build a course-booking mini app. Users can browse courses, pick a time, book,
+cancel. Admins can manage courses and bookings.
 ```
 
-UmaDev 会做这些事：
+umadev will:
 
-1. **理清需求**：补全目标平台、是否需要支付、管理员后台复杂度等合理默认假设（自动模式下自动推进、不打断你；手动模式可逐条确认）。
-2. **联网调研**：当底座具备联网能力时，搜索同类小程序 / 预约系统的竞品功能、定价、设计趋势和真实用户评价；同时检索内置知识库里的预约系统、后台 CRUD、权限、表单校验等规范。两者合并产出调研报告 `output/<slug>-research.md`。
-3. 生成 PRD，明确用户角色、功能范围、EARS 可测验收标准。
-4. 生成架构文档，定义数据模型、API、鉴权、部署方式。
-5. 生成 UI/UX 文档，定义设计方向、颜色 token、字体、组件状态、图标库。
-6. 拆成执行计划和任务（每个任务回链到需求 FR 编号）。
-7. 驱动底座实现前端。
-8. 暂停让你预览。
-9. 驱动底座实现后端和集成。
-10. 跑质量门：文档、契约、构建、设计、安全、交付文件全部检查。
-11. 生成交付包和成绩单。
+1. **Route the request.** The base's own model judges this: a full build, not a quick edit. You see an intent card — "full build, entering the delivery flow" — before any code is written.
+2. **Clarify.** Fill in sensible defaults for target platform, payment scope, and admin complexity. Auto mode self-resolves; manual mode lets you confirm each.
+3. **Research.** When the base has web access, search competing booking apps — features, pricing, design trends, real user reviews — and merge that with built-in knowledge about booking systems, admin CRUD, permissions, and form validation. Everything lands in `output/<slug>-research.md`.
+4. **Draft three core documents.** PRD (roles, scope, EARS acceptance criteria), architecture (data model, APIs, auth, deployment), UI/UX (design direction, tokens, typography, component states, icon library). Pause for your review.
+5. **Build an execution plan.** A dependency plan (`plan.json`) rendered as a live checklist. Each task links back to its FR id.
+6. **Implement the frontend.** The director schedules each task, the base writes the code, each file is governance-checked as it lands.
+7. **Pause for preview.** You see the running app before backend work starts.
+8. **Implement the backend and integration.**
+9. **Run the full quality gate.** Build, test, lint, contract check, runtime probe, governance scan.
+10. **Produce the delivery pack.** Scorecard, proof pack, compliance mapping — on disk and ready to hand to a teammate, client, or reviewer.
 
-整个过程不是“AI 聊完就算完成”，而是会留下真实文件。
+This is not "AI chatted and said done." It leaves real artifacts on disk.
 
-## UmaDev 如何工作
+---
 
-当你说出一句需求，UmaDev 不是直接把它丢给底座，而是像一位总监那样**先想清楚、把计划摆给你看、带上团队心法和对你代码库的理解去干、逐步调度团队并每步验收、最后留下交付证明**。一次输入会流经这几层（每一步的"借脑"判断都 **fail-open**——失败就退回确定性兜底，绝不卡死）：
+## Project Origin
+
+umadev evolved from the original [shangyankeji/super-dev](https://github.com/shangyankeji/super-dev) project.
+
+Early `super-dev` was closer to an AI coding governance tool. It focused on what AI-generated code must not contain: emoji icons, hardcoded colors, unsafe patterns.
+
+umadev has grown that into a full project-director agent:
+
+- **From single-point governance to whole-pipeline governance.** It no longer only checks code; every phase from requirement to delivery is brought under the process and its gates.
+- **From loose scripts to a spec-driven system.** The source of truth is [UMADEV_HOST_SPEC_V1](spec/UMADEV_HOST_SPEC_V1.md), 25 clauses, ~112 governance rules.
+- **Rewritten in Rust.** One binary, fast startup, low dependency surface, cross-platform distribution.
+- **From blocking bad output to driving the base through the process.** Claude Code / Codex / OpenCode are the brain and hands; umadev is the director and governance rail wrapped around them.
+
+> `super-dev` asked: "how do we stop AI from writing bad code?" umadev asks: "how do we make AI deliver a complete, shippable, auditable project — the way a real software team would?"
+
+---
+
+## What Problem It Solves
+
+Most people hit the same problems when they use AI coding tools at scale:
+
+- The AI starts coding immediately, without a PRD, architecture, or acceptance criteria.
+- The frontend is built, but backend API paths do not match.
+- The UI looks generic: random colors, random fonts, template-like composition.
+- The AI leaves placeholders, fake data, and TODOs — and still says "done."
+- After one requirement change, context drifts and earlier decisions are forgotten.
+- Code exists, but there is no quality report or delivery evidence.
+- Your team has standards and internal knowledge, but you copy them manually into prompts.
+
+umadev turns those problems into a structured workflow:
+
+```mermaid
+flowchart LR
+    A["One requirement"] --> B["Route & plan"]
+    B --> C["Research"]
+    C --> D["PRD / Architecture / UI/UX"]
+    D --> E["Execution plan"]
+    E --> F["Frontend"]
+    F --> G["Preview"]
+    G --> H["Backend"]
+    H --> I["Quality gate"]
+    I --> J["Delivery proof"]
+```
+
+---
+
+## Features
+
+- **Drives a base you already use.** Claude Code, Codex, or OpenCode, run as one continuous session so the base keeps its context across a whole build instead of starting cold each step. No API key of its own.
+- **Works like a real dev team.** The director convenes a roster of nine named roles — product manager, architect, UI/UX designer, frontend engineer, backend engineer, QA, security, DevOps, and the director itself — that plan, implement, review, and sign off the way a real team does.
+- **Plans the work and shows it.** A build becomes a dependency plan (`.umadev/plan.json`) rendered as a live checklist you can steer with `/plan`. Steps are driven step by step; the director owns the plan, not the base.
+- **A build in chat is a real build.** A build typed in the chat UI earns the same planning, team scheduling, governance, and delivery proof as `umadev run`. There is no weaker chat path.
+- **Ships a delivery proof.** PRD, architecture, and UI/UX docs, a scorecard, and a proof pack — scaled to the task, so a one-page change doesn't get an enterprise dossier.
+- **Carries engineering standards into the base.** 418 curated knowledge files — commercial-grade engineering standards, design rules, and a map of your existing code — are compiled into the binary and injected into the base on every working turn. Zero config.
+- **Learns from each run.** Recurring mistakes are recorded and recalled into later work so the same pitfall isn't repeated.
+- **A real terminal UI.** Markdown, syntax-highlighted code, live diff cards as files change (word-level highlighting), folding tool rows, a build-completion card with a clickable preview URL, and slash commands throughout.
+- **Governance you can audit.** A trust dial (`plan` / `guarded` / `auto`), irreversible actions always confirm on every tier, an MCP server (`umadev mcp serve`) that exposes the governor to other tools, and compliance mapping (SOC 2 / ISO 27001 / EU AI Act).
+- **Goal-until-met builds.** `/goal <objective>` drives the base to keep working until the objective is met — native `/goal` on all three bases; `UMADEV_NO_GOAL_MODE=1` opts out.
+
+---
+
+## How It Works
+
+A turn flows through up to five layers. Every consult of the base fails open to a safe default, so a bug or an unreachable base never blocks you.
 
 ```mermaid
 flowchart TB
-    In["你的一句话<br/>聊天 / 临时任务 / 完整需求"] --> Router["① 智能路由<br/>理解意图 → 分流 chat / 小修 / 完整 build<br/>显示意图卡：'小改动，这就做' vs '完整产品，进研发流程'"]
-    Router -->|"完整 build"| Plan["② 可视计划<br/>总监大脑拆解成依赖 DAG<br/>清单实时勾选 [✓] [~] [ ]"]
-    Router -->|"闲聊 / 小修"| Fast["快路径<br/>不上锁、轻量"]
-    Plan --> Firmware["③ 注入固件 + 你的代码库理解<br/>身份 + 反 AI 模板心法 + 知识 + 踩坑 + repo-map"]
-    Firmware --> Sched["④ 逐步调度团队 + 每步验收<br/>干活角色串行 · 评审角色并行 fork<br/>确定性地板判过/返工"]
-    Sched --> Final["⑤ 交付证明<br/>PRD / 架构 / UIUX / 成绩单 / proof-pack"]
-    Final --> Mem["⑥ 记忆<br/>持久化对话 + 跨会话续接 + 踩坑进化"]
-    Mem -.->|"下次更懂你"| Firmware
-```
+    User["User — requirement / review / preview / deploy"] --> UI["umadev TUI / CLI<br/>chat + slash commands"]
 
-**① 智能路由（router）。** 每条非斜杠输入都先被分流：一句"你好"留在轻量聊天；"改个文案"走快路径直接做；"做一个订阅后台"自动升级成完整 build。路由结果**会显示给你**（意图卡），你可以用 `/run` 强制完整流程、`/quick` 强制快路径来覆盖。这是"像 Agent"还是"像套壳"的体感分水岭——你看得见它在想。
+    UI --> Director["umadev-agent<br/>Router · Plan · Schedule · Verify · Finalize"]
 
-**② 可视计划（plan）。** 一个完整 build 开工前，总监先让底座大脑把目标拆成一份**它自己解析并持有**的依赖 DAG（落 `.umadev/plan.json`），在界面上渲染成一张**实时勾选的清单**（`[✓] 脚手架 · [~] 登录路由 · [ ] 登录表单  3/8`）。`/plan skip|add|veto|up|down <id>` 让你**重排 / 跳过 / 否决 / 新增**某一步，折回下一条指令同会话生效——把"只能在门上干预"升级成"步级可控"。
+    Director --> Spec["umadev-spec<br/>UMADEV_HOST_SPEC_V1 · 25 clauses"]
+    Director --> Knowledge["umadev-knowledge<br/>418 files · BM25 + vector · repo-map"]
+    Director --> Governance["umadev-governance<br/>~112 rules · audit · compliance"]
+    Director --> Contract["umadev-contract<br/>OpenAPI · frontend↔backend path check"]
 
-**③ 注入固件 + 你的代码库理解（compose_firmware + repo-map）。** 每条干活路径开跑前，UmaDev 给底座注入一段**精选、有 token 预算**的系统提示：总监团队**身份** + 工程**心法 / 反 AI 模板**品味 + 按需检索的**知识**摘要 + 按技术栈指纹召回的**踩坑**教训 + 你现有代码的 **repo-map 切片**（符号轮廓，按路由命中的文件排序）。这是"为什么值得用 UmaDev 而不是裸底座"的真正资产——底座带着团队心法和对你代码库的理解干活，而不是一颗空白大脑。
+    Director --> Runtime["umadev-runtime<br/>Runtime trait"]
+    Runtime --> Host["umadev-host<br/>claude-code · codex · opencode<br/>(subprocess drivers)"]
+    Runtime --> Offline["Offline templates<br/>CI / no-base fallback"]
 
-**④ 逐步调度团队 + 每步验收（summon 驱动 + 确定性地板）。** 总监沿 DAG 一步步驱动：每个就绪的 Build 步在主会话上被 `summon` 串行执行，并对照它自己的验收标准在**确定性地板**（源码在不在 / 构建测试 / 契约 / 评审）上验证——过则勾掉清单，不过则有界返工。评审步 fork 出团队并行交叉审。
-
-**⑤ 交付证明（finalize）。** 质检通过后，`finalize` 产出 PRD / 架构 / UIUX 文档、成绩单 HTML 和打包的 **proof-pack**（按深度裁剪——一个小页面不会硬塞一个 proof-pack）。
-
-**⑥ 记忆（持久化对话 + 跨会话）。** UmaDev 每轮把自己的有界对话发给底座，并把对话**持久化**到 `.umadev/chat/<id>.json`；重开 UmaDev 对话还在，未完成的计划会问你"继续目标 X（第 N/M 步）？"。踩坑沉淀进自学习库，下次注入到固件里**预防**同类错误。
-
-> 这些都是**已实现**的真实行为（见 `crates/umadev-agent` 的 `router.rs` / `plan_state.rs` / `context.rs` / `director_loop.rs` 与 `crates/umadev-knowledge/src/repomap.rs`），不是路线图承诺。权威产品态见 [`docs/PRODUCT_VISION_AND_ROADMAP.md`](docs/PRODUCT_VISION_AND_ROADMAP.md)。
-
-整体架构可以理解成四层：
-
-```mermaid
-flowchart TB
-    User["用户<br/>输入需求 / 审核 / 预览 / 部署"] --> UI["UmaDev TUI / CLI<br/>聊天界面 + 命令入口"]
-
-    UI --> Director["umadev-agent<br/>流程引擎：阶段、gate、状态、质量门"]
-
-    Director --> Spec["umadev-spec<br/>UMADEV_HOST_SPEC_V1"]
-    Director --> Knowledge["umadev-knowledge<br/>本地知识库检索：BM25 + 向量"]
-    Director --> Governance["umadev-governance<br/>112 条治理规则 + 审计"]
-    Director --> Contract["umadev-contract<br/>OpenAPI 契约校验"]
-
-    Director --> Runtime["umadev-runtime<br/>统一 Runtime 接口"]
-    Runtime --> Host["umadev-host<br/>驱动底座 Claude / Codex / OpenCode<br/>实现代码 · 联网调研竞品"]
-    Runtime --> Offline["离线模板<br/>内部 CI / 无底座兜底"]
-
-    Host --> Workspace["项目工作区<br/>源码 / output / release"]
+    Host --> Workspace["Workspace<br/>source · output · release"]
     Offline --> Workspace
 
-    Governance --> Evidence[".umadev/audit<br/>审计日志"]
-    Contract --> Quality["quality gate"]
+    Governance --> Evidence[".umadev/audit/<br/>tool-calls.jsonl · verify.jsonl"]
+    Contract --> Quality["Quality gate"]
     Evidence --> Quality
-    Quality --> Release["proof pack<br/>scorecard"]
+    Quality --> Release["proof-pack-*.zip<br/>scorecard-*.html"]
 ```
 
-更简单地说：
+The five layers in plain English:
 
-- **TUI/CLI**：你和总监对话的地方。一句"你好"、一个"审下这段代码"、一个完整需求，都进同一个会话，由智能路由分流该闲聊、做临时任务、还是开工跑完整流程。
-- **总监（umadev-agent）**：路由意图、拆出可视计划、注入固件、点名哪些角色、逐步驱动并每步验收、汇总裁决推进或返工、最后 finalize 交付。完整商业级交付时会展开成 9 阶段主链（见下文"流水线设计"）。
-- **持续会话 / 底座**：整条流水线复用你登录的底座（Claude Code / Codex / OpenCode）的一个会话——底座用它自己的登录和模型连续干活（调研、设计、真写代码、评审）；UmaDev 不注入、不覆盖任何模型或 key。
-- **治理 / 质量**：底座每写一个文件就实时拦截不合规内容；交付前再跑一遍质量门补扫。
-- **知识库**：把工程标准、设计系统、领域知识（本地 BM25 + 向量检索）注入给当前阶段的角色。
-- **证据**：把每次工具调用、每份裁决、每道门记录下来，最后打包成交付证明。
+1. **Route.** The base's own model judges what your message needs — a small edit, a debug, or a full build. The intent is surfaced immediately ("small change, on it" vs. "full build, entering the delivery flow") so you can correct it before work starts. The base model is authoritative; if it is unreachable, the turn falls to the lightest path, never a keyword guess.
+2. **Plan.** A real build is broken into a dependency plan that umadev owns and renders as a live checklist. The plan is stored in `.umadev/plan.json` and is steerable with `/plan`.
+3. **Schedule.** umadev walks the plan step by step. Writing roles (frontend / backend engineer) drive the main session serially — single-writer. Reviewing roles (product manager, architect, designer, QA, security, frontend, backend, DevOps) each get their own read-only forked session and review in parallel, returning structured verdicts. Roles communicate only through shared artifact files and their verdicts.
+4. **Verify and self-correct.** Each step is checked against its acceptance criteria on a deterministic floor — coverage, contract, build/test, hard gates — not by the model self-assessing "good enough." Blocking findings come back as one fix directive with evidence attached. The loop is bounded by a gap counter and stall counter; it ends cleanly when done or genuinely stuck.
+5. **Finalize.** Once the floor is clean, umadev produces the delivery artifacts and proof pack. The run's episodes feed the lessons store for future runs.
 
-## 团队怎么协作
+Underneath every path, a curated system prompt — identity, engineering and design standards, the relevant slice of the knowledge base, recalled pitfalls from past runs, and an outline of your existing code — is injected into the base on every working turn.
 
-UmaDev 把"质量判断"建模成**一支团队**，而不是单趟检查。一个**确定性总监**主导全程；干活角色串行写，评审角色并行只读审；沟通只走"共享文件黑板 + 结构化裁决"。
+The firmware is pre-loaded once at launch, so the first reply doesn't pay the 30–60s per-message cold start that re-priming from scratch would cost.
+
+---
+
+## The Review Team
+
+umadev convenes a nine-seat review roster. Each role is a real job function, not a label.
 
 ```mermaid
 flowchart TB
-    User["你<br/>需求 / 确认"] --> Director["总监<br/>确定性编排核 · 唯一决策者"]
-    Director -->|"send_turn · 观察事件 · 纠偏"| Main["主持续会话（底座大脑）"]
-    Main -->|"干活角色串行写"| Board["黑板<br/>output/*.md · 源码"]
-    Director -->|"fork() 只读分叉"| Critics["评审角色 ×N<br/>PM · 架构 · 设计 · QA · 安全 · 前端 · 后端 · 运维"]
-    Board -.->|"读黑板"| Critics
-    Critics -->|"RoleVerdict<br/>accepts · blocking · advisory · evidence"| Director
-    Floor["确定性地板<br/>覆盖 · 契约 · 验证 · 硬门"] --> Director
-    Director -->|"阻断项 → 一条返工指令"| Main
-    Director -->|"全过 → 过门推进"| Next["下一阶段"]
+    Director["Director<br/>owns plan · drives main session · aggregates verdicts"]
+
+    subgraph Writing ["Writing roles — main session, serial (single-writer)"]
+        FE["Frontend engineer"]
+        BE["Backend engineer"]
+    end
+
+    subgraph Reviewing ["Reviewing roles — read-only fork, parallel"]
+        PM["Product manager<br/>scope · acceptance criteria"]
+        Arch["Architect<br/>data model · APIs · scalability"]
+        Design["UI/UX designer<br/>tokens · typography · component states"]
+        QA["QA engineer<br/>test coverage · edge cases"]
+        Sec["Security<br/>SAST · secrets · auth"]
+        FER["Frontend reviewer<br/>contract · accessibility · slop"]
+        DevOps["DevOps<br/>Dockerfile · CI · deploy"]
+    end
+
+    Director --> Writing
+    Director --> Reviewing
+
+    Writing --> Artifacts["Shared artifact files<br/>output/*.md · source tree"]
+    Reviewing --> Artifacts
+
+    Artifacts --> Verdicts["RoleVerdict { accepts, blocking, advisory, evidence }"]
+    Verdicts --> Director
 ```
 
-四条铁律保证这套团队既强又稳：
+How the team works:
 
-- **单写者**：任一时刻只有主会话在写黑板；评审分叉只读，绝不并行写，因此并行安全。
-- **确定性控环**：循环继续还是终止，由确定性信号（gap-count、退出码、硬门）决定。底座和评审角色都是 **advisory**，永不驱动循环终止——避免模型"自我感觉良好"放行。
-- **fail-open**：评审角色够不到底座时，空裁决 = 通过，绝不阻塞；总监退回确定性地板决策。一个评审的 bug 永远不会卡住底座。
-- **有界返工**：阻断项折成返工指令注入主会话，带上下文修，再复审；gap-count + stall-counter 确定性收敛（默认最多几轮、无进展即停），残留进自学习库下次规避。
+- **Writing roles** drive the main session serially. Only one writer touches source at a time.
+- **Reviewing roles** each run on their own read-only forked session, in parallel, and return a `RoleVerdict` — `accepts`, `blocking` findings with evidence, and `advisory` notes.
+- **The director aggregates deterministically.** The deterministic floor governs loop control; critic opinions are advisory only. Blocking findings are folded into one rework directive injected back into the main session, along with the evidence.
+- **Roles never chat to each other.** The shared blackboard is the output artifact files and the source tree. The only communication channel between roles is the verdict.
+- **The team scales with the task.** A bugfix convenes no team. A greenfield build convenes the full roster. Complexity determines the seats.
 
-团队规模随任务复杂度缩放：bugfix / 小重构不组队，确定性地板独立把关；完整需求才上全套角色。简单需求因此能走轻量路径——跳过调研和三文档、保留 Spec 与硬门，几分钟出代码。
+---
 
-## 大概要多久 · 命令怎么发现
+## Why You Can Trust the Output
 
-**时间预期**（实际取决于你底座的模型、思考强度和需求复杂度——UmaDev 不持有模型，速度主要由底座决定，这里只给量级）：
+Trust in the output comes from four things that happen on every build:
 
-| 你说的 | 路由判成 | 大致量级 |
+**1. The deterministic floor runs regardless of what the model thinks**
+
+Build, lint, typecheck, and test results are checked directly. The acceptance floor checks spec coverage and contract alignment — the model doesn't self-report "it passed."
+
+**2. The frontend↔backend contract is verified mechanically**
+
+`umadev-contract` parses the architecture doc's API table into a typed spec, renders `openapi.json` to `.umadev/contracts/`, extracts every `fetch`/`axios` call in the frontend source, and cross-validates the paths. A mismatch is a blocking finding.
+
+**3. Every important action leaves evidence**
+
+Tool calls, verification runs, and critic verdicts are written to `.umadev/audit/` as JSONL. The proof pack includes the evidence chain.
+
+**4. Governance runs on every file write**
+
+~112 rules check for emoji-as-icons, hardcoded colors, leaked secrets, AI-slop UI patterns, and unsafe code constructs. They run as a pre-write hook into Claude Code, as a pre-commit hook in git, and as part of the quality gate. All rules are configurable in `.umadev/rules.toml` and are fail-open — a bug in the governor never blocks your work.
+
+---
+
+## Runtime Modes
+
+### Drive a local AI coding CLI (the product)
+
+| Backend ID | Binary | How umadev calls it |
 |---|---|---|
-| "你好" / "这怎么用" | 闲聊 | 秒级，不进流程 |
-| "改个文案" / "重命名这个函数" | 快路径小修 | 一两分钟，单步直接做 |
-| "审下这段代码会不会出 bug" / "帮我看这个报错" | 临时任务（带 repo-map / git 锚定） | 几分钟 |
-| "给用户模型加个字段" / "修结账的 bug" | bugfix / 小改（不组队） | 几分钟，硬门把关 |
-| "做一个订阅管理后台" | 完整 build（展开 9 阶段、全套团队） | 更久——按需求规模从十几分钟到更长；中途在确认门停下等你 |
+| `claude-code` | `claude` | `claude --print --output-format text` |
+| `codex` | `codex` | `codex exec --sandbox workspace-write` |
+| `opencode` | `opencode` | `opencode run` |
 
-> 看得见进度：完整 build 全程有**实时勾选的计划清单**和**团队评审面板**，不会"卡在 0/9 不动"；超过几秒无输出状态栏会染红，绝不让你对着静默猜它死没死。`auto` 模式全自动推进，`guarded`（默认）在每道确认门停下等你拍板。
+### The base brings its own model — umadev has none
 
-**命令可发现性**：
+umadev connects to no model API and stores no credentials of its own. The base uses its own configured model — your logged-in subscription, or whatever third-party / local model you routed through the base. By default umadev passes no `--model` flag; the base runs on its own configuration. Use `/model <id>` to override a session, or change the model in the base's own config.
 
-- TUI 里输入 `/` 弹出**命令补全浮层**，`Tab` 补全、`↑↓` 切换、回车执行。
-- `/help`（或 F1）列出**全部命令和快捷键**。
-- 不确定下一步时，意图卡和计划清单本身会提示可用动作（`[c] 继续 · /revise 重做 · /plan 调整`）。
-- `umadev guide` 是 60 秒上手教程，`umadev examples` 是命令速查表。
+umadev reads and surfaces the base's current model and reasoning effort in `/status` — it reads `~/.claude/settings.json` for Claude Code, `~/.codex/config.toml` for Codex, and `opencode.json` for OpenCode — but never overrides those values unless you explicitly ask it to.
 
-## 为什么可信
+Wider model coverage means routing the base to a third-party or local model. That is the base's job. umadev does not add new base drivers for that.
 
-总监带队听起来像把判断权交给模型——其实恰恰相反。UmaDev 的可信来自把"模型说了什么"和"硬信号是什么"严格分开：
+### Offline templates (internal fallback, not a product mode)
 
-- **fail-open 治理**：底座每写一个文件，都实时拦截 emoji 当图标、硬编码颜色、AI 模板痕迹、无障碍缺失、前后端契约不符等。治理函数**永远 fail-open**——治理自身出 bug 时放行而非阻断，绝不让一个治理缺陷卡死底座。
-- **确定性控环**：底座和评审 critic 都是 **advisory**。真正决定"过门 / 返工 / 硬停"的是确定性信号：FR→任务覆盖、前后端契约对照、真跑 verify 的退出码、质量门阈值、以及**零代码硬门**（计划要产出代码却没有真实源码 = 判失败，绝不把空骨架伪装成"完成"）。
-- **不持有模型端点**：UmaDev 用你已登录的底座，不自带模型、不接第三方 API、不存你的 key。底座用谁的模型、什么思考强度，UmaDev 只读出来显示、绝不覆盖。
-- **审计证据**：每次工具调用、每份角色裁决、每道门的状态都落盘（`.umadev/audit/*`、`team-ledger.jsonl`）；交付时打包成 proof-pack + 成绩单 + 合规映射（SOC 2 / ISO 27001 / EU AI Act），可直接发给团队、客户或审计方。
-- **自我进化记忆**：踩坑自动识别→按技术栈指纹精准召回→复发触发更高层的纠正策略（反思）；相似教训沉淀成更稠密的"信念"，并做矛盾卫生；信任分级 + CJK 检索贯穿其中。越用越懂你的项目。
-- **三语**：zh-CN / zh-TW / en 全程覆盖用户可见文案，按系统语言检测、可随时切换。
+Offline mode (`/offline`) makes no model calls and no network requests. It is an internal deterministic fallback for demos, smoke tests, and CI — not a mode you choose for real work. The first-run picker lists only the three bases. The output is templates with `TODO` placeholders, not real code.
 
-## 运行模式
+---
 
-### 模式 A：驱动本机 AI 编码 CLI（默认走持续会话）
+## The Full Delivery Flow
 
-这是产品模式。整条流水线复用底座的**一个持续会话**，上下文全程在线；底座连续用工具干活。
-
-| Backend ID | 实际程序 | UmaDev 怎么驱动 | 适合谁 |
-|---|---|---|---|
-| `claude-code` | `claude` | 持续会话（stream-json 双向流），跨阶段 `--resume` 续接 | 已经在用 Claude Code 的用户 |
-| `codex` | `codex` | 持续会话（`codex app-server`，同一 thread 续接） | 已经在用 Codex CLI 的用户 |
-| `opencode` | `opencode` | 持续会话（`opencode serve`，同一 session 续接） | 已经在用 OpenCode 的用户 |
-
-特点：
-
-- UmaDev 不需要你的模型 API key。
-- 继续使用你原来 CLI 的账号、订阅和配置。
-- 底座负责真实读写文件和运行命令。
-- UmaDev 负责团队调度、流程、规则、质量门和证据链。
-
-> 单发兜底：底座的持续会话起不来时，自动回退到旧的"每阶段单发"路径（`claude --print` / `codex exec` / `opencode run`），保证不卡死；离线模式与显式 `UMADEV_CONTINUOUS=0` 也走单发。
-
-### 底座自带模型 —— UmaDev 不接外部 API
-
-UmaDev 不自带模型，也不接第三方 API —— **底座用它自己的模型**（你订阅登录的，或你给底座自己配的第三方 / 本地模型）。选底座时 UmaDev 会读出并显示它当前用的模型和思考强度（`/status` 也能看），但**绝不覆盖**：运行时默认不传 `--model`，底座用它自己的；想换就改底座自己的配置，或用 `/model <id>` 临时覆盖这一会话。
-
-UmaDev 读取的来源：claude 的 `~/.claude/settings.json`（`model` / `effortLevel`）、codex 的 `~/.codex/config.toml`（`model` / `model_reasoning_effort`）、opencode 的 `opencode.json`（`model`，思考强度内置在模型变体里）。
-
-### 模式 B：离线模板（内部兜底，不是产品）
-
-```text
-/offline
-```
-
-离线模式不会调用任何模型，也不会访问网络。它**不是一个让你选的产品形态**——产品永远是"驱动你登录的底座"。离线模板只是没有底座可用时的确定性兜底，适合：
-
-- 快速看文件结构。
-- CI smoke test。
-- 演示 UmaDev 的流程。
-
-离线产物只是模板（带 TODO 占位），不代表模型完成了真实开发；真实交付必须走底座。第一次启动的底座选择器也只列这三个底座，不会把离线当成一个选项。
-
-## 流水线设计
-
-**9 阶段主链不是每个需求都走的固定漏斗，而是总监为"完整商业级 greenfield 交付"选择的*最深一招*。** 智能路由（上文"UmaDev 如何工作"①）先判断意图：闲聊不进流程、小修走快路径、bugfix 不组队；只有一个完整产品需求，总监才把计划展开成下面这条主链。规范里这条链就是 `standard` profile 的全程（见 [spec §4.1 / §9.5](spec/UMADEV_HOST_SPEC_V1.md)）——是**怎么交付一个完整产品**的契约，不是"每句话都得走九步"。
-
-规范主链是 9 个阶段：
+For a heavyweight greenfield build, the director can expand the plan into the full nine-phase chain. This is the most complete delivery path — not a funnel every message is forced through.
 
 ```mermaid
 flowchart LR
-    R["research<br/>调研"] --> D["docs<br/>PRD / 架构 / UIUX"]
-    D --> G1["docs_confirm<br/>文档确认"]
-    G1 --> S["spec<br/>执行计划"]
-    S --> F["frontend<br/>前端"]
-    F --> G2["preview_confirm<br/>预览确认"]
-    G2 --> B["backend<br/>后端"]
-    B --> Q["quality<br/>质量门"]
-    Q --> L["delivery<br/>交付"]
+    CL["clarify"] --> R["research"]
+    R --> D["docs<br/>PRD · Architecture · UI/UX"]
+    D --> G1["docs_confirm<br/>gate"]
+    G1 --> S["spec<br/>plan · tasks"]
+    S --> F["frontend"]
+    F --> G2["preview_confirm<br/>gate"]
+    G2 --> B["backend"]
+    B --> Q["quality gate"]
+    Q --> L["delivery"]
 ```
 
-当前产品实现还在主链前增加了一个 `clarify` 微阶段：
+Small tasks have a lightweight path — the router routes to the right depth, and the plan expands to fit. Declare the task type with `/kind` (fullstack / frontend-only / backend-only / bugfix / refactor) and the plan trims accordingly.
 
-```mermaid
-flowchart LR
-    C["clarify<br/>澄清需求"] --> R["research<br/>调研"]
-    R --> D["docs"]
-    D --> Rest["...后续 7 个规范阶段"]
-```
+### Phase outputs
 
-所以你可能先看到 UmaDev 生成：
+| Phase | What it produces |
+|---|---|
+| `clarify` | `output/<slug>-clarify.md`, `output/<slug>-clarify-answers.md` |
+| `research` | `output/<slug>-research.md` — web research + knowledge base hits merged |
+| `docs` | `output/<slug>-prd.md`, `output/<slug>-architecture.md`, `output/<slug>-uiux.md` |
+| `docs_confirm` | Gate — pause for review before any code is written |
+| `spec` | `output/<slug>-execution-plan.md`, `.umadev/plan.json`, `.umadev/changes/<id>/tasks.md` |
+| `frontend` | Source code + `output/<slug>-frontend-notes.md` |
+| `preview_confirm` | Gate — running app in the browser before backend work begins |
+| `backend` | Source code + `output/<slug>-backend-notes.md` |
+| `quality` | `output/<slug>-quality-gate.json`, `output/<slug>-quality-gate.md`, `runtime-proof.json` |
+| `delivery` | `output/<slug>-delivery-notes.md`, `release/proof-pack-*.zip`, `release/scorecard-*.html` |
 
-```text
-output/<slug>-clarify.md
-```
+---
 
-你可以回答澄清问题，也可以输入 `c` 跳过。
+## Quality Gate
 
-> 小任务有轻量路径：9 阶段是面向"完整商业级交付"的主链，不是每个需求都得全程走完。用 `/kind`（全栈 / 仅前端 / 仅后端 / bugfix / 重构）声明任务类型后，UmaDev 会据此裁剪阶段——bugfix、小改动不会强行拉你走 PRD/架构/UIUX 全套。
+The quality gate is a pre-delivery review that runs independently of the model.
 
-### 每个阶段由谁主导、产出什么
+It checks:
 
-| 阶段 | 主导角色 | 你能理解成 | 主要文件 |
-|---|---|---|---|
-| `clarify` | 产品经理 | 先把需求问清楚 | `output/<slug>-clarify.md`、`output/<slug>-clarify-answers.md` |
-| `research` | 产品经理 | 联网调研竞品、领域、风险、设计趋势 | `output/<slug>-research.md` |
-| `docs` | PM · 架构师 · 设计师 | 写三份核心文档（架构 ‖ UIUX 可并行） | `output/<slug>-prd.md`、`output/<slug>-architecture.md`、`output/<slug>-uiux.md` |
-| `docs_confirm` | 团队并行评审 + 你 | PM + 架构 + 设计 critic 各自只读审，连同你一起确认方向 | `.umadev/workflow-state.json`、`.umadev/team-ledger.jsonl` |
-| `spec` | 技术负责人 | 拆任务和执行计划（每任务回链 FR 编号） | `output/<slug>-execution-plan.md`、`.umadev/changes/<id>/tasks.md` |
-| `frontend` | 前端工程师 | 照设计系统/令牌实现前端 | `output/<slug>-frontend-notes.md` |
-| `preview_confirm` | 设计 + 前端 critic + 你 | 看前端效果、审实现质量 | TUI gate 状态、`.umadev/team-ledger.jsonl` |
-| `backend` | 后端工程师 | 照契约实现后端和集成 | `output/<slug>-backend-notes.md` |
-| `quality` | QA · 安全 · 后端 · 运维 critic | 真跑构建测试 + 红队 + 契约/覆盖/治理扫描 + 硬门 | `output/<slug>-quality-gate.json`、`output/<slug>-quality-gate.md` |
-| `delivery` | 运维 / 总监验收 | 对照计划验收、打包交付 | `output/<slug>-delivery-notes.md`、`release/proof-pack-*.zip`、`release/scorecard-*.html` |
+- PRD goal, scope, and acceptance criteria completeness.
+- Architecture APIs, data model, error handling, and authentication.
+- UI/UX tokens, typography, icon library, component states, and dark mode.
+- Frontend API calls cross-validated against the backend contract.
+- Emoji icons, hardcoded colors, and generic AI-template UI patterns.
+- Build, test, lint, and typecheck results.
+- Dockerfile, CI config, migrations, and `.env.example`.
+- Leaked API keys, passwords, and connection strings.
+- Audit logs and compliance mapping.
 
-## 质量门是什么
+The runtime probe (`umadev verify --runtime`) boots the app and hits its routes, writing `runtime-proof.json` — evidence that the app actually starts and responds.
 
-质量门可以理解成 UmaDev 的“交付前验收”。
-
-它不是简单看文件在不在，而是会检查：
-
-- PRD 有没有目标、范围、验收标准。
-- 架构文档有没有 API、数据模型、错误处理、鉴权。
-- UI/UX 文档有没有设计 token、字体、图标库、组件状态、暗黑模式。
-- 前端调用的 API 和后端契约是否一致。
-- 是否存在 emoji 图标、硬编码颜色、AI 模板痕迹。
-- 是否有构建、测试、lint、typecheck 结果。
-- 是否生成 Dockerfile、CI、migration、`.env.example`。
-- 是否泄露 API key、密码、连接串。
-- 是否有审计日志和合规映射。
-
-输出文件：
+Outputs:
 
 ```text
 output/<slug>-quality-gate.json
 output/<slug>-quality-gate.md
+runtime-proof.json
 ```
 
-默认通过线是 90 分，可以在 `.umadevrc` 调整：
+Default threshold:
 
 ```toml
 [quality]
@@ -484,31 +396,29 @@ threshold = 90
 skip_checks = []
 ```
 
-## 治理规则是什么
+---
 
-UmaDev 最早来自治理工具，这部分仍然是核心能力。
+## Governance
 
-这些规则是一条**治理基线**，不是绝对真理——每条都可以在 `.umadev/rules.toml` 里禁用、按路径排除或调参（见下文）。它们的作用是给底座的产出兜底，而不是替你做最终的工程判断。
+umadev started as a governance tool and that remains a core capability.
 
-规范层有 25 条 clause，实现层目前有 112 条规则，覆盖：
+The spec layer has 25 clauses. The implementation includes ~112 governance checks across UI quality, security, frontend architecture, backend engineering, and language-specific hazards. Every check is configurable in `.umadev/rules.toml` — each rule can be disabled, path-excluded, or tuned. They exist to backstop the base's output, not to make the final engineering call for you.
 
-- UI 质量：不用 emoji 当图标，不写硬编码色，不产出模板感 UI。
-- 安全：不写密钥，不写危险命令，不写 SQL 注入、SSRF、XXE 等危险代码。
-- 前端质量：不用随意 `any`、裸 `fetch`、缺少 a11y、缺少 ErrorBoundary 等。
-- 后端质量：鉴权、限流、日志、事务、输入校验、错误处理。
-- 多语言危险模式：Rust `unwrap`、Go `panic`、Python `bare except`、Java `System.exit` 等。
-
-治理入口有四个：
+Governance entry points:
 
 ```mermaid
 flowchart LR
-    A["Claude Code hook<br/>写入前拦截"] --> G["umadev-governance"]
-    B["umadev ci<br/>提交前/CI 扫描"] --> G
-    C["MCP server<br/>给其他 AI 工具调用"] --> G
-    D["quality gate<br/>交付前补扫"] --> G
+    A["Claude Code hook<br/>pre-write"] --> G["umadev-governance"]
+    B["umadev ci<br/>pre-commit / CI"] --> G
+    C["MCP server<br/>umadev mcp serve"] --> G
+    D["Quality gate<br/>pre-delivery scan"] --> G
+    G --> E["Decision: pass · block · advisory"]
+    E --> F[".umadev/audit/<br/>tool-calls.jsonl"]
 ```
 
-项目可以通过 `.umadev/rules.toml` 调整：
+Every governance function is fail-open: an error path returns `pass`, never a block. A bug in the governor never stops your work.
+
+Project policy:
 
 ```toml
 [disabled]
@@ -521,43 +431,43 @@ paths = ["src/legacy/**", "**/*.test.ts"]
 blocked_domains = ["internal-bad-proxy.corp"]
 ```
 
-## 知识库是什么
+The compliance mapping (`umadev report`) maps the evidence chain to SOC 2 / ISO 27001 / EU AI Act controls.
 
-UmaDev 内置了 400+ 份 markdown 知识文件，不只是普通文档，而是给底座看的工程标准库。
+---
 
-它覆盖：
+## Knowledge Base
 
-- 产品和 PRD。
-- 架构和 API。
-- 前端、后端、数据库。
-- 安全、测试、CI/CD、运维。
-- 移动端、桌面、小程序、鸿蒙、跨平台。
-- 电商、金融科技、医疗、教育、游戏等行业。
-- UI/UX、设计系统、设计反模式。
-- 产品经理、架构师、前端负责人、后端负责人、QA、DevOps 等专家方法论。
+umadev ships with 418 curated markdown knowledge files bundled directly into the binary and auto-extracted to `~/.umadev/knowledge` on first launch. They are not generic documentation — they are commercial-grade engineering standards formatted for injection into an AI coding CLI.
 
-检索方式：
+The corpus covers: product design, PRD methodology, system architecture, frontend engineering, backend engineering, database design, security, testing, CI/CD, operations, mobile, desktop, mini programs, HarmonyOS, cross-platform development, domain verticals, UI/UX, design systems, and engineering playbooks.
+
+On every working turn, umadev retrieves the most relevant chunks for the current requirement and phase, prepends them into the base's system prompt, and also injects a dependency-ranked outline of your existing code (the repo map). The result is that every prompt the base sees arrives pre-loaded with the applicable standard — not just a generic instruction.
+
+Retrieval flow:
 
 ```mermaid
 flowchart LR
-    A["用户需求"] --> B["分词<br/>中文 + 英文"]
-    B --> C["BM25 检索"]
-    B --> D["可选向量检索"]
-    C --> E["RRF 融合排序"]
+    A["Requirement + phase"] --> B["Tokenizer<br/>CJK bigram + English"]
+    B --> C["BM25 index"]
+    B --> D["Vector embeddings<br/>(optional, OPENAI_EMBED_KEY)"]
+    C --> E["RRF fusion"]
     D --> E
-    E --> F["注入当前阶段 prompt"]
+    E --> F["Top-k chunks"]
+    F --> G["Injected into base system prompt<br/>alongside repo-map slice + recalled pitfalls"]
 ```
 
-你也可以添加自己的团队知识：
+Add your own knowledge:
 
 ```bash
 umadev knowledge-manage add ./team-docs --name team-docs
-umadev knowledge-manage search "支付 webhook 幂等"
+umadev knowledge-manage search "payment webhook idempotency"
 ```
 
-## 交付产物长什么样
+---
 
-一次完整运行后，目录大致是：
+## Deliverables
+
+After a full run:
 
 ```text
 your-project/
@@ -576,203 +486,191 @@ your-project/
     app-delivery-notes.md
 
   .umadev/
+    plan.json
     workflow-state.json
+    contracts/
+      openapi.json
+      openapi.yaml
     audit/
       tool-calls.jsonl
       frontend-api-calls.jsonl
       verify.jsonl
-    changes/
-    decisions/
-    history/
 
   release/
     proof-pack-app-20260620090000.zip
     proof-pack-app-20260620090000.manifest.txt
     scorecard-app-20260620090000.html
+    runtime-proof.json
 ```
 
-其中：
+The proof pack and scorecard are what you hand to a teammate, client, or reviewer. Everything else is intermediate work.
 
-- `output/` 是项目过程文档。
-- `.umadev/` 是状态和审计记录。
-- `release/` 是最终交付包。
+---
 
-## 命令大全
+## Commands
 
-UmaDev 有两套入口,一一对应:
+umadev has two entry points that mirror each other:
 
-- **TUI 斜杠命令** —— 在 `umadev` 聊天界面里输入 `/`,日常推荐。
-- **终端 CLI 子命令** —— 脚本 / CI 用,无需进 TUI。
+- **TUI slash commands** — type inside the `umadev` chat UI (recommended for daily use).
+- **Terminal CLI subcommands** — for scripts and CI, no TUI needed.
 
-> 提示:TUI 里输入 `/` 会弹出命令补全浮层,`Tab` 补全、`↑↓` 切换;`/help`(或 F1)列出全部命令和快捷键。
+Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`↓` to cycle. `/help` (or F1) lists every command and keybinding.
 
-### TUI 斜杠命令
+### TUI slash commands
 
-**选择"大脑"与模型**
+**Pick the base and model**
 
-| 命令 | 作用 |
+| Command | What it does |
 |---|---|
-| `/claude` · `/codex` · `/opencode` | 切换驱动的本机底座 CLI(存入 `~/.umadev/config.toml`);切换时显示该底座当前的模型与思考强度 |
-| `/offline` | 切到离线确定性模板(演示 / CI,完全不联网) |
-| `/status` | 当前底座、它的**驱动模型**和**思考强度**(读自底座自己的配置,UmaDev 不覆盖) |
-| `/model <id>` | 临时覆盖这一会话用的模型(默认不覆盖,底座用它自己的) |
-| `/kind <类型>` | 指定任务类型(全栈 / 仅前端 / 仅后端 / bugfix / 重构),据此裁剪阶段 |
+| `/claude` · `/codex` · `/opencode` | Switch the base being driven (saved to `~/.umadev/config.toml`) |
+| `/offline` | Switch to deterministic offline templates (demo / CI, no network) |
+| `/status` | Active base, its current model, and reasoning effort (read from the base's own config) |
+| `/model <id>` | Override the model for this session only (default: umadev passes none, base uses its own) |
+| `/kind <type>` | Set task type (`fullstack` / `frontend-only` / `backend-only` / `bugfix` / `refactor`) to trim the plan |
 
-**驱动流程与过门**
+**Drive the flow**
 
-| 命令 | 作用 |
+| Command | What it does |
 |---|---|
-| 直接打字 | 智能路由分流"闲聊 / 小修 / 完整 build";若有确认门打开,则作为修改意见 |
-| `/run <需求>` | 显式开始一次完整流水线(强制走完整 build) |
-| `/quick <需求>` | 强制走快路径(轻量单点改动,不展开计划) |
-| `/plan [skip\|add\|veto\|up\|down <id>]` | 查看 / 步级调度当前可视计划;无参折叠面板 |
-| `/continue`(门上也可直接输 `c`) | 通过当前确认门、进入下一阶段 |
-| `/revise <反馈>` | 停在当前门,带反馈重做本阶段 |
-| `/manual` · `/auto` | 切换"逐门人工确认 / 全自动"(默认 `auto`;`shift+Tab` 也可切换) |
-| `/redo` | 重跑上一个阶段块 |
-| `/abort` · `/stop` | 中止当前运行(磁盘工作流状态保留,下次可续跑) |
+| just type | Routes to the right path; a build typed here gets the same systems as `/run` |
+| `/run <requirement>` | Start a full build explicitly |
+| `/goal <objective>` | Keep the base working until the objective is met (native on all three bases; `UMADEV_NO_GOAL_MODE=1` opts out) |
+| `/quick <task>` | Force the light path for a trivial one-off change |
+| `/plan [skip\|add\|veto\|up\|down <id>]` | View or steer the live dependency plan |
+| `/continue` (or `c` at a gate) | Approve the current gate and advance |
+| `/revise <feedback>` | Stay at the gate, redo the current phase with feedback |
+| `/manual` · `/auto` | Per-gate confirmation vs. fully automatic (`shift+Tab` also toggles) |
+| `/redo` | Re-run the previous phase block |
+| `/abort` · `/stop` | Abort the current run (on-disk state kept, resumable later) |
 
-**预览与交付**
+**Preview and delivery**
 
-| 命令 | 作用 |
+| Command | What it does |
 |---|---|
-| `/preview` | 启动前端 dev server 并打开浏览器 |
-| `/stop-preview` | 停止预览服务 |
-| `/deploy` | **预览**部署命令(只看不执行) |
-| `/deploy confirm` | 真正执行部署 |
+| `/preview` | Start the frontend dev server and open the browser |
+| `/stop-preview` | Stop the preview server |
+| `/deploy` | Preview the deploy command (look, don't run) |
+| `/deploy confirm` | Run the deploy |
 
-**检查点与回滚**(影子 git,不碰你自己的 `.git`)
+**Checkpoints and rewind** (shadow git — never touches your `.git`)
 
-| 命令 | 作用 |
+| Command | What it does |
 |---|---|
-| `/checkpoint [标签]` | 给当前工作区文件打快照 |
-| `/rewind [id]` | 列出 / 回滚到某个文件检查点 |
+| `/checkpoint [label]` | Snapshot the workspace files |
+| `/rewind [id]` | List / roll back to a file checkpoint |
 
-**查看产物与状态**
+**Inspect artifacts and state**
 
-| 命令 | 作用 |
+| Command | What it does |
 |---|---|
-| `/spec` | 查看完整 `UMADEV_HOST_SPEC_V1` 规范 |
-| `/diff [名字]` | 查看某个产物(默认 `prd`,也可 `architecture` / `uiux` / …) |
-| `/verify` | 工作区合规报告 + 证据链 |
-| `/doctor` | 自检(二进制 / manifest / 探针) |
-| `/status` | 当前阶段 / 门 / 运行状态 |
-| `/history` | 完整对话历史 |
-| `/sessions` | 列出本项目持久化的对话会话 |
-| `/resume <id>` | 续接某个持久化对话会话 |
-| `/usage` | token / 用量统计 |
-| `/knowledge` | 本次命中的知识库条目 |
-| `/skill` · `/mcp` | 已安装的 Skill / MCP server |
-| `/config` | 当前生效配置 |
+| `/spec` | Print the full `UMADEV_HOST_SPEC_V1` spec |
+| `/diff [name]` | Show an artifact (`prd` · `architecture` · `uiux` · …) |
+| `/verify` | Workspace conformance report and evidence chain |
+| `/doctor` | Self-test (binary / manifest / probes) |
+| `/status` | Current phase, gate, and run state |
+| `/history` | Full conversation history |
+| `/usage` | Token and usage statistics |
+| `/knowledge` | Knowledge-base hits for this run |
+| `/skill` · `/mcp` | Installed Skills / MCP servers |
+| `/config` | Effective configuration |
 
-**设计与项目**
+**Design and project**
 
-| 命令 | 作用 |
+| Command | What it does |
 |---|---|
-| `/design <方向>` | 锁定设计系统方向(`modern-minimal` / `editorial-clean` / …) |
-| `/template <名字>` | 选脚手架模板 |
-| `/name <名字>` | 设置项目 slug |
-| `/init` | 写入 `umadev.yaml` manifest |
+| `/design <direction>` | Lock the design-system direction (`modern-minimal` · `editorial-clean` · …) |
+| `/template <name>` | Pick a scaffold template |
+| `/name <name>` | Set the project slug |
+| `/init` | Write the `umadev.yaml` manifest |
 
-**通用**
+**General**
 
-| 命令 | 作用 |
+| Command | What it does |
 |---|---|
-| `/help`(或 F1) | 帮助浮层(含全部快捷键) |
-| `/compact` | 按 token 预算压缩对话上下文(总结并折叠,替代 FIFO 截断) |
-| `/clear` | 清空聊天 |
-| `/export` | 导出当前会话 |
-| `/quit`(或 Esc) | 退出(工作流状态已保存,可续跑) |
+| `/help` (or F1) | Help overlay with all keybindings |
+| `/clear` | Clear the chat |
+| `/export` | Export the current session |
+| `/quit` (or Esc) | Exit (workflow state is saved, resumable) |
 
-### 终端 CLI 子命令
+### Terminal CLI subcommands
 
-**工作区生命周期**
+**Workspace lifecycle**
 
-| 命令 | 作用 |
+| Command | What it does |
 |---|---|
-| `umadev init` | 脚手架工作区(写 `umadev.yaml` + 设计系统 / 模板 / 知识库种子) |
-| `umadev`(无子命令) | 启动聊天 TUI |
-| `umadev doctor` | 自检 |
-| `umadev verify` | 工作区合规 + 证据链状态 |
-| `umadev report` | 合规映射(SOC 2 / ISO 27001 / EU AI Act) |
-| `umadev history` | 列出回滚快照 |
-| `umadev rollback latest` | 回滚到某快照 |
-| `umadev update` | 升级 UmaDev 到最新版(经 npm) |
-| `umadev uninstall` | 完整卸载:确认后删 `~/.umadev` + 本项目治理钩子 + 二进制(加 `--base <claude-code\|pre-commit>` 则仅卸钩子) |
+| `umadev init` | Scaffold the workspace (`umadev.yaml` + design system / knowledge seeds) |
+| `umadev` | Launch the chat TUI |
+| `umadev doctor` | Self-test |
+| `umadev verify` | Workspace conformance and evidence chain; `--runtime` boots the app and hits its routes |
+| `umadev report` | Compliance mapping (SOC 2 / ISO 27001 / EU AI Act) |
+| `umadev history` | List rollback snapshots |
+| `umadev rollback latest` | Roll back to a snapshot |
+| `umadev update` | Upgrade umadev via npm |
+| `umadev uninstall` | Full uninstall: removes `~/.umadev`, governance hooks, and the binary (`--base <id>` for hook-only) |
 
-**非交互运行(脚本 / CI)**
+**Non-interactive run (scripts / CI)**
 
-| 命令 | 作用 |
+| Command | What it does |
 |---|---|
-| `umadev run "<需求>" --backend <id>` | 跑一次流水线,停在 `docs_confirm` 门 |
-| `umadev continue [--backend <id>]` | 通过当前门(自动复用上次的 `--backend`) |
-| `umadev revise "<反馈>"` | 停在门,记录修改并重跑本块 |
-| `umadev spec [--clauses]` | 打印规范(`--clauses` 看条款表) |
+| `umadev run "<requirement>" --backend <id>` | Run a pipeline, pausing at the `docs_confirm` gate |
+| `umadev continue [--backend <id>]` | Approve the current gate |
+| `umadev revise "<feedback>"` | Stay at the gate, record a revision, rerun the block |
+| `umadev spec [--clauses]` | Print the spec (`--clauses` for the clause table) |
 
-**治理 / CI**
+**Governance / CI**
 
-| 命令 | 作用 |
+| Command | What it does |
 |---|---|
-| `umadev ci [--changed-only] [--report-only]` | 对工作区每个源文件跑治理(CI 模式) |
-| `umadev install --base <claude-code\|pre-commit\|…>` | 把 pre-write 治理钩子装到底座 CLI 或 git pre-commit |
+| `umadev ci [--changed-only] [--report-only]` | Run governance over every source file (CI mode) |
+| `umadev install --base <claude-code\|pre-commit\|…>` | Install the pre-write governance hook |
 
-**平台扩展**
+**Platform extensions**
 
-| 命令 | 作用 |
+| Command | What it does |
 |---|---|
-| `umadev mcp serve` | 作为 MCP server 运行——把 `govern_file` / `govern_command` 暴露给 Claude Desktop / Cursor / Continue 等 |
-| `umadev mcp-manage <install\|list\|remove>` | 管理底座的 MCP server |
-| `umadev skill <install\|list\|remove>` | 管理 Skill(知识 + 规则 + 提示词包) |
-| `umadev knowledge-manage <add\|list\|search\|remove>` | 管理自定义知识库文档 |
+| `umadev mcp serve` | Run as an MCP server — exposes `govern_file` / `govern_command` to Claude Desktop, Cursor, Continue, and others |
+| `umadev mcp-manage <install\|list\|remove>` | Manage the base CLI's MCP servers |
+| `umadev skill <install\|list\|remove>` | Manage Skills (knowledge + rules + prompt packs) |
+| `umadev knowledge-manage <add\|list\|search\|remove>` | Manage custom knowledge-base docs |
 
-**帮助**
+**Help**
 
-| 命令 | 作用 |
+| Command | What it does |
 |---|---|
-| `umadev examples` | 命令速查表 |
-| `umadev guide` | 60 秒上手教程 |
+| `umadev examples` | Command cheat-sheet |
+| `umadev guide` | 60-second walkthrough |
 
-### 常用环境变量
+### Common environment variables
 
-| 变量 | 作用 | 默认 |
+| Variable | What it does | Default |
 |---|---|---|
-| `UMADEV_CLAUDE_BIN` / `UMADEV_CODEX_BIN` | `claude` / `codex` 二进制路径 | `claude` / `codex` |
-| `UMADEV_WORKER_TIMEOUT` | 单次 worker 超时(秒) | `300` |
-| `UMADEV_VERIFY_TIMEOUT_SECS` | verify 循环单次超时(秒) | `120` |
-| `UMADEV_MODEL_PLAN` / `UMADEV_MODEL_BUILD` | 分阶段模型分层(等价 `/model plan\|build`) | — |
-| `OPENAI_EMBED_KEY` | 启用远程向量嵌入(否则用内置离线模型 + BM25) | — |
-| `XDG_CONFIG_HOME` | `config.toml` 的基目录 | `$HOME` |
+| `UMADEV_CLAUDE_BIN` / `UMADEV_CODEX_BIN` | Path to the `claude` / `codex` binary | `claude` / `codex` |
+| `UMADEV_WORKER_TIMEOUT` | Per-call worker timeout in seconds | `300` |
+| `UMADEV_VERIFY_TIMEOUT_SECS` | Verify-loop per-call timeout in seconds | `120` |
+| `UMADEV_MODEL_PLAN` / `UMADEV_MODEL_BUILD` | Per-phase model tiers (same as `/model plan\|build`) | — |
+| `UMADEV_NO_GOAL_MODE` | Disable `/goal` mode if set to `1` | — |
+| `OPENAI_EMBED_KEY` | Enable remote vector embeddings (else bundled local model + BM25) | — |
+| `XDG_CONFIG_HOME` | Base directory for `config.toml` | `$HOME` |
 
-## 配置
+---
 
-### 用户级配置
+## Configuration
 
-默认路径：
-
-```text
-~/.umadev/config.toml
-```
-
-示例：
+User config:
 
 ```toml
+# ~/.umadev/config.toml
 backend = "claude-code"
-lang = "zh-CN"
-# model 默认留空 —— 底座用它自己配置的模型;只有想覆盖某会话时才填(等价 /model <id>)
+lang = "en"
+# model is empty by default — the base uses its own configured model.
+# Set it (or use /model <id>) only to override a session.
 # model = "opus"
 ```
 
-### 项目级配置
-
-默认路径：
-
-```text
-.umadevrc
-```
-
-示例：
+Project config:
 
 ```toml
+# .umadevrc
 [quality]
 threshold = 90
 skip_checks = []
@@ -788,44 +686,53 @@ engine = "hybrid"
 top_k = 6
 ```
 
-## Rust 架构
+Trust mode controls autonomy: `umadev run --mode plan|guarded|auto` (default `guarded`). Irreversible actions — git merge, reset, deletes, deploys, network pushes — always confirm on every tier.
 
-UmaDev 是一个 10 crate Rust workspace。
+---
 
-| Crate | 普通人理解 | 技术职责 |
-|---|---|---|
-| `umadev` | 主程序 | CLI、TUI 入口、doctor、hook、CI、MCP/Skill/Knowledge 管理 |
-| `umadev-spec` | 规则说明书 | `UMADEV_HOST_SPEC_V1` 的 Rust 数据 |
-| `umadev-governance` | 质检和红线 | 112 条治理规则、审计、策略、合规映射 |
-| `umadev-agent` | 总监引擎 | 智能路由（`router`）、可视计划 DAG（`plan_state`）、固件注入（`context::compose_firmware`）、团队调度（`director::summon` + `director_loop`）、finalize 交付、gate、质量门、角色 critic 团队、验收/有界返工、信任分级、自我进化记忆；9 阶段主链是其中"最深一招" |
-| `umadev-runtime` | 统一大脑接口 | Runtime trait + 持续会话 `BaseSession` trait、Offline、能力契约 |
-| `umadev-host` | 驱动外部 CLI | Claude Code / Codex / OpenCode：持续会话驱动（`*_session.rs`）+ 单发兜底 |
-| `umadev-contract` | API 对账员 | OpenAPI 契约、前后端路径校验 |
-| `umadev-knowledge` | 知识检索 | BM25、chunk、tokenizer、可选 vector |
-| `umadev-tui` | 终端界面 | ratatui 聊天 UI、预览/部署命令 |
-| `umadev-i18n` | 多语言 | 简体中文、繁體中文、English |
+## Rust Architecture
 
-目录结构：
+umadev is a ten-crate Rust workspace.
 
-```text
-crates/               Rust workspace
-spec/                 UMADEV_HOST_SPEC_V1 规范
-knowledge/            内置知识库
-docs/                 架构、产品、商业化和设计文档
-docs/assets/          图片和 Mermaid 图
-npm/                  npm 分发包
-tests/spec_vectors/   规范测试向量
+```mermaid
+flowchart TB
+    Binary["umadev binary<br/>CLI · TUI · CI · hook · MCP · doctor"]
+
+    Binary --> Agent["umadev-agent<br/>Router · Plan · Director · Critics · Trust · Lessons"]
+    Binary --> TUI["umadev-tui<br/>ratatui · markdown · live diffs · build cards"]
+    Binary --> I18N["umadev-i18n<br/>zh-CN · zh-TW · en"]
+
+    Agent --> Spec["umadev-spec<br/>UMADEV_HOST_SPEC_V1 · 25 clauses"]
+    Agent --> Governance["umadev-governance<br/>~112 rules · audit · compliance"]
+    Agent --> Knowledge["umadev-knowledge<br/>418 files · BM25 · vector · repo-map"]
+    Agent --> Contract["umadev-contract<br/>OpenAPI · path reconciliation"]
+    Agent --> Runtime["umadev-runtime<br/>Runtime trait · OfflineRuntime"]
+
+    Runtime --> Host["umadev-host<br/>claude-code · codex · opencode drivers"]
 ```
 
-## 开发
+| Crate | Role |
+|---|---|
+| `umadev` | Binary entry point. CLI verbs, TUI launch, CI runner, pre-write hook, MCP/Skill/Knowledge management, doctor. |
+| `umadev-spec` | `UMADEV_HOST_SPEC_V1` as Rust data — clauses, phases, gates, runtime kinds. Normative prose mirror: `spec/`. |
+| `umadev-governance` | Fail-open enforcement kernel. ~112 checks across UI quality, security, frontend, backend, and language hazards. Policy, audit (JSONL), compliance mapping (SOC 2 / ISO 27001 / EU AI Act). |
+| `umadev-agent` | The director engine. Router (typed `RoutePlan`, base-model intent triage), plan state (owned `Plan`/`PlanStep` DAG → `.umadev/plan.json`), firmware builder (`compose_firmware` — identity, standards, knowledge chunks, pitfall recall, repo-map slice), director loop (step drive, verify, bounded self-correct, finalize), critics (nine role seats, parallel forked sessions, structured `RoleVerdict`), trust tiers, lessons store (frequency-signal pitfall recall, HyDE query expansion, BM25+vector RRF fusion). |
+| `umadev-runtime` | `Runtime` trait + `OfflineRuntime` + `RuntimeKind`. The three host drivers implement this trait; umadev owns no model endpoint. |
+| `umadev-host` | `HostDriver` trait for the three bases: `claude`, `codex`, `opencode`. Each implements `umadev_runtime::Runtime`. `BACKEND_IDS` is the authoritative ID list, locked by tests. |
+| `umadev-knowledge` | Structured retrieval over the bundled knowledge corpus. Markdown-aware chunker, pure-Rust BM25 + CJK-bigram tokenizer, optional vector embeddings (`OPENAI_EMBED_KEY`), RRF fusion, mtime-cached BM25 index. Also `repomap`: per-language regex symbol scan, degree-centrality ranked, intent-personalized, token-budgeted, mtime-cached. |
+| `umadev-contract` | Machine-verifiable frontend↔backend API contract. Parses the architecture doc's API table into a typed `ApiSpec`, renders `openapi.{json,yaml}`, extracts frontend `fetch`/`axios` calls, cross-validates. Self-contained OpenAPI subset. |
+| `umadev-tui` | ratatui terminal app over the engine event stream. Markdown rendering, syntax-highlighted code, live word-level diff cards, folding tool rows, build-completion card with clickable preview URL. |
+| `umadev-i18n` | Trilingual (zh-CN / zh-TW / en) string catalogs and system-locale detection for all user-facing text. |
 
-要求：
+---
+
+## Development
+
+Requirements:
 
 - Rust 1.87+
 - Cargo
-- 如果要测试 npm 分发，需要 Node.js 18+
-
-常用命令：
+- Node.js 18+ only if testing the npm distribution shim
 
 ```bash
 cargo build --workspace
@@ -834,14 +741,23 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 ```
 
-推荐阅读顺序：
+Clippy runs at `pedantic` level workspace-wide; new code must pass with `-D warnings`.
 
-1. [spec/UMADEV_HOST_SPEC_V1.md](spec/UMADEV_HOST_SPEC_V1.md)
-2. [crates/umadev-spec/src/lib.rs](crates/umadev-spec/src/lib.rs)
-3. [crates/umadev-agent/src/runner.rs](crates/umadev-agent/src/runner.rs)
-4. [crates/umadev-governance/src/rules.rs](crates/umadev-governance/src/rules.rs)
-5. [crates/umadev/src/main.rs](crates/umadev/src/main.rs)
+Recommended reading order:
+
+1. [`spec/UMADEV_HOST_SPEC_V1.md`](spec/UMADEV_HOST_SPEC_V1.md) — the normative spec
+2. [`crates/umadev-spec/src/lib.rs`](crates/umadev-spec/src/lib.rs) — clauses as Rust data
+3. [`crates/umadev-agent/src/router.rs`](crates/umadev-agent/src/router.rs) — routing logic
+4. [`crates/umadev-governance/src/rules.rs`](crates/umadev-governance/src/rules.rs) — the governance rules
+5. [`crates/umadev/src/main.rs`](crates/umadev/src/main.rs) — binary entry point
+
+Other authoritative references:
+
+- [`docs/PRODUCT_VISION_AND_ROADMAP.md`](docs/PRODUCT_VISION_AND_ROADMAP.md) — the product model
+- [`CHANGELOG.md`](CHANGELOG.md) — release history
+
+---
 
 ## License
 
-MIT，见 [LICENSE](LICENSE)。
+[MIT](LICENSE).
