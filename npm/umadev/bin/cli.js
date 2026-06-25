@@ -188,6 +188,49 @@ function downloadTo(url, dest, withBar, label) {
     req.setTimeout(120000, () => req.destroy(new Error('timeout')));
   });
 }
+// Ordered list of base URLs to try for the release assets. An explicit override
+// (UMADEV_MODEL_BASE_URL) wins; otherwise zh-CN / China-timezone users get GitHub
+// PROXY MIRRORS first (github.com's release CDN is frequently slow or blocked in
+// mainland China), and everyone else gets github.com first — with the others as
+// fallback either way, so a blocked github.com or a down mirror still recovers.
+function releaseBases(version) {
+  if (process.env.UMADEV_MODEL_BASE_URL) {
+    return [process.env.UMADEV_MODEL_BASE_URL.replace(/\/+$/, '')];
+  }
+  const gh = 'https://github.com/umacloud/umadev/releases/download/v' + version;
+  const mirrors = [
+    'https://ghproxy.net/' + gh,
+    'https://ghfast.top/' + gh,
+    'https://gh-proxy.com/' + gh,
+  ];
+  let cn = false;
+  try {
+    const opts = Intl.DateTimeFormat().resolvedOptions();
+    const tz = opts.timeZone || '';
+    const loc = (process.env.LANG || process.env.LC_ALL || '') + ' ' + (opts.locale || '');
+    cn =
+      /Shanghai|Chongqing|Urumqi|Harbin|Hong_Kong|Macau/.test(tz) ||
+      /zh[_-]?(CN|Hans)/i.test(loc);
+  } catch (_) {
+    /* default to direct-first */
+  }
+  return cn ? [...mirrors, gh] : [gh, ...mirrors];
+}
+// Try each base for `name` in order; resolve on first success, throw the last
+// error if all fail. A China mirror can cover a blocked github.com (or vice
+// versa) with zero user configuration.
+async function downloadFile(bases, name, dest, withBar, label) {
+  let lastErr;
+  for (const base of bases) {
+    try {
+      await downloadTo(base + '/' + name, dest, withBar, label);
+      return;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('no source reachable');
+}
 async function ensureModel() {
   const dir = modelTargetDir();
   if (modelPresent(dir)) return dir; // already installed — fast path, no network
@@ -197,7 +240,7 @@ async function ensureModel() {
   } catch (_) {
     /* keep default */
   }
-  const base = 'https://github.com/umacloud/umadev/releases/download/v' + version;
+  const bases = releaseBases(version);
   try {
     fs.mkdirSync(dir, { recursive: true });
     process.stderr.write(
@@ -206,10 +249,11 @@ async function ensureModel() {
     process.stderr.write(
       '  一次性下载;之后完全本地、运行时无需联网。失败不影响使用(降级为 BM25)。\n',
     );
-    await downloadTo(base + '/config.json', path.join(dir, 'config.json'), false, '');
-    await downloadTo(base + '/tokenizer.json', path.join(dir, 'tokenizer.json'), false, '');
-    await downloadTo(
-      base + '/model.safetensors',
+    await downloadFile(bases, 'config.json', path.join(dir, 'config.json'), false, '');
+    await downloadFile(bases, 'tokenizer.json', path.join(dir, 'tokenizer.json'), false, '');
+    await downloadFile(
+      bases,
+      'model.safetensors',
       path.join(dir, 'model.safetensors'),
       true,
       '下载向量模型',
