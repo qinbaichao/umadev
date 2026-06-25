@@ -837,7 +837,10 @@ pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<Subproces
     let mut cmd = Command::new(program);
     cmd.args(&lead);
     cmd.args(call.args);
-    if matches!(call.channel, PromptChannel::Arg) {
+    if matches!(call.channel, PromptChannel::Arg) && !call.prompt.is_empty() {
+        // Skip an EMPTY prompt: appending "" as a CLI arg is never intended and
+        // breaks strict tools (e.g. GNU `printenv VAR ""` exits 1 where BSD exits
+        // 0). A real base prompt is always non-empty, so this only fixes the edge.
         cmd.arg(call.prompt);
     }
     cmd.current_dir(call.workspace);
@@ -1037,7 +1040,10 @@ pub(crate) async fn run_subprocess_streaming(
     let mut cmd = Command::new(program);
     cmd.args(&lead);
     cmd.args(call.args);
-    if matches!(call.channel, PromptChannel::Arg) {
+    if matches!(call.channel, PromptChannel::Arg) && !call.prompt.is_empty() {
+        // Skip an EMPTY prompt: appending "" as a CLI arg is never intended and
+        // breaks strict tools (e.g. GNU `printenv VAR ""` exits 1 where BSD exits
+        // 0). A real base prompt is always non-empty, so this only fixes the edge.
         cmd.arg(call.prompt);
     }
     cmd.current_dir(call.workspace);

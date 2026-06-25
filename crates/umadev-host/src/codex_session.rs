@@ -2008,26 +2008,19 @@ done
             "send_turn must return promptly without awaiting the turn/start response: {sent:?}"
         );
 
-        // The turn drives to completion via the notification stream. The turn id is
-        // adopted from `turn/started` MID-turn (so interrupt can target it) — assert
-        // it on the first non-done event, before `turn/completed` clears it.
+        // The turn drives to completion via the notification stream. (The turn id
+        // being adopted from `turn/started` mid-turn is verified deterministically
+        // by `await_turn_id_*` — polling it during the drain here was a race: the
+        // background notification task sets AND clears it between `next_event`s, so
+        // on a fast/loaded runner the test missed the window.)
         let mut done = false;
-        let mut saw_turn_id = false;
         while let Some(ev) = session.next_event().await {
             if matches!(ev, SessionEvent::TurnDone { .. }) {
                 done = true;
                 break;
             }
-            // Before the completion clears it, the id must be the adopted one (F5).
-            if session.turn_id.lock().await.as_deref() == Some("turn_test") {
-                saw_turn_id = true;
-            }
         }
         assert!(done, "the turn completes from the notification stream");
-        assert!(
-            saw_turn_id,
-            "the turn id is adopted from turn/started mid-turn (for F5 interrupt)"
-        );
         let _ = session.end().await;
     }
 
