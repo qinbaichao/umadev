@@ -300,6 +300,22 @@ async function ensureModel() {
   }
 }
 
+// Subcommands that do NOT drive the agent runtime — they never retrieve
+// knowledge, so they must not trigger the one-time ~224MB vector-model download.
+// Without this, `umadev update` (and `--version` / `--help` / `doctor` / …) would
+// appear to hang on a machine that doesn't have the model yet, while it streams
+// in — which reads as "the update command broke". The model is fetched lazily on
+// the first command that actually needs it (the TUI / run / quick / …).
+const NO_MODEL_COMMANDS = new Set([
+  'update', 'install', 'uninstall', 'init',
+  '--version', '-V', 'version',
+  '--help', '-h', 'help',
+  'doctor', 'mcp', 'hook', 'ci',
+  'usage', 'lessons', 'history',
+  'examples', 'guide',
+  'mcp-manage', 'skill', 'knowledge-manage', 'pr',
+]);
+
 async function main() {
   const binary = findBinary();
   // npm artifact round-trips (upload/download-artifact in CI) can strip the
@@ -310,10 +326,15 @@ async function main() {
     // read-only install dir or already +x — spawnSync below reports real errors
   }
   const extraEnv = {};
+  // A utility command (update/--version/--help/doctor/…) skips the model fetch so
+  // it returns instantly even before the model is installed; the agent runtime
+  // commands still fetch it lazily on first use.
+  const firstArg = process.argv[2] || '';
+  const needsModel = !NO_MODEL_COMMANDS.has(firstArg);
   // Prefer a bundled npm model package (dev / sibling layout); otherwise fetch
   // it on demand into ~/.umadev/embed-model (the binary's model_dir() fallback).
   let modelDir = findModelDir();
-  if (!modelDir) modelDir = await ensureModel();
+  if (needsModel && !modelDir) modelDir = await ensureModel();
   if (modelDir && !process.env.UMADEV_EMBED_MODEL_DIR) {
     extraEnv.UMADEV_EMBED_MODEL_DIR = modelDir;
   }
