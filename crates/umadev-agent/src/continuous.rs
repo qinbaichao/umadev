@@ -218,6 +218,12 @@ pub async fn run_block(
     // mid-run env flip can't race the in-flight phase pumps. Threaded into every
     // `drive_phase` so each main-session phase pump is idle-guarded (P1-11).
     let idle = crate::director_loop::idle_timeout();
+    // The run's wall-clock ceiling. The legacy phase walk has no `deadline` of its
+    // own (the director loop owns one; this path predates it), so derive it the SAME
+    // way here — `now + run_budget()` — and thread it into every phase / rework pump
+    // so an ACTIVE base can't run one phase turn unbounded past the budget. A
+    // GRACEFUL ceiling: the pump settles the turn on what's built, never aborts.
+    let deadline = std::time::Instant::now() + crate::director_loop::run_budget();
 
     // Persist the project's governance context BEFORE any phase writes a file, so
     // the out-of-process PreToolUse hook (which reads `.umadev/governance-context.
@@ -274,7 +280,7 @@ pub async fn run_block(
             // fail-open: it NEVER drives the gate decision — the gate still pauses
             // for the user exactly as before.
             let gate = gate_for_phase(phase);
-            review_and_rework(session, options, events, gate_review_kind(phase)).await;
+            review_and_rework(session, options, events, gate_review_kind(phase), deadline).await;
             // P0-A: persist the OPEN-GATE state (phase = the gate phase, active_gate
             // = its id) so `umadev continue` / the TUI gate resume read the real door
             // and resume the continuous run from THIS gate — exactly the state shape
@@ -313,6 +319,7 @@ pub async fn run_block(
             std::mem::take(&mut first_directive),
             plan.kind,
             idle,
+            deadline,
         )
         .await;
         // `first_directive` is consumed by `std::mem::take` only when this is
@@ -339,7 +346,7 @@ pub async fn run_block(
         // this catch-up a non-claude base's written files were never governed.
         // Fail-open + advisory: it re-delegates a fix but never stops the run.
         if matches!(phase, Phase::Frontend | Phase::Backend) {
-            governance_catchup(session, options, events).await;
+            governance_catchup(session, options, events, deadline).await;
         }
 
         // DETERMINISTIC QUALITY GATE (the moat — HARD signal). Before the LLM
@@ -375,7 +382,7 @@ pub async fn run_block(
         // session. Advisory + fail-open; never blocks the run (the gate above is
         // the hard signal).
         if phase == Phase::Quality {
-            review_and_rework(session, options, events, ReviewKind::Quality).await;
+            review_and_rework(session, options, events, ReviewKind::Quality, deadline).await;
         }
 
         // HARD STOP (git-independent): after the last code-producing phase, if
@@ -420,6 +427,7 @@ enum PhaseResult {
 /// Inject one phase directive and pump the resulting event stream, applying
 /// governance + audit + trust-tiered approval + TUI streaming on each event,
 /// until the turn's [`SessionEvent::TurnDone`].
+#[allow(clippy::too_many_arguments)]
 async fn drive_phase(
     session: &mut dyn BaseSession,
     options: &RunOptions,
@@ -430,6 +438,11 @@ async fn drive_phase(
     // Idle watchdog window (P1-11), passed in so the env is read ONCE at the
     // `run_block` boundary and the test can drive a tiny deterministic window.
     idle: std::time::Duration,
+    // The run's wall-clock ceiling, checked at the TOP of the pump so an ACTIVE base
+    // can't run ONE phase turn unbounded past the run budget (the legacy phase walk
+    // otherwise had no mid-turn ceiling at all — it never re-checks a deadline once a
+    // phase turn starts draining).
+    deadline: std::time::Instant,
 ) -> PhaseResult {
     let directive = phase_directive(options, phase, first_directive, kind);
     if let Err(e) = session.send_turn(directive).await {
@@ -443,6 +456,27 @@ async fn drive_phase(
     // shared idle primitive + window the director loop uses so every
     // main-session pump has identical zero-stall protection.
     loop {
+        // Wall-clock budget reached DURING a phase turn. A base that stays ACTIVE
+        // (keeps emitting, never trips the idle watchdog below) would otherwise run
+        // one phase turn unbounded past the run budget. Settle GRACEFULLY as a
+        // completed phase on the work so far: best-effort bounded interrupt (the SAME
+        // one `next_event_idle` issues on an idle hang), an honest note, then
+        // `PhaseResult::Done` (mirroring this pump's `TurnDone`-Completed path, which
+        // records no usage) so the block winds down to its terminal phase rather than
+        // hard-aborting mid-write.
+        if std::time::Instant::now() >= deadline {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(crate::director_loop::INTERRUPT_TIMEOUT_SECS),
+                session.interrupt(),
+            )
+            .await;
+            events.emit(EngineEvent::Note(
+                "team · run budget reached mid-turn — interrupted the base and finalizing \
+                 on what's built (raise UMADEV_RUN_BUDGET_SECS for a longer run)"
+                    .to_string(),
+            ));
+            return PhaseResult::Done;
+        }
         let ev = match crate::director_loop::next_event_idle(session, idle).await {
             crate::director_loop::IdleEvent::Event(ev) => ev,
             crate::director_loop::IdleEvent::SessionEnded => {
@@ -892,6 +926,7 @@ async fn governance_catchup(
     session: &mut dyn BaseSession,
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
+    deadline: std::time::Instant,
 ) {
     if backend_has_realtime_governance(&options.backend) {
         return;
@@ -905,7 +940,7 @@ async fn governance_catchup(
         &[&violations.len().to_string()],
     )));
     let directive = governance_rework_directive(&violations);
-    if !drive_rework_turn(session, options, events, directive).await {
+    if !drive_rework_turn(session, options, events, directive, deadline).await {
         return; // rework turn failed → fail-open, leave for the quality gate
     }
     let remaining = governance_scan(options);
@@ -1412,6 +1447,7 @@ async fn review_and_rework(
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
     kind: ReviewKind,
+    deadline: std::time::Instant,
 ) {
     // Scale the team to the task; an empty team (lean / no-UI / docs-only paths)
     // means "no cross-review here" — return immediately, the floor stands.
@@ -1464,7 +1500,7 @@ async fn review_and_rework(
             ],
         )));
         let directive = rework_directive(kind, &blocking);
-        if !drive_rework_turn(session, options, events, directive).await {
+        if !drive_rework_turn(session, options, events, directive, deadline).await {
             // The rework turn failed / the session died — stop reworking (the
             // outer loop's phase/turn handling already surfaced the failure path).
             // Fail-open: leave the findings as advisory and proceed.
@@ -1619,8 +1655,9 @@ pub(crate) async fn drive_rework_turn(
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
     directive: String,
+    deadline: std::time::Instant,
 ) -> bool {
-    drive_rework_turn_capturing(session, options, events, directive)
+    drive_rework_turn_capturing(session, options, events, directive, deadline)
         .await
         .done
 }
@@ -1628,12 +1665,15 @@ pub(crate) async fn drive_rework_turn(
 /// [`drive_rework_turn`], but returning the full [`ReworkTurn`] (text + pitfalls).
 /// Reads the idle window ONCE at the boundary (not per-wait), so a mid-turn env flip
 /// can't race; the deterministic core takes it as a param (the test drives it with a
-/// tiny window, no process-env mutation to race).
+/// tiny window, no process-env mutation to race). `deadline` is the run's wall-clock
+/// ceiling, checked at the TOP of the pump so an ACTIVE base can't run one turn past
+/// the budget (the mid-turn graceful settle — see [`drive_rework_turn_with_idle`]).
 pub(crate) async fn drive_rework_turn_capturing(
     session: &mut dyn BaseSession,
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
     directive: String,
+    deadline: std::time::Instant,
 ) -> ReworkTurn {
     drive_rework_turn_with_idle(
         session,
@@ -1641,18 +1681,26 @@ pub(crate) async fn drive_rework_turn_capturing(
         events,
         directive,
         crate::director_loop::idle_timeout(),
+        deadline,
     )
     .await
 }
 
 /// [`drive_rework_turn`] with an explicit idle window — the env read is hoisted
 /// to the wrapper so this core is deterministic for the idle-watchdog test.
+///
+/// `deadline` is the run's wall-clock ceiling. It is checked at the TOP of the pump
+/// loop, BEFORE the idle-guarded wait, so a base that stays ACTIVE (keeps emitting,
+/// never trips the idle watchdog) can't run ONE turn unbounded past the run budget —
+/// the mid-turn settle interrupts the base (bounded) and returns the work so far as a
+/// completed turn, GRACEFULLY (never an error), so the caller finalizes what's built.
 async fn drive_rework_turn_with_idle(
     session: &mut dyn BaseSession,
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
     directive: String,
     idle: std::time::Duration,
+    deadline: std::time::Instant,
 ) -> ReworkTurn {
     // Estimate this turn's token cost up front (the session stream carries no usage
     // on TurnDone) so the summon-driven step path records usage on the DEFAULT loop,
@@ -1674,6 +1722,35 @@ async fn drive_rework_turn_with_idle(
     // review node forever. Guard it with the SAME shared idle primitive as the
     // director loop + `drive_phase`, so no main-session pump can wedge.
     loop {
+        // Wall-clock budget reached DURING a turn (not just between steps). A base
+        // that stays ACTIVE (keeps emitting tool-calls / text deltas — e.g. writing
+        // code) never trips the idle watchdog below, so without this a single summon
+        // turn runs UNBOUNDED past the run budget (the between-step deadline checks
+        // can't be reached while this pump is still draining). Settle GRACEFULLY on
+        // the work so far: best-effort bounded interrupt (the SAME one
+        // `next_event_idle` issues on an idle hang), record this turn's usage estimate
+        // (no `TurnDone` → no real usage, F3), and return the accumulated text as a
+        // completed turn (`done: true`) — so the step scheduler treats it as "this
+        // step produced what it produced" and the between-step deadline winds the run
+        // down to the final gate rather than re-driving past the budget.
+        if std::time::Instant::now() >= deadline {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(crate::director_loop::INTERRUPT_TIMEOUT_SECS),
+                session.interrupt(),
+            )
+            .await;
+            crate::director_loop::record_estimated_usage(&options.backend, est_tokens);
+            events.emit(EngineEvent::Note(
+                "team · run budget reached mid-turn — interrupted the base and finalizing \
+                 on what's built (raise UMADEV_RUN_BUDGET_SECS for a longer run)"
+                    .to_string(),
+            ));
+            return ReworkTurn {
+                done: true,
+                text,
+                pitfalls,
+            };
+        }
         let ev = match crate::director_loop::next_event_idle(session, idle).await {
             crate::director_loop::IdleEvent::Event(ev) => ev,
             // Session ended mid-rework, OR the base hung past the idle window
@@ -2084,6 +2161,11 @@ mod tests {
     // advance, tool-call governance + audit, the TurnDone boundary, the gate
     // pause, the hard gate, and fail-open session death.
 
+    // The mock's distinct failure modes are independent toggles (die / fork-hangs /
+    // next-event-hangs / active-forever), each modelling ONE base pathology a pump
+    // must survive; folding them into a state enum would obscure that they can be set
+    // independently and only adds ceremony to a test fixture.
+    #[allow(clippy::struct_excessive_bools)]
     struct FakeBaseSession {
         /// One `Vec<SessionEvent>` per upcoming turn, consumed front-to-back.
         turns: Vec<Vec<SessionEvent>>,
@@ -2111,6 +2193,11 @@ mod tests {
         /// holds the pipe open but emits nothing, never exits) — the P1-11 hang
         /// the idle watchdog on every MAIN-session pump must settle.
         next_event_hangs: bool,
+        /// When true, every `next_event` returns a fresh `TextDelta` and NEVER a
+        /// `TurnDone` — the base that stays ACTIVE forever (keeps emitting, e.g.
+        /// writing code), so the idle watchdog never trips. Only the wall-clock
+        /// budget check at the top of each pump can settle such a turn.
+        active_forever: bool,
         /// Count of `interrupt()` calls — a test asserts the idle watchdog issued
         /// its best-effort interrupt before settling.
         interrupts: Arc<Mutex<usize>>,
@@ -2128,8 +2215,19 @@ mod tests {
                 forks_opened: Arc::new(Mutex::new(0)),
                 fork_hangs: false,
                 next_event_hangs: false,
+                active_forever: false,
                 interrupts: Arc::new(Mutex::new(0)),
             }
+        }
+        /// A session that accepts `send_turn` then stays ACTIVE forever — every
+        /// `next_event` yields a fresh `TextDelta`, never a `TurnDone`. The idle
+        /// watchdog never trips (the base keeps emitting), so ONLY the wall-clock
+        /// budget check at the top of a pump can settle the turn — the mid-turn
+        /// budget path this models.
+        fn active_forever() -> Self {
+            let mut s = Self::new(vec![]);
+            s.active_forever = true;
+            s
         }
         fn dying() -> Self {
             let mut s = Self::new(vec![]);
@@ -2211,6 +2309,13 @@ mod tests {
                 self.current.clear();
                 return Ok(());
             }
+            // An always-active session drives itself from `next_event` (a fresh
+            // TextDelta each call, never a TurnDone) — leave `current` empty so the
+            // override below takes over (no scripted batch / no auto TurnDone).
+            if self.active_forever {
+                self.current.clear();
+                return Ok(());
+            }
             // Load the next scripted turn (or an immediate clean TurnDone if the
             // script ran out, so the driver never hangs).
             let batch = if self.turns.is_empty() {
@@ -2233,6 +2338,14 @@ mod tests {
             // the idle watchdog must settle it.
             if self.next_event_hangs && self.current.is_empty() {
                 std::future::pending::<()>().await;
+            }
+            // An always-active base keeps emitting a fresh TextDelta forever and
+            // never a TurnDone — so the idle watchdog never trips. Only the pump's
+            // wall-clock budget check can end such a turn. A short yield keeps the
+            // loop cooperative (the test's past deadline returns on the first pass).
+            if self.active_forever && self.current.is_empty() {
+                tokio::task::yield_now().await;
+                return Some(SessionEvent::TextDelta("still working…".to_string()));
             }
             self.current.pop_front()
         }
@@ -3476,7 +3589,13 @@ mod tests {
         let mut session = FakeBaseSession::new(vec![vec![done()]]);
         let sent = session.sent_handle();
 
-        governance_catchup(&mut session, &options, &events).await;
+        governance_catchup(
+            &mut session,
+            &options,
+            &events,
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        )
+        .await;
 
         let sent = sent.lock().unwrap();
         assert_eq!(sent.len(), 1, "exactly one governance rework turn injected");
@@ -3499,7 +3618,13 @@ mod tests {
         let mut session = FakeBaseSession::new(vec![vec![done()]]);
         let sent = session.sent_handle();
 
-        governance_catchup(&mut session, &options, &events).await;
+        governance_catchup(
+            &mut session,
+            &options,
+            &events,
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        )
+        .await;
         assert!(
             sent.lock().unwrap().is_empty(),
             "claude-code already governs at write time — no catch-up rework"
@@ -3591,6 +3716,7 @@ mod tests {
             false,
             crate::planner::TaskKind::Greenfield,
             std::time::Duration::from_millis(80),
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
         )
         .await;
 
@@ -3626,6 +3752,7 @@ mod tests {
             &events,
             "fix these".to_string(),
             std::time::Duration::from_millis(80),
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
         )
         .await
         .done;
@@ -3638,6 +3765,55 @@ mod tests {
             *interrupts.lock().unwrap(),
             1,
             "the watchdog issued its best-effort interrupt before settling"
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_rework_turn_budget_settles_an_active_base_mid_turn() {
+        // The 62-min bug: a base that stays ACTIVE (keeps emitting, never sends
+        // TurnDone — e.g. writing code) never trips the IDLE watchdog, so before the
+        // mid-turn wall-clock check a single rework/summon turn ran UNBOUNDED past the
+        // run budget (the between-step deadline checks can't be reached while one pump
+        // turn is still draining). With a deadline ALREADY in the past, the pump must
+        // return PROMPTLY — GRACEFULLY (done = true, the work-so-far stands), after a
+        // best-effort interrupt — instead of looping forever on the active stream.
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
+        let (events, _rec) = sink();
+        // `active_forever`: every next_event yields a fresh TextDelta, never TurnDone
+        // (a full idle window would otherwise NEVER fire — the base is always active).
+        let mut session = FakeBaseSession::active_forever();
+        let interrupts = session.interrupts_handle();
+
+        // A deadline 1s in the PAST → the top-of-loop budget check fires on the first
+        // pass, before any next_event_idle wait. A generous idle window proves it is
+        // the BUDGET (not the idle watchdog) that settles the active base.
+        let past_deadline = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
+        let turn = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            drive_rework_turn_with_idle(
+                &mut session,
+                &options,
+                &events,
+                "build it".to_string(),
+                std::time::Duration::from_secs(3600), // idle window that never trips
+                past_deadline,
+            ),
+        )
+        .await
+        .expect("an active base past its budget must settle promptly, not loop forever");
+
+        assert!(
+            turn.done,
+            "the mid-turn budget settle is GRACEFUL (done = true), so the caller \
+             finalizes the work-so-far rather than treating it as a failed turn"
+        );
+        assert_eq!(
+            *interrupts.lock().unwrap(),
+            1,
+            "the budget path issued its best-effort (bounded) interrupt before settling"
         );
     }
 }

@@ -164,8 +164,10 @@ pub(crate) fn run_budget() -> Duration {
 /// interrupt path (the same dead pipe), so the interrupt is ITSELF bounded —
 /// otherwise the watchdog would just move the permanent hang from `next_event`
 /// to `interrupt`. 5s is ample for a live child to acknowledge a signal; a dead
-/// one simply times out and the pump settles regardless.
-const INTERRUPT_TIMEOUT_SECS: u64 = 5;
+/// one simply times out and the pump settles regardless. `pub(crate)` so the
+/// shared rework pump (`continuous::drive_rework_turn_with_idle`) reuses the SAME
+/// bounded-interrupt grace on its mid-turn budget settle (no second constant).
+pub(crate) const INTERRUPT_TIMEOUT_SECS: u64 = 5;
 
 /// The result of ONE idle-guarded `next_event()` wait — the shared primitive
 /// every main-session event pump uses so the "stops emitting but never exits"
@@ -431,10 +433,11 @@ async fn drive_director_loop_with_idle(
         // 1. Drive ONE end-to-end base turn (build, or fix-the-QC-findings). The
         //    base runs its own agentic tool loop (PM→…→QA internally) and writes
         //    real files under the run-lock the caller holds (single-writer).
-        let turn = match drive_one_turn(session, options, events, next_directive, idle).await {
-            Ok(t) => t,
-            Err(reason) => return DirectorLoopOutcome::Failed(reason),
-        };
+        let turn =
+            match drive_one_turn(session, options, events, next_directive, idle, deadline).await {
+                Ok(t) => t,
+                Err(reason) => return DirectorLoopOutcome::Failed(reason),
+            };
         last_reply = turn.text.clone();
 
         // 2. On the FIRST turn only: if the base didn't claim it built/changed code
@@ -724,6 +727,7 @@ async fn drive_build_step(
             seat_id,
             &instruction,
             director::SummonMode::Serial,
+            deadline,
         )
         .await;
         if summoned.done {
@@ -814,7 +818,8 @@ async fn drive_review_step(
          re-run any build/test you already ran. Issues:\n{body}\nWhen all are fixed, end \
          your turn."
     );
-    let drove = crate::continuous::drive_rework_turn(session, options, events, directive).await;
+    let drove =
+        crate::continuous::drive_rework_turn(session, options, events, directive, deadline).await;
     // LOW #1 — re-VERIFY the repair instead of blindly accepting it: re-run the
     // (read-only, cheap) cross-review once after the fix turn. A review step stays
     // advisory (the final QC gate + hard-gate own termination, never an LLM verdict),
@@ -1001,6 +1006,7 @@ async fn run_final_gate(
             events,
             qc.fix_directive_with_context(fix_prefix),
             idle_timeout(),
+            deadline,
         )
         .await
         {
@@ -1279,6 +1285,7 @@ async fn drive_one_turn(
     events: &Arc<dyn EventSink>,
     directive: String,
     idle: Duration,
+    deadline: std::time::Instant,
 ) -> Result<TurnResult, String> {
     // Estimate the directive's token cost up front (the session stream carries no
     // usage on `TurnDone`, unlike the single-shot path), so `/usage` is real on the
@@ -1290,6 +1297,32 @@ async fn drive_one_turn(
     let mut text = String::new();
     let mut pitfalls: Vec<String> = Vec::new();
     loop {
+        // Wall-clock budget reached DURING a turn (not just between steps/rounds). A
+        // base that stays ACTIVE — keeps emitting tool-calls / text deltas (e.g.
+        // writing code) — never trips the idle watchdog below, so without this check
+        // a single turn runs UNBOUNDED past the run budget (the between-step deadline
+        // checks can never be reached while one pump turn is still draining). Settle
+        // GRACEFULLY on the work produced so far: best-effort interrupt (the SAME
+        // bounded interrupt `next_event_idle` issues on an idle hang), record the
+        // turn's usage estimate (no `TurnDone` arrived → no real usage, F3), distil
+        // the pitfalls seen so far, and return the accumulated text as a completed-ish
+        // turn — so the caller treats it as "this turn produced what it produced" and
+        // the between-step deadline checks wind the run down to the final gate.
+        if std::time::Instant::now() >= deadline {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(INTERRUPT_TIMEOUT_SECS),
+                session.interrupt(),
+            )
+            .await;
+            record_turn_usage(options, events, None, est_tokens);
+            capture_turn_pitfalls(options, events, &pitfalls);
+            events.emit(EngineEvent::Note(
+                "team · run budget reached mid-turn — interrupted the base and finalizing \
+                 on what's built (raise UMADEV_RUN_BUDGET_SECS for a longer run)"
+                    .to_string(),
+            ));
+            return Ok(TurnResult { text });
+        }
         // Idle watchdog (P0-3 / P1-11): a base that HANGS (stops emitting stdout
         // but never exits) would leave `next_event()` blocked forever — no
         // `TurnDone`, no settle, `thinking` stuck. The shared [`next_event_idle`]
@@ -2080,6 +2113,7 @@ mod tests {
             &events,
             "build it".to_string(),
             std::time::Duration::from_secs(5),
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
         )
         .await;
         match out {

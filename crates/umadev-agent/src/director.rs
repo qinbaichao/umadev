@@ -232,6 +232,11 @@ pub async fn summon(
     role: &str,
     instruction: &str,
     mode: SummonMode,
+    // The run's wall-clock ceiling, threaded into the `Serial` doer's turn pump so an
+    // ACTIVE base can't run ONE summon turn unbounded past the run budget (the mid-turn
+    // graceful settle in `continuous::drive_rework_turn_with_idle`). Ignored by a
+    // `Parallel` (read-only fork) seat — a fork review is bounded by its own timeout.
+    deadline: std::time::Instant,
 ) -> SummonResult {
     events.emit(EngineEvent::Note(format!(
         "team · summon {role} ({})",
@@ -248,8 +253,10 @@ pub async fn summon(
             // lessons KB on the default loop — every tool call is still governed +
             // audited inside the pump (UD-EVID-002), exactly as a phase turn.
             let directive = summon_directive(options, role, instruction);
-            let turn =
-                continuous::drive_rework_turn_capturing(session, options, events, directive).await;
+            let turn = continuous::drive_rework_turn_capturing(
+                session, options, events, directive, deadline,
+            )
+            .await;
             SummonResult {
                 role: role.to_string(),
                 done: turn.done,
@@ -852,6 +859,7 @@ mod tests {
             "frontend-engineer",
             "build the login form",
             SummonMode::Serial,
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
         )
         .await;
         assert_eq!(r.role, "frontend-engineer");
@@ -888,6 +896,7 @@ mod tests {
             "backend-engineer",
             "wire the API",
             SummonMode::Serial,
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
         )
         .await;
         assert!(!r.done, "a failed turn is not done (fail-open)");
@@ -909,6 +918,7 @@ mod tests {
             "security-engineer",
             "audit the auth surface",
             SummonMode::Parallel,
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
         )
         .await;
         assert!(r.done, "a forked seat that returned a verdict is done");
@@ -932,6 +942,7 @@ mod tests {
             "astrologer",
             "read the stars",
             SummonMode::Parallel,
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
         )
         .await;
         let v = r.verdict.expect("always a verdict");
@@ -953,6 +964,7 @@ mod tests {
             "qa-engineer",
             "review the tests",
             SummonMode::Parallel,
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
         )
         .await;
         let v = r.verdict.expect("always a verdict");
