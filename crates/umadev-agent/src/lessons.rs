@@ -105,7 +105,13 @@ pub struct Lesson {
     pub keywords: Vec<String>,
     /// The requirement that triggered this lesson.
     pub source_requirement: String,
-    /// ISO-8601 UTC timestamp when first seen.
+    /// ISO-8601 UTC timestamp of the last time this lesson was REINFORCED — set at
+    /// creation, and refreshed when the lesson proves HELPFUL (injected into a turn
+    /// whose verify/quality gate then PASSES, see [`Lesson::apply_trust_feedback`]).
+    /// This is the recency basis for [`lesson_decay_score`] / eviction, giving
+    /// **usage-driven decay**: a lesson that keeps earning its place stays fresh and
+    /// is not evicted on clock-age alone, while one that's never helpful decays
+    /// normally. (A pure recurrence still bumps `occurrences` + `trust`, not this.)
     pub first_seen: String,
     /// Stable dedup signature (populated for [`LessonKind::DevError`] from
     /// [`crate::error_kb::ErrorInsight::signature`]; empty for older kinds that
@@ -270,6 +276,12 @@ impl Lesson {
     fn apply_trust_feedback(&mut self, passed: bool) {
         let base = self.trust();
         let next = if passed {
+            // Helpful (injected → the gate then PASSED): besides the trust reward,
+            // refresh the recency basis so this lesson resists clock-age decay /
+            // eviction (usage-driven decay — a lesson that keeps EARNING its place
+            // stays fresh). A never-helpful lesson is never refreshed and decays
+            // normally. Only on success: a failure should not buy freshness.
+            self.first_seen = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
             base + TRUST_REWARD
         } else {
             base - TRUST_PENALTY
@@ -5707,6 +5719,29 @@ mod tests {
             l.trust
         );
         assert!(l.trust > 0.0);
+    }
+
+    #[test]
+    fn helpful_feedback_refreshes_recency_basis_failure_does_not() {
+        let tmp = TempDir::new().unwrap();
+        let mut l = seed_cluster_one(tmp.path());
+        // Backdate so a refresh is observable.
+        l.first_seen = "2020-01-01T00:00:00Z".to_string();
+        let stale = l.first_seen.clone();
+        // A FAILED gate must NOT buy freshness — only success keeps a lesson alive.
+        l.apply_trust_feedback(false);
+        assert_eq!(
+            l.first_seen, stale,
+            "a failed gate must not refresh recency"
+        );
+        // A HELPFUL pass refreshes the recency basis (usage-driven decay): a lesson
+        // that keeps earning its place resists clock-age eviction.
+        l.apply_trust_feedback(true);
+        assert!(
+            l.first_seen > stale,
+            "a helpful pass refreshes recency to now: {} !> {stale}",
+            l.first_seen
+        );
     }
 
     #[test]
