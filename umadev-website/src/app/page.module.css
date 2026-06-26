@@ -1863,7 +1863,22 @@
   }
 
   .footer {
-    grid-template-columns: repeat(2, 1fr);
+    grid-template-columns: 1fr;
+    padding-top: 24px;
+    padding-bottom: 24px;
+    text-align: center;
+  }
+
+  .footer > div,
+  .footer > nav {
+    display: none;
+  }
+
+  .footer small {
+    border-top: none;
+    padding-top: 0;
+    text-align: center;
+    width: 100%;
   }
 }
 
@@ -1921,23 +1936,7 @@
     grid-template-columns: 1fr;
   }
 
-  .footer {
-    padding-top: 24px;
-    padding-bottom: 24px;
-    text-align: center;
-  }
 
-  .footer > div,
-  .footer > nav {
-    display: none;
-  }
-
-  .footer small {
-    border-top: none;
-    padding-top: 0;
-    text-align: center;
-    width: 100%;
-  }
 
   .terminalTop {
     grid-template-columns: 72px 1fr;
@@ -3171,6 +3170,14 @@
 
   .heroVisual {
     display: none;
+  }
+
+  .heroCarouselControls {
+    position: relative;
+    bottom: auto;
+    left: auto;
+    transform: none;
+    margin: 32px auto 0;
   }
 }
 
