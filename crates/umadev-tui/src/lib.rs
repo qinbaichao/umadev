@@ -3201,13 +3201,14 @@ fn setup_terminal() -> Result<Term> {
     // atomic `Event::Paste` instead of a scrambled stream of `Char` events.
     stdout.execute(EnableBracketedPaste).map_err(fail)?;
     // Mouse capture is OFF by default so the terminal's native click-drag text
-    // SELECTION + copy keep working — the more essential need for a coding tool.
-    // The transcript scrolls via the keyboard (PageUp/PageDown, Home/End,
-    // Shift+↑/↓, Ctrl+Alt+U/D); `/mouse` opts INTO wheel-scroll (which then takes
-    // over selection). (We're on the alternate screen, which has no native
-    // scrollback, so the wheel can't both scroll AND leave selection intact here —
-    // claude-code gets both only by rendering on the MAIN screen, not the alt
-    // screen.) Teardown + the panic hook DisableMouseCapture regardless.
+    // SELECTION + copy keep working — the user requirement that scrolling must NOT
+    // break copy. The transcript scrolls via the keyboard (PageUp/PageDown,
+    // Home/End, Shift+↑/↓, Ctrl+Alt+U/D); `/mouse` opts INTO wheel-scroll (which
+    // then takes over selection). We're on the alternate screen (no native
+    // scrollback), so wheel-scroll AND native click-drag can't coexist here —
+    // getting BOTH needs an in-app selection layer (claude-code's approach over its
+    // own alt screen), tracked as a focused feature. Teardown + the panic hook
+    // DisableMouseCapture regardless.
     // Show the terminal cursor so the user sees a blinking caret in the
     // input box (positioned via frame.set_cursor_position in render_prompt).
     stdout.execute(crossterm::cursor::Show).map_err(fail)?;

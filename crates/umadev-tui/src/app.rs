@@ -1358,8 +1358,12 @@ impl App {
             transcript_max_scroll: std::cell::Cell::new(0),
             transcript_viewport_rows: std::cell::Cell::new(0),
             input_text_cols: std::cell::Cell::new(0),
-            // OFF by default so native click-drag text selection / copy keeps
-            // working; `/mouse` opts into wheel-scroll (and takes over selection).
+            // OFF by default so the terminal's native click-drag text selection /
+            // copy keeps working (the user requirement: scroll must NOT break copy).
+            // The transcript scrolls via the keyboard (PageUp/PageDown, Home/End,
+            // Shift+↑/↓, Ctrl+Alt+U/D); `/mouse` opts into wheel-scroll. The proper
+            // "wheel-scroll AND mouse-copy both" needs an in-app selection layer
+            // (Claude Code's approach) — tracked as a focused feature.
             mouse_scroll: false,
             conversation: Vec::new(),
             host_chat_session_active: false,
@@ -2128,16 +2132,28 @@ impl App {
     /// the render. Honors [`INPUT_CAP`] and advances the char-cursor by the
     /// number of characters actually inserted.
     pub fn insert_str_at_cursor(&mut self, text: &str) {
+        // Filter to insertable chars + enforce the cap ONCE, then do a SINGLE
+        // byte-splice insert. The old per-char loop recomputed `byte_index`
+        // (O(cursor)) and `String::insert` (O(n) memmove) for EVERY char — O(n²)
+        // overall, so a large paste visibly lagged / appeared to hang (worse on
+        // slower consoles, user-reported on Windows).
+        let room = INPUT_CAP.saturating_sub(self.input_len());
+        let mut buf = String::with_capacity(text.len().min(room * 4));
+        let mut added = 0usize;
         for c in text.chars() {
+            if added >= room {
+                break;
+            }
             if c != '\n' && c.is_control() {
                 continue;
             }
-            if self.input_len() >= INPUT_CAP {
-                break;
-            }
+            buf.push(c);
+            added += 1;
+        }
+        if !buf.is_empty() {
             let pos = self.byte_index(self.input_cursor);
-            self.input.insert(pos, c);
-            self.input_cursor += 1;
+            self.input.insert_str(pos, &buf);
+            self.input_cursor += added;
         }
         self.input_history_idx = None;
         self.palette_selected = 0;
@@ -5150,14 +5166,23 @@ impl App {
             self.push(ChatRole::System, umadev_i18n::t(self.lang, "run.usage"));
             return Action::None;
         }
-        let (slug, req) = if let Some((first, rest)) = arg.split_once(' ') {
-            if rest.trim().is_empty() {
-                (String::new(), first.to_string())
-            } else {
+        // The first token is the optional run SLUG only when it UNAMBIGUOUSLY looks
+        // like one: ASCII alnum/-/_ AND carrying a separator (`-`/`_`), e.g.
+        // `todo-app`. A natural first word of a requirement ("create", "做一个", "做一个登录页")
+        // has no separator (or isn't ASCII), so it stays part of the requirement.
+        // Without this, `/run 做一个 登录页` treated "做一个" as a slug → slug_invalid,
+        // so ANY multi-word / Chinese requirement was rejected (user-reported).
+        let looks_like_slug = |t: &str| {
+            !t.is_empty()
+                && t.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                && t.contains(['-', '_'])
+        };
+        let (slug, req) = match arg.split_once(' ') {
+            Some((first, rest)) if !rest.trim().is_empty() && looks_like_slug(first) => {
                 (first.to_string(), rest.trim().to_string())
             }
-        } else {
-            (String::new(), arg.to_string())
+            _ => (String::new(), arg.to_string()),
         };
         if !slug.is_empty() {
             if slug.contains(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_') {
@@ -10810,6 +10835,23 @@ mod tests {
     }
 
     // ---- palette ----
+
+    #[test]
+    fn slash_run_only_treats_a_separatored_ascii_first_word_as_a_slug() {
+        // `todo-app` (ASCII + a `-` separator) IS the optional run slug.
+        let mut a = fresh_app(Some("offline"));
+        let _ = a.slash_run("todo-app 做一个待办应用");
+        assert_eq!(a.slug, "todo-app");
+        // A multi-word / Chinese requirement's first word is NOT mistaken for a
+        // slug (no separator / not ASCII), so the whole thing stays the requirement
+        // and no slug-invalid error fires (was: '/run with spaces' wrongly rejected).
+        let mut b = fresh_app(Some("offline"));
+        let _ = b.slash_run("做一个 带空格 的登录页");
+        assert_ne!(
+            b.slug, "做一个",
+            "the first word must not become a phantom slug"
+        );
+    }
 
     #[test]
     fn palette_fuzzy_finds_deploy_from_dpl() {
